@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Build output
+/.cache
+/build
+/app/build
+/public/build/
+/public/_dev
+/app/public/build
+/extensions/*/dist
+.vite
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Prisma / database
+/prisma/dev.sqlite
+/prisma/dev.sqlite-journal
+database.sqlite
+*.sqlite
+*.sqlite-journal
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Shopify CLI
+.shopify/*
+.shopify.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+
+# Misc
+*.local

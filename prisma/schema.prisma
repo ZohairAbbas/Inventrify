@@ -1,0 +1,244 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}
+
+model ShopSettings {
+  id                 String   @id @default(cuid())
+  shop               String   @unique
+  courierifyApiKey   String?
+  financifyApiKey    String?
+  defaultLeadTime    Int      @default(7)
+  // Safety stock: Z-score for service level (1.28=90%, 1.65=95%, 2.05=98%)
+  serviceLevel       Float    @default(1.65)
+  safetyStockDays    Int      @default(7)   // fallback when no variance data
+  // Alert thresholds
+  deadStockDays      Int      @default(60)
+  deadStockMinUnits  Int      @default(20)
+  // Notifications
+  notificationEmail  String?
+  slackWebhookUrl    String?
+  timezone           String   @default("UTC")
+  currency           String   @default("USD")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model Supplier {
+  id                String   @id @default(cuid())
+  shop              String
+  name              String
+  contactName       String?
+  email             String?
+  phone             String?
+  address           String?
+  leadTimeDays      Int      @default(7)
+  // Computed from PO history
+  avgActualLeadTime Float?   // actual avg days from sent → received
+  leadTimeVariance  Float?   // std dev of actual lead times
+  totalPosReceived  Int      @default(0)
+  notes             String?
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  products       Product[]
+  purchaseOrders PurchaseOrder[]
+
+  @@index([shop])
+}
+
+model Product {
+  id              String    @id  // Shopify variant GID
+  shop            String
+  productGid      String          // Parent Shopify product GID
+  inventoryItemId String?         // Shopify inventory_item_id — for webhook mapping
+  title           String
+  variantTitle    String?
+  sku             String?
+  currentStock    Int       @default(0)
+  reorderPoint    Int       @default(0)
+  leadTimeDays    Int       @default(7)
+  codReturnRate   Float     @default(0)
+  avgMargin       Float     @default(0)
+  avgDailySales   Float     @default(0)
+  // Safety stock — auto-computed on sync
+  safetyStock     Int       @default(0)
+  supplierId      String?
+  supplier        Supplier? @relation(fields: [supplierId], references: [id])
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  forecasts        Forecast[]
+  purchaseOrders   PurchaseOrderItem[]
+  salesRecords     SalesRecord[]
+  stockSnapshots   StockSnapshot[]
+  adjustments      StockAdjustment[]
+  returnRateHistory ReturnRateHistory[]
+
+  @@index([shop])
+  @@index([productGid])
+  @@index([inventoryItemId])
+  @@index([shop, sku])
+}
+
+model SalesRecord {
+  id        String   @id @default(cuid())
+  shop      String
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  date      DateTime // midnight UTC
+  quantity  Int
+  createdAt DateTime @default(now())
+
+  @@unique([productId, date])
+  @@index([shop, date])
+}
+
+// Daily stock snapshots for analytics / trend charts
+model StockSnapshot {
+  id        String   @id @default(cuid())
+  shop      String
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  date      DateTime // midnight UTC
+  stock     Int
+  createdAt DateTime @default(now())
+
+  @@unique([productId, date])
+  @@index([shop, date])
+}
+
+// Manual inventory adjustments with audit trail
+model StockAdjustment {
+  id        String   @id @default(cuid())
+  shop      String
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  delta     Int      // positive=added, negative=removed
+  reason    String   // damage | count_correction | sample | return | other
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([shop, productId])
+}
+
+// COD return rate per product per week (trend tracking)
+model ReturnRateHistory {
+  id         String   @id @default(cuid())
+  shop       String
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  weekStart  DateTime // Monday midnight UTC
+  returnRate Float    // 0.0–1.0
+  orderCount Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  @@unique([productId, weekStart])
+  @@index([shop, weekStart])
+}
+
+// Seasonal events / demand multipliers
+model SeasonalEvent {
+  id               String   @id @default(cuid())
+  shop             String
+  name             String   // "Eid ul Fitr", "Ramadan", "Back to School"
+  startDate        DateTime
+  endDate          DateTime
+  impactMultiplier Float    @default(1.0) // 1.5 = 50% demand increase
+  // comma-separated product tags this event affects (empty = all products)
+  productTags      String   @default("")
+  notes            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([shop, startDate])
+}
+
+model Forecast {
+  id           String   @id @default(cuid())
+  shop         String
+  productId    String
+  product      Product  @relation(fields: [productId], references: [id])
+  forecastDate DateTime
+  horizon      Int      // 30, 60, or 90 days
+  grossDemand  Int
+  netDemand    Int
+  confidence   Float
+  // AI enhancements
+  seasonalityApplied Boolean @default(false)
+  eventMultiplier    Float   @default(1.0)
+  safetyStockUsed    Int     @default(0)
+  createdAt    DateTime @default(now())
+
+  @@unique([productId, horizon])
+  @@index([shop])
+}
+
+model PurchaseOrder {
+  id                   String    @id @default(cuid())
+  shop                 String
+  poNumber             String    @unique
+  status               String    @default("draft") // draft | sent | received
+  supplierId           String?
+  supplier             Supplier? @relation(fields: [supplierId], references: [id])
+  notes                String?
+  totalCost            Float     @default(0)
+  expectedDeliveryDate DateTime?
+  actualDeliveryDate   DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  items PurchaseOrderItem[]
+
+  @@index([shop])
+  @@index([shop, status])
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  productId       String
+  product         Product       @relation(fields: [productId], references: [id])
+  quantityOrdered Int
+  quantityReceived Int          @default(0)
+  unitCost        Float         @default(0)
+}
+
+model Alert {
+  id        String   @id @default(cuid())
+  shop      String
+  type      String   // low_stock | stockout | dead_stock | return_rate_spike | lead_time_breach
+  productId String
+  message   String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([shop, isRead])
+  @@index([shop, type])
+}

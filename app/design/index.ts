@@ -13,3 +13,4 @@ export { Toast } from "./Toast";
 export { FilterChips, TogglePills } from "./FilterChips";
 export type { ChipOption } from "./FilterChips";
 export { ReorderRow } from "./ReorderRow";
+export { ForecastBar } from "./ForecastBar";

@@ -1,0 +1,134 @@
+/* Inventrify design system tokens — see "Inventorify app redesign prep/Inventrify Design System.md" */
+
+.inv-root {
+  --inv-ink: #1b1a17;
+  --inv-text-2: #6f6c63;
+  --inv-muted: #9a968b;
+  --inv-faint: #c9c4b8;
+  --inv-border: #e7e4dc;
+  --inv-input-border: #e0dcd2;
+  --inv-input-border-2: #d9d5cb;
+  --inv-divider: #efece4;
+  --inv-divider-2: #ddd9cf;
+  --inv-divider-3: #f1efe8;
+  --inv-canvas: #f6f5f1;
+  --inv-nav-bg: #f3f1ea;
+  --inv-subtle: #faf9f5;
+
+  /* Accent — Emerald (default). Indigo values (not wired): #4b52c9 / #ecebf7 / rgba(75,82,201,.5) */
+  --inv-accent: #1f7a5c;
+  --inv-accent-soft: #e4f0ea;
+  --inv-accent-glow: rgba(31, 122, 92, 0.5);
+
+  /* Status semantics — fixed, independent of accent theme */
+  --inv-status-healthy-bg: #e4f0ea;
+  --inv-status-healthy-fg: #1c6b50;
+  --inv-status-healthy-dot: #1f7a5c;
+  --inv-status-low-bg: #f6edd8;
+  --inv-status-low-fg: #8a6a12;
+  --inv-status-low-dot: #b8860b;
+  --inv-status-critical-bg: #f8e6d8;
+  --inv-status-critical-fg: #b04e14;
+  --inv-status-critical-dot: #c0451a;
+  --inv-status-stockout-bg: #f8ded9;
+  --inv-status-stockout-fg: #b3271b;
+  --inv-status-stockout-dot: #d1493f;
+
+  --inv-link: #4b52c9;
+  --inv-link-hover: #3a40a8;
+
+  --inv-font-ui: "Space Grotesk", system-ui, sans-serif;
+  --inv-font-mono: "IBM Plex Mono", monospace;
+
+  --inv-radius-card: 16px;
+  --inv-radius-card-lg: 18px;
+  --inv-radius-control: 10px;
+  --inv-radius-badge: 7px;
+  --inv-radius-pill: 20px;
+
+  --inv-row-pad: 11px 16px;
+  --inv-row-pad-compact: 8px 14px;
+  --inv-content-max: 1180px;
+  --inv-gutter: 26px;
+
+  font-family: var(--inv-font-ui);
+  color: var(--inv-ink);
+  background: var(--inv-canvas);
+}
+
+.inv-root * {
+  box-sizing: border-box;
+}
+
+.inv-root a {
+  color: var(--inv-link);
+  text-decoration: none;
+}
+
+.inv-root a:hover {
+  color: var(--inv-link-hover);
+}
+
+.inv-root input,
+.inv-root select,
+.inv-root button,
+.inv-root textarea {
+  font-family: inherit;
+}
+
+.inv-root ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.inv-root ::-webkit-scrollbar-thumb {
+  background: #cfccc2;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.inv-root ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@keyframes invPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes invRise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes invBar {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes invToast {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

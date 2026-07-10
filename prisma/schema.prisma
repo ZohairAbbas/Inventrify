@@ -170,8 +170,8 @@ model SeasonalEvent {
   startDate        DateTime
   endDate          DateTime
   impactMultiplier Float    @default(1.0) // 1.5 = 50% demand increase
-  // comma-separated product tags this event affects (empty = all products)
-  productTags      String   @default("")
+  // comma-separated Product ids this event affects (empty = all products)
+  productIds       String   @default("")
   notes            String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt

@@ -4,15 +4,19 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, FormField, PageHead, TextArea, TextInput, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, FormField, PageHead, ProductPicker, TextArea, TextInput, type DataTableColumn } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const events = await prisma.seasonalEvent.findMany({
-    where: { shop: session.shop },
-    orderBy: { startDate: "asc" },
-  });
-  return { events };
+  const [events, products] = await Promise.all([
+    prisma.seasonalEvent.findMany({ where: { shop: session.shop }, orderBy: { startDate: "asc" } }),
+    prisma.product.findMany({
+      where: { shop: session.shop },
+      orderBy: { title: "asc" },
+      select: { id: true, title: true, variantTitle: true, sku: true },
+    }),
+  ]);
+  return { events, products };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -26,7 +30,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const startDate = formData.get("startDate") as string;
     const endDate = formData.get("endDate") as string;
     const impactMultiplier = parseFloat(formData.get("impactMultiplier") as string);
-    const productTags = (formData.get("productTags") as string)?.trim() ?? "";
+    const productIds = (formData.getAll("productIds") as string[]).join(",");
     const notes = (formData.get("notes") as string)?.trim() ?? "";
 
     if (!name || !startDate || !endDate || isNaN(impactMultiplier)) {
@@ -40,7 +44,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     await prisma.seasonalEvent.create({
-      data: { shop, name, startDate: new Date(startDate), endDate: new Date(endDate), impactMultiplier, productTags, notes: notes || null },
+      data: { shop, name, startDate: new Date(startDate), endDate: new Date(endDate), impactMultiplier, productIds, notes: notes || null },
     });
     return { ok: true };
   }
@@ -63,8 +67,19 @@ function eventStatus(event: { startDate: string; endDate: string }) {
   return "past";
 }
 
+const PRESETS = [
+  { name: "Eid al-Fitr", multiplier: "1.8" },
+  { name: "Eid al-Adha", multiplier: "1.8" },
+  { name: "Ramadan", multiplier: "1.4" },
+  { name: "Black Friday", multiplier: "2.5" },
+  { name: "11.11", multiplier: "2.0" },
+  { name: "White Friday", multiplier: "2.2" },
+  { name: "Independence Day", multiplier: "1.5" },
+  { name: "Back to School", multiplier: "1.5" },
+];
+
 export default function SeasonalEvents() {
-  const { events } = useLoaderData<typeof loader>();
+  const { events, products } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
 
@@ -72,7 +87,7 @@ export default function SeasonalEvents() {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [multiplier, setMultiplier] = useState("1.5");
-  const [tags, setTags] = useState("");
+  const [productIds, setProductIds] = useState<string[]>([]);
   const [notes, setNotes] = useState("");
 
   const isBusy = fetcher.state !== "idle";
@@ -85,7 +100,7 @@ export default function SeasonalEvents() {
       setStartDate("");
       setEndDate("");
       setMultiplier("1.5");
-      setTags("");
+      setProductIds([]);
       setNotes("");
     }
     if (result?.error) {
@@ -94,6 +109,18 @@ export default function SeasonalEvents() {
   }, [result, shopify]);
 
   const activeEvent = events.find((e) => eventStatus(e) === "active");
+
+  const pickerProducts = products.map((p) => ({
+    id: p.id,
+    label: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
+    sku: p.sku,
+  }));
+
+  const applyPreset = (preset: (typeof PRESETS)[number]) => {
+    setName(preset.name);
+    setMultiplier(preset.multiplier);
+    shopify.toast.show(`Applied preset: ${preset.name} — adjust dates and save`);
+  };
 
   const columns: DataTableColumn[] = [
     { header: "Event", width: "1.6fr" },
@@ -108,6 +135,7 @@ export default function SeasonalEvents() {
     const status = eventStatus(e);
     const statusColor =
       status === "active" ? "var(--inv-status-healthy-fg)" : status === "upcoming" ? "var(--inv-accent)" : "var(--inv-muted)";
+    const scopedCount = e.productIds ? e.productIds.split(",").filter(Boolean).length : 0;
     return {
       key: e.id,
       cells: [
@@ -124,7 +152,9 @@ export default function SeasonalEvents() {
         <span key="mult" style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600, color: "var(--inv-accent)" }}>
           {e.impactMultiplier}×
         </span>,
-        <span key="tags" style={{ color: "var(--inv-text-2)", fontSize: "12.5px" }}>{e.productTags || "All products"}</span>,
+        <span key="scope" style={{ color: "var(--inv-text-2)", fontSize: "12.5px" }}>
+          {scopedCount > 0 ? `${scopedCount} product${scopedCount !== 1 ? "s" : ""}` : "All products"}
+        </span>,
         <button
           key="del"
           onClick={() => fetcher.submit({ intent: "delete", id: e.id }, { method: "POST" })}
@@ -164,7 +194,8 @@ export default function SeasonalEvents() {
                 {activeEvent.name} — {new Date(activeEvent.startDate).toLocaleDateString()} → {new Date(activeEvent.endDate).toLocaleDateString()}
               </div>
               <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", marginTop: "2px" }}>
-                Applies a {activeEvent.impactMultiplier}× demand multiplier to {activeEvent.productTags ? "tagged" : "all"} products. Folded into every forecast.
+                Applies a {activeEvent.impactMultiplier}× demand multiplier to{" "}
+                {activeEvent.productIds ? "selected" : "all"} products. Folded into every forecast.
               </div>
             </div>
             <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "20px", fontWeight: 600, color: "var(--inv-accent)" }}>
@@ -174,9 +205,33 @@ export default function SeasonalEvents() {
         )}
 
         <Card style={{ marginBottom: "16px" }}>
+          <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Presets — one tap to add</div>
+          <div style={{ display: "flex", gap: "9px", flexWrap: "wrap" }}>
+            {PRESETS.map((preset) => (
+              <button
+                key={preset.name}
+                onClick={() => applyPreset(preset)}
+                style={{
+                  fontSize: "12.5px",
+                  fontWeight: 500,
+                  padding: "8px 14px",
+                  borderRadius: "20px",
+                  border: "1px dashed var(--inv-input-border-2)",
+                  background: "#fff",
+                  cursor: "pointer",
+                  color: "#5d5a51",
+                }}
+              >
+                + {preset.name}
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        <Card style={{ marginBottom: "16px" }}>
           <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "4px" }}>Add seasonal event</div>
           <div style={{ fontSize: "12.5px", color: "var(--inv-muted)", marginBottom: "16px" }}>
-            Applies a demand multiplier to forecasts during the event period. Events with product tags only apply to matching products.
+            Applies a demand multiplier to forecasts during the event period. Scope to specific products, or leave empty to apply to all.
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
             <FormField label="Event name">
@@ -193,8 +248,8 @@ export default function SeasonalEvents() {
                 <TextInput type="number" min={0.1} step={0.1} value={multiplier} onChange={(e) => setMultiplier(e.target.value)} />
               </FormField>
             </div>
-            <FormField label="Product tags (optional)" hint="Comma-separated Shopify tags, empty = all products">
-              <TextInput value={tags} onChange={(e) => setTags(e.target.value)} placeholder="Comma-separated tags, empty = all products" />
+            <FormField label="Products (optional)" hint="Leave empty to apply to all products">
+              <ProductPicker products={pickerProducts} selected={productIds} onChange={setProductIds} />
             </FormField>
             <FormField label="Notes (optional)">
               <TextArea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
@@ -203,12 +258,17 @@ export default function SeasonalEvents() {
               <Button
                 variant="primary"
                 disabled={isBusy || !name || !startDate || !endDate}
-                onClick={() =>
-                  fetcher.submit(
-                    { intent: "create", name, startDate, endDate, impactMultiplier: multiplier, productTags: tags, notes },
-                    { method: "POST" },
-                  )
-                }
+                onClick={() => {
+                  const fd = new FormData();
+                  fd.append("intent", "create");
+                  fd.append("name", name);
+                  fd.append("startDate", startDate);
+                  fd.append("endDate", endDate);
+                  fd.append("impactMultiplier", multiplier);
+                  fd.append("notes", notes);
+                  productIds.forEach((id) => fd.append("productIds", id));
+                  fetcher.submit(fd, { method: "POST" });
+                }}
               >
                 + New event
               </Button>

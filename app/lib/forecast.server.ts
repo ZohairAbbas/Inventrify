@@ -127,9 +127,9 @@ export async function generateAndSaveForecast(
 
   // Get seasonality multipliers for each horizon
   const [mult30, mult60, mult90] = await Promise.all([
-    getHorizonMultiplier(shop, 30),
-    getHorizonMultiplier(shop, 60),
-    getHorizonMultiplier(shop, 90),
+    getHorizonMultiplier(shop, 30, productId),
+    getHorizonMultiplier(shop, 60, productId),
+    getHorizonMultiplier(shop, 90, productId),
   ]);
 
   const f30 = forecastDemand(history, 30, codReturnRate, safetyStock, mult30);

@@ -2,6 +2,60 @@ import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
 import { calculateReorderPoint } from "./forecast.server";
 
+const PRIMARY_LOCATION_QUERY = `
+  query getPrimaryLocation {
+    locations(first: 1) {
+      edges { node { id } }
+    }
+  }
+`;
+
+const INVENTORY_ADJUST_MUTATION = `
+  mutation adjustInventory($input: InventoryAdjustQuantitiesInput!) {
+    inventoryAdjustQuantities(input: $input) {
+      userErrors { field message }
+    }
+  }
+`;
+
+/**
+ * Pushes a stock-adjustment delta to Shopify's own inventory count so it stays
+ * in sync with Inventrify's tracked stock. Non-fatal on failure — the local
+ * adjustment already succeeded, so we surface the error without rolling back.
+ */
+export async function applyShopifyInventoryDelta(
+  admin: AdminApiContext,
+  inventoryItemId: string | null,
+  delta: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!inventoryItemId) return { ok: false, error: "Product not linked to a Shopify inventory item" };
+
+  try {
+    const locResp = await admin.graphql(PRIMARY_LOCATION_QUERY);
+    const locJson = await locResp.json();
+    const locationId: string | undefined = locJson.data?.locations?.edges?.[0]?.node?.id;
+    if (!locationId) return { ok: false, error: "No Shopify location found" };
+
+    const resp = await admin.graphql(INVENTORY_ADJUST_MUTATION, {
+      variables: {
+        input: {
+          reason: "correction",
+          name: "available",
+          changes: [{ delta, inventoryItemId, locationId }],
+        },
+      },
+    });
+    const json = await resp.json();
+    const userErrors = json.data?.inventoryAdjustQuantities?.userErrors ?? [];
+    if (userErrors.length > 0) {
+      return { ok: false, error: userErrors.map((e: { message: string }) => e.message).join(", ") };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Unknown error" };
+  }
+}
+
 const PRODUCTS_QUERY = `
   query getProducts($cursor: String) {
     products(first: 50, after: $cursor) {

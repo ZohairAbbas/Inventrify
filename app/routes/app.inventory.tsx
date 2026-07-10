@@ -16,6 +16,7 @@ import {
   Drawer,
   FilterChips,
   PageHead,
+  SelectInput,
   StatusBadge,
   Toast,
   type DataTableColumn,
@@ -54,7 +55,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }))
     .filter((p) => statusFilter === "all" || p.status === statusFilter);
 
-  return { products: enriched, statusFilter, search };
+  const suppliers = await prisma.supplier.findMany({
+    where: { shop: session.shop },
+    orderBy: { name: "asc" },
+    select: { id: true, name: true },
+  });
+
+  return { products: enriched, statusFilter, search, suppliers };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -66,34 +73,55 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const productIds = formData.getAll("productIds") as string[];
     if (productIds.length === 0) return { error: "No products selected" };
 
-    for (let i = 0; i < productIds.length; i++) {
-      const product = await prisma.product.findUnique({ where: { id: productIds[i] } });
-      if (!product) continue;
+    const products = await prisma.product.findMany({ where: { id: { in: productIds } } });
 
-      const suggestedQty = Math.max(
-        10,
-        calculateReorderPoint(product.avgDailySales || 1, product.leadTimeDays) * 2 -
-          product.currentStock,
-      );
+    const bySupplier = new Map<string, typeof products>();
+    for (const product of products) {
+      const key = product.supplierId ?? "__none__";
+      const group = bySupplier.get(key);
+      if (group) group.push(product);
+      else bySupplier.set(key, [product]);
+    }
 
+    for (const [supplierKey, group] of bySupplier) {
       const d = new Date();
       const datePart = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
       const poNumber = `PO-${datePart}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+      const items = group.map((product) => ({
+        productId: product.id,
+        quantityOrdered: Math.max(
+          10,
+          calculateReorderPoint(product.avgDailySales || 1, product.leadTimeDays) * 2 - product.currentStock,
+        ),
+        unitCost: 0,
+      }));
 
       await prisma.purchaseOrder.create({
         data: {
           shop: session.shop,
           poNumber,
-          supplierId: product.supplierId ?? null,
+          supplierId: supplierKey === "__none__" ? null : supplierKey,
           totalCost: 0,
-          items: {
-            create: [{ productId: product.id, quantityOrdered: suggestedQty, unitCost: 0 }],
-          },
+          items: { create: items },
         },
       });
     }
 
     return redirect("/app/purchase-orders");
+  }
+
+  if (intent === "update_supplier") {
+    const productId = formData.get("productId") as string;
+    const supplierId = (formData.get("supplierId") as string) || null;
+
+    if (productId) {
+      await prisma.product.updateMany({
+        where: { id: productId, shop: session.shop },
+        data: { supplierId },
+      });
+    }
+    return { ok: true };
   }
 
   if (intent === "update_reorder") {
@@ -122,7 +150,7 @@ const STATUS_CHIPS = [
 ];
 
 export default function Inventory() {
-  const { products, statusFilter, search } = useLoaderData<typeof loader>();
+  const { products, statusFilter, search, suppliers } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const [, setSearchParams] = useSearchParams();
@@ -130,6 +158,7 @@ export default function Inventory() {
   const [selected, setSelected] = useState<string[]>([]);
   const [drawerId, setDrawerId] = useState<string | null>(null);
   const [toast, setToast] = useState("");
+  const [supplierDraft, setSupplierDraft] = useState("");
 
   useEffect(() => {
     if (fetcher.data && (fetcher.data as { ok?: boolean }).ok) {
@@ -172,6 +201,10 @@ export default function Inventory() {
   };
 
   const drawerProduct = products.find((p) => p.id === drawerId);
+
+  useEffect(() => {
+    setSupplierDraft(drawerProduct?.supplierId ?? "");
+  }, [drawerProduct?.id, drawerProduct?.supplierId]);
 
   const columns: DataTableColumn[] = [
     { header: "", width: "34px" },
@@ -358,6 +391,34 @@ export default function Inventory() {
                   <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "16px", fontWeight: 600 }}>{value}</div>
                 </div>
               ))}
+            </div>
+            <div style={{ marginBottom: "18px" }}>
+              <label style={{ fontSize: "11px", color: "var(--inv-muted)", display: "block", marginBottom: "6px" }}>Supplier</label>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <SelectInput
+                  value={supplierDraft}
+                  onChange={(e) => setSupplierDraft(e.target.value)}
+                  style={{ height: "36px" }}
+                >
+                  <option value="">— No supplier —</option>
+                  {suppliers.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </SelectInput>
+                {supplierDraft !== (drawerProduct.supplierId ?? "") && (
+                  <button
+                    onClick={() =>
+                      fetcher.submit(
+                        { intent: "update_supplier", productId: drawerProduct.id, supplierId: supplierDraft },
+                        { method: "POST" },
+                      )
+                    }
+                    style={{ flex: "none", border: "none", background: "var(--inv-ink)", color: "#fff", fontSize: "12.5px", fontWeight: 500, padding: "0 14px", borderRadius: "9px", cursor: "pointer" }}
+                  >
+                    Save
+                  </button>
+                )}
+              </div>
             </div>
             <div style={{ display: "flex", gap: "9px", marginTop: "20px" }}>
               <Link to={`/app/purchase-orders/new?product=${drawerProduct.id}`}>

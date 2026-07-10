@@ -4,6 +4,7 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { applyShopifyInventoryDelta } from "../lib/shopify-sync.server";
 import { Button, Card, DataTable, PageHead, Pill, SelectInput, TextArea, type DataTableColumn } from "../design";
 
 const REASONS = [
@@ -35,10 +36,52 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return { products, adjustments };
 };
 
+async function applyAdjustment(
+  admin: Parameters<typeof applyShopifyInventoryDelta>[0],
+  shop: string,
+  productId: string,
+  delta: number,
+  reason: string,
+  note: string | null,
+) {
+  const product = await prisma.product.findFirst({ where: { id: productId, shop } });
+  if (!product) return { error: "Product not found" };
+
+  const newStock = product.currentStock + delta;
+  if (newStock < 0) {
+    return { error: `Cannot remove ${Math.abs(delta)} units — only ${product.currentStock} in stock` };
+  }
+
+  await prisma.$transaction([
+    prisma.stockAdjustment.create({ data: { shop, productId, delta, reason, note } }),
+    prisma.product.update({ where: { id: productId }, data: { currentStock: newStock } }),
+  ]);
+
+  const shopifySync = await applyShopifyInventoryDelta(admin, product.inventoryItemId, delta);
+
+  return { ok: true as const, newStock, shopifySynced: shopifySync.ok, shopifyError: shopifySync.error };
+}
+
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
   const formData = await request.formData();
+  const intent = (formData.get("intent") as string) || "adjust";
+
+  if (intent === "reverse") {
+    const adjustmentId = formData.get("adjustmentId") as string;
+    const original = await prisma.stockAdjustment.findFirst({ where: { id: adjustmentId, shop } });
+    if (!original) return { error: "Adjustment not found" };
+
+    return applyAdjustment(
+      admin,
+      shop,
+      original.productId,
+      -original.delta,
+      "reversal",
+      `Reversal of adjustment from ${original.createdAt.toLocaleDateString()}`,
+    );
+  }
 
   const productId = formData.get("productId") as string;
   const deltaStr = formData.get("delta") as string;
@@ -53,20 +96,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { error: "Please select a reason" };
   }
 
-  const product = await prisma.product.findFirst({ where: { id: productId, shop } });
-  if (!product) return { error: "Product not found" };
-
-  const newStock = product.currentStock + delta;
-  if (newStock < 0) {
-    return { error: `Cannot remove ${Math.abs(delta)} units — only ${product.currentStock} in stock` };
-  }
-
-  await prisma.$transaction([
-    prisma.stockAdjustment.create({ data: { shop, productId, delta, reason, note } }),
-    prisma.product.update({ where: { id: productId }, data: { currentStock: newStock } }),
-  ]);
-
-  return { ok: true, newStock };
+  return applyAdjustment(admin, shop, productId, delta, reason, note);
 };
 
 export default function StockAdjustments() {
@@ -84,7 +114,10 @@ export default function StockAdjustments() {
 
   useEffect(() => {
     if (result?.ok) {
-      shopify.toast.show(`Stock updated — new level: ${result.newStock}`);
+      const shopifyNote = result.shopifySynced
+        ? ""
+        : ` (Shopify sync failed${result.shopifyError ? `: ${result.shopifyError}` : ""})`;
+      shopify.toast.show(`Stock updated — new level: ${result.newStock}${shopifyNote}`);
       setDelta(0);
       setNote("");
     }
@@ -103,6 +136,7 @@ export default function StockAdjustments() {
     { header: "Reason", width: "1.2fr" },
     { header: "Note", width: "1.6fr" },
     { header: "Date", width: "1fr" },
+    { header: "", width: ".9fr", align: "right" },
   ];
 
   const rows = adjustments.map((a) => ({
@@ -119,6 +153,18 @@ export default function StockAdjustments() {
       <span key="r" style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>{REASONS.find((r) => r.value === a.reason)?.label ?? a.reason}</span>,
       <span key="note" style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>{a.note ?? "—"}</span>,
       <span key="date" style={{ color: "var(--inv-muted)", fontSize: "12px" }}>{new Date(a.createdAt).toLocaleDateString()}</span>,
+      a.reason === "reversal" ? (
+        <span key="rev" style={{ fontSize: "11px", color: "var(--inv-faint)" }}>—</span>
+      ) : (
+        <button
+          key="rev"
+          onClick={() => fetcher.submit({ intent: "reverse", adjustmentId: a.id }, { method: "POST" })}
+          disabled={isBusy}
+          style={{ fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
+        >
+          Reverse
+        </button>
+      ),
     ],
   }));
 

@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useSearchParams, useFetcher, useRevalidator } from "@remix-run/react";
+import { useLoaderData, useSearchParams, useFetcher, useRevalidator, Link } from "@remix-run/react";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
@@ -258,9 +258,9 @@ export default function Forecast() {
                     {isGenerating ? "Generating…" : forecasts ? "Recalculate Forecast" : "Generate Forecast"}
                   </Button>
                   {fc && (
-                    <a href={`/app/purchase-orders/new?product=${selected.id}&qty=${fc.netDemand + fc.safetyStockUsed}`}>
+                    <Link to={`/app/purchase-orders/new?product=${selected.id}&qty=${fc.netDemand + fc.safetyStockUsed}`}>
                       <Button variant="accent">Turn forecast into PO →</Button>
-                    </a>
+                    </Link>
                   )}
                 </div>
               </Card>

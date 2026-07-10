@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigate } from "@remix-run/react";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
@@ -91,6 +91,7 @@ export default function Dashboard() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
+  const navigate = useNavigate();
   const isSyncing = fetcher.state !== "idle";
   const [toast, setToast] = useState("");
 
@@ -178,7 +179,7 @@ export default function Dashboard() {
             }}
             secondaryAction={{
               label: "Open demand forecast",
-              onClick: () => (window.location.href = "/app/forecast"),
+              onClick: () => navigate("/app/forecast"),
             }}
           />
         )}

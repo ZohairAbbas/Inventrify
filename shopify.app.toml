@@ -27,6 +27,10 @@ api_version = "2026-04"
   topics = ["app/uninstalled"]
   uri = "/webhooks"
 
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "/webhooks"
+
 [access_scopes]
 scopes = "write_products,read_orders,read_inventory"
 

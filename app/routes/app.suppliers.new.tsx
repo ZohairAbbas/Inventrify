@@ -1,20 +1,10 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate } from "@remix-run/react";
-import {
-  Page,
-  Layout,
-  Card,
-  BlockStack,
-  TextField,
-  Button,
-  InlineStack,
-  Text,
-  Banner,
-} from "@shopify/polaris";
+import { useFetcher, useNavigate, Link } from "@remix-run/react";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { Button, Card, FormField, TextArea, TextInput } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   await authenticate.admin(request);
@@ -45,7 +35,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 export default function NewSupplier() {
-  useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
 
@@ -67,102 +56,55 @@ export default function NewSupplier() {
   }, [fetcher.data, error, navigate]);
 
   const handleSubmit = () => {
-    fetcher.submit(
-      {
-        name,
-        contactName,
-        email,
-        phone,
-        address,
-        leadTimeDays,
-        notes,
-      },
-      { method: "POST" },
-    );
+    fetcher.submit({ name, contactName, email, phone, address, leadTimeDays, notes }, { method: "POST" });
   };
 
   return (
-    <Page>
+    <div className="inv-root" style={{ minHeight: "100vh" }}>
       <TitleBar title="Add Supplier" />
-      <Layout>
-        <Layout.Section>
-          <BlockStack gap="500">
-            {error && <Banner tone="critical">{error}</Banner>}
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">Supplier Details</Text>
-                <TextField
-                  label="Supplier Name"
-                  value={name}
-                  onChange={setName}
-                  autoComplete="off"
-                  requiredIndicator
-                />
-                <TextField
-                  label="Contact Name"
-                  value={contactName}
-                  onChange={setContactName}
-                  autoComplete="off"
-                />
-                <InlineStack gap="400">
-                  <div style={{ flex: 1 }}>
-                    <TextField
-                      label="Email"
-                      value={email}
-                      onChange={setEmail}
-                      type="email"
-                      autoComplete="email"
-                    />
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <TextField
-                      label="Phone"
-                      value={phone}
-                      onChange={setPhone}
-                      type="tel"
-                      autoComplete="tel"
-                    />
-                  </div>
-                </InlineStack>
-                <TextField
-                  label="Address"
-                  value={address}
-                  onChange={setAddress}
-                  autoComplete="off"
-                  multiline={2}
-                />
-                <TextField
-                  label="Default Lead Time (days)"
-                  value={leadTimeDays}
-                  onChange={setLeadTimeDays}
-                  type="number"
-                  autoComplete="off"
-                  helpText="Default days from order to delivery for this supplier"
-                  min={1}
-                />
-                <TextField
-                  label="Notes"
-                  value={notes}
-                  onChange={setNotes}
-                  autoComplete="off"
-                  multiline={3}
-                />
-              </BlockStack>
-            </Card>
-            <InlineStack gap="300" align="end">
-              <Button url="/app/suppliers">Cancel</Button>
-              <Button
-                variant="primary"
-                loading={isBusy}
-                onClick={handleSubmit}
-                disabled={!name.trim()}
-              >
-                Save Supplier
-              </Button>
-            </InlineStack>
-          </BlockStack>
-        </Layout.Section>
-      </Layout>
-    </Page>
+      <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
+        {error && (
+          <Card padding="12px 16px" style={{ marginBottom: "16px" }}>
+            <span style={{ color: "var(--inv-status-critical-fg)", fontSize: "13px" }}>{error}</span>
+          </Card>
+        )}
+        <Card style={{ marginBottom: "14px" }}>
+          <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "16px" }}>Supplier details</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+            <FormField label="Supplier name *">
+              <TextInput value={name} onChange={(e) => setName(e.target.value)} />
+            </FormField>
+            <FormField label="Contact name">
+              <TextInput value={contactName} onChange={(e) => setContactName(e.target.value)} />
+            </FormField>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+              <FormField label="Email">
+                <TextInput type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+              </FormField>
+              <FormField label="Phone">
+                <TextInput type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} />
+              </FormField>
+            </div>
+            <FormField label="Address">
+              <TextArea value={address} onChange={(e) => setAddress(e.target.value)} rows={2} />
+            </FormField>
+            <FormField label="Default lead time (days)" hint="Applied to new products">
+              <TextInput type="number" min={1} value={leadTimeDays} onChange={(e) => setLeadTimeDays(e.target.value)} style={{ maxWidth: "160px" }} />
+            </FormField>
+            <FormField label="Notes">
+              <TextArea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} />
+            </FormField>
+          </div>
+        </Card>
+        <div style={{ display: "flex", gap: "9px", justifyContent: "flex-end" }}>
+          <Link to="/app/suppliers">
+            <Button variant="ghost">Cancel</Button>
+          </Link>
+          <Button variant="primary" disabled={isBusy || !name.trim()} onClick={handleSubmit}>
+            Save supplier
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

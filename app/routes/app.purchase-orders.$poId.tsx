@@ -1,26 +1,12 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useRouteLoaderData } from "@remix-run/react";
+import { useLoaderData, useFetcher, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { formatCurrency, formatDate } from "../lib/format";
-import {
-  Page,
-  Layout,
-  Card,
-  DataTable,
-  Text,
-  Badge,
-  BlockStack,
-  InlineStack,
-  Button,
-  Divider,
-  TextField,
-  Select,
-  Banner,
-} from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { Button, Card, DataTable, PageHead, POStatusPill, TextInput, type DataTableColumn } from "../design";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -45,10 +31,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     where: { id: params.poId, shop },
     include: { items: true },
   });
-  if (!po) return { error: "PO not found" };
+  if (!po) return { ok: false as const, error: "PO not found", action: "" };
 
   if (intent === "mark_sent") {
-    if (po.status !== "draft") return { error: "Only draft POs can be marked sent" };
+    if (po.status !== "draft") return { ok: false as const, error: "Only draft POs can be marked sent", action: "" };
     const expectedDelivery = formData.get("expectedDeliveryDate") as string;
     await prisma.purchaseOrder.update({
       where: { id: po.id },
@@ -57,14 +43,13 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         expectedDeliveryDate: expectedDelivery ? new Date(expectedDelivery) : null,
       },
     });
-    return { ok: true, action: "sent" };
+    return { ok: true as const, action: "sent", error: "" };
   }
 
   if (intent === "mark_received") {
-    if (po.status === "received") return { error: "Already received" };
+    if (po.status === "received") return { ok: false as const, error: "Already received", action: "" };
     const actualDelivery = formData.get("actualDeliveryDate") as string;
 
-    // Update stock for each item using received quantities
     for (const item of po.items) {
       const receivedQty = parseInt(
         (formData.get(`received_${item.id}`) as string) ?? String(item.quantityOrdered),
@@ -90,34 +75,23 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       },
     });
 
-    // Update supplier lead time stats if linked
     if (po.supplierId && po.expectedDeliveryDate) {
-      const sentDate =
-        po.updatedAt; // approximation — when status was set to sent
       const receivedDate = actualDelivery ? new Date(actualDelivery) : new Date();
       const actualLeadDays = Math.max(
         1,
-        Math.round(
-          (receivedDate.getTime() - po.createdAt.getTime()) / 86400000,
-        ),
+        Math.round((receivedDate.getTime() - po.createdAt.getTime()) / 86400000),
       );
 
-      const supplier = await prisma.supplier.findUnique({
-        where: { id: po.supplierId },
-      });
+      const supplier = await prisma.supplier.findUnique({ where: { id: po.supplierId } });
       if (supplier) {
         const totalPos = supplier.totalPosReceived + 1;
         const currentAvg = supplier.avgActualLeadTime ?? actualLeadDays;
-        const newAvg =
-          (currentAvg * supplier.totalPosReceived + actualLeadDays) / totalPos;
+        const newAvg = (currentAvg * supplier.totalPosReceived + actualLeadDays) / totalPos;
 
-        // Running variance (Welford's online algorithm approximation)
         const diff = actualLeadDays - newAvg;
         const currentVariance = supplier.leadTimeVariance ?? 0;
         const newVariance = Math.sqrt(
-          ((currentVariance * currentVariance * supplier.totalPosReceived +
-            diff * diff) /
-            totalPos),
+          (currentVariance * currentVariance * supplier.totalPosReceived + diff * diff) / totalPos,
         );
 
         await prisma.supplier.update({
@@ -131,16 +105,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       }
     }
 
-    return { ok: true, action: "received" };
+    return { ok: true as const, action: "received", error: "" };
   }
 
-  return { ok: true };
-};
-
-const statusTone: Record<string, "success" | "warning" | "new"> = {
-  received: "success",
-  sent: "warning",
-  draft: "new",
+  return { ok: true as const, action: "", error: "" };
 };
 
 export default function PODetail() {
@@ -151,13 +119,9 @@ export default function PODetail() {
     useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const [expectedDate, setExpectedDate] = useState(
-    po.expectedDeliveryDate
-      ? new Date(po.expectedDeliveryDate).toISOString().slice(0, 10)
-      : "",
+    po.expectedDeliveryDate ? new Date(po.expectedDeliveryDate).toISOString().slice(0, 10) : "",
   );
-  const [actualDate, setActualDate] = useState(
-    new Date().toISOString().slice(0, 10),
-  );
+  const [actualDate, setActualDate] = useState(new Date().toISOString().slice(0, 10));
   const [receivedQtys, setReceivedQtys] = useState<Record<string, string>>(
     Object.fromEntries(po.items.map((i) => [i.id, String(i.quantityOrdered)])),
   );
@@ -166,52 +130,54 @@ export default function PODetail() {
 
   useEffect(() => {
     if (fetcher.data?.ok) {
-      const msg =
-        (fetcher.data as { action?: string }).action === "received"
-          ? "PO marked as received — stock updated"
-          : "PO updated";
+      const msg = fetcher.data.action === "received" ? "PO marked as received — stock updated" : "PO updated";
       shopify.toast.show(msg);
-    }
-    if ((fetcher.data as { error?: string })?.error) {
-      shopify.toast.show(
-        (fetcher.data as { error: string }).error,
-        { isError: true },
-      );
+    } else if (fetcher.data?.error) {
+      shopify.toast.show(fetcher.data.error, { isError: true });
     }
   }, [fetcher.data, shopify]);
 
-  const tableRows = po.items.map((item) => {
-    const name = item.product.variantTitle
-      ? `${item.product.title} — ${item.product.variantTitle}`
-      : item.product.title;
+  const columns: DataTableColumn[] = [
+    { header: "Product", width: "2.2fr" },
+    { header: "SKU", width: "1fr" },
+    { header: "Qty ordered", width: "1fr", align: "right" },
+    { header: "Qty received", width: "1.2fr", align: "right" },
+    { header: "Unit cost", width: "1fr", align: "right" },
+    { header: "Line total", width: "1.1fr", align: "right" },
+  ];
 
-    return [
-      name,
-      item.product.sku ?? "—",
-      String(item.quantityOrdered),
-      po.status === "sent" ? (
-        <TextField
-          key={item.id}
-          label=""
-          labelHidden
-          type="number"
-          value={receivedQtys[item.id] ?? String(item.quantityOrdered)}
-          onChange={(v) =>
-            setReceivedQtys((prev) => ({ ...prev, [item.id]: v }))
-          }
-          autoComplete="off"
-          min={0}
-        />
-      ) : (
-        String(item.quantityReceived ?? 0)
-      ),
-      formatCurrency(item.unitCost, currency),
-      formatCurrency(item.quantityOrdered * item.unitCost, currency),
-    ];
+  const rows = po.items.map((item) => {
+    const name = item.product.variantTitle ? `${item.product.title} — ${item.product.variantTitle}` : item.product.title;
+    return {
+      key: item.id,
+      cells: [
+        <span key="name" style={{ fontWeight: 500 }}>{name}</span>,
+        <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>
+          {item.product.sku ?? "—"}
+        </span>,
+        <span key="ord" style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantityOrdered}</span>,
+        po.status === "sent" ? (
+          <TextInput
+            key="recv"
+            type="number"
+            min={0}
+            value={receivedQtys[item.id] ?? String(item.quantityOrdered)}
+            onChange={(e) => setReceivedQtys((prev) => ({ ...prev, [item.id]: e.target.value }))}
+            style={{ height: "32px", textAlign: "right" }}
+          />
+        ) : (
+          <span key="recv" style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantityReceived ?? 0}</span>
+        ),
+        <span key="cost" style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(item.unitCost, currency)}</span>,
+        <span key="total" style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600 }}>
+          {formatCurrency(item.quantityOrdered * item.unitCost, currency)}
+        </span>,
+      ],
+    };
   });
 
   return (
-    <Page>
+    <div className="inv-root" style={{ minHeight: "100vh" }}>
       <TitleBar title={`PO ${po.poNumber}`}>
         <button onClick={() => window.print()}>Print / PDF</button>
       </TitleBar>
@@ -224,206 +190,125 @@ export default function PODetail() {
         }
       `}</style>
 
-      <Layout>
-        <Layout.Section>
-          <BlockStack gap="500">
-            {(fetcher.data as { error?: string })?.error && (
-              <Banner tone="critical">
-                {(fetcher.data as { error: string }).error}
-              </Banner>
+      <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
+        <PageHead eyebrow="Purchase order" title={po.poNumber} right={<POStatusPill status={po.status} />} />
+
+        {fetcher.data?.error && (
+          <Card padding="12px 16px" style={{ marginBottom: "16px", borderColor: "var(--inv-status-critical-dot)" }}>
+            <span style={{ color: "var(--inv-status-critical-fg)", fontSize: "13px" }}>{fetcher.data.error}</span>
+          </Card>
+        )}
+
+        <Card style={{ marginBottom: "14px" }}>
+          <div style={{ fontSize: "12.5px", color: "var(--inv-muted)", marginBottom: "18px" }}>
+            Created {formatDate(po.createdAt, timezone)}
+          </div>
+          <div style={{ display: "flex", gap: "32px", flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "4px" }}>Supplier</div>
+              <div style={{ fontSize: "13px" }}>{po.supplier?.name ?? "—"}</div>
+              {po.supplier?.email && (
+                <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>{po.supplier.email}</div>
+              )}
+            </div>
+            {po.expectedDeliveryDate && (
+              <div>
+                <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "4px" }}>Expected delivery</div>
+                <div style={{ fontSize: "13px" }}>{formatDate(po.expectedDeliveryDate, timezone)}</div>
+              </div>
             )}
+            {po.actualDeliveryDate && (
+              <div>
+                <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "4px" }}>Actual delivery</div>
+                <div style={{ fontSize: "13px" }}>{formatDate(po.actualDeliveryDate, timezone)}</div>
+              </div>
+            )}
+            {po.notes && (
+              <div>
+                <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "4px" }}>Notes</div>
+                <div style={{ fontSize: "13px" }}>{po.notes}</div>
+              </div>
+            )}
+          </div>
+        </Card>
 
-            {/* PO Header */}
-            <Card>
-              <BlockStack gap="400">
-                <InlineStack align="space-between">
-                  <BlockStack gap="100">
-                    <Text as="h2" variant="headingLg">
-                      {po.poNumber}
-                    </Text>
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      Created {formatDate(po.createdAt, timezone)}
-                    </Text>
-                  </BlockStack>
-                  <Badge
-                    tone={statusTone[po.status] ?? "new"}
-                    size="large"
-                  >
-                    {po.status.toUpperCase()}
-                  </Badge>
-                </InlineStack>
+        <div style={{ fontSize: "13px", fontWeight: 600, margin: "0 0 10px" }}>Line items</div>
+        <div style={{ marginBottom: "14px" }}>
+          <DataTable columns={columns} rows={rows} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", padding: "12px 14px", background: "var(--inv-subtle)", borderRadius: "11px", marginBottom: "18px" }}>
+          <span style={{ fontWeight: 600 }}>Total</span>
+          <span style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600 }}>{formatCurrency(po.totalCost, currency)}</span>
+        </div>
 
-                <Divider />
+        <Card style={{ marginBottom: "18px" }}>
+          {po.status === "draft" && (
+            <div>
+              <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>
+                Expected delivery date
+              </label>
+              <TextInput
+                type="date"
+                value={expectedDate}
+                onChange={(e) => setExpectedDate(e.target.value)}
+                style={{ marginBottom: "14px", maxWidth: "240px" }}
+              />
+              <div>
+                <Button
+                  variant="primary"
+                  disabled={isBusy}
+                  onClick={() => fetcher.submit({ intent: "mark_sent", expectedDeliveryDate: expectedDate }, { method: "POST" })}
+                >
+                  Mark as sent to supplier
+                </Button>
+              </div>
+            </div>
+          )}
 
-                <InlineStack gap="600" wrap>
-                  <BlockStack gap="100">
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      Supplier
-                    </Text>
-                    <Text as="p" variant="bodyMd">
-                      {po.supplier?.name ?? "—"}
-                    </Text>
-                    {po.supplier?.email && (
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        {po.supplier.email}
-                      </Text>
-                    )}
-                  </BlockStack>
-                  {po.expectedDeliveryDate && (
-                    <BlockStack gap="100">
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        Expected Delivery
-                      </Text>
-                      <Text as="p" variant="bodyMd">
-                        {formatDate(po.expectedDeliveryDate, timezone)}
-                      </Text>
-                    </BlockStack>
-                  )}
-                  {po.actualDeliveryDate && (
-                    <BlockStack gap="100">
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        Actual Delivery
-                      </Text>
-                      <Text as="p" variant="bodyMd">
-                        {formatDate(po.actualDeliveryDate, timezone)}
-                      </Text>
-                    </BlockStack>
-                  )}
-                  {po.notes && (
-                    <BlockStack gap="100">
-                      <Text as="p" variant="bodySm" tone="subdued">
-                        Notes
-                      </Text>
-                      <Text as="p" variant="bodyMd">
-                        {po.notes}
-                      </Text>
-                    </BlockStack>
-                  )}
-                </InlineStack>
-              </BlockStack>
-            </Card>
-
-            {/* Line Items */}
-            <Card>
-              <BlockStack gap="300">
-                <Text as="h2" variant="headingMd">Line Items</Text>
-                <DataTable
-                  columnContentTypes={[
-                    "text",
-                    "text",
-                    "numeric",
-                    "numeric",
-                    "numeric",
-                    "numeric",
-                  ]}
-                  headings={[
-                    "Product",
-                    "SKU",
-                    "Qty Ordered",
-                    po.status === "sent" ? "Qty Received" : "Qty Received",
-                    "Unit Cost",
-                    "Line Total",
-                  ]}
-                  rows={tableRows}
-                  totals={[
-                    "",
-                    "",
-                    "",
-                    "",
-                    "Total",
-                    formatCurrency(po.totalCost, currency),
-                  ]}
-                  showTotalsInFooter
-                />
-              </BlockStack>
-            </Card>
-
-            {/* Actions */}
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">Actions</Text>
-
-                {po.status === "draft" && (
-                  <BlockStack gap="300">
-                    <TextField
-                      label="Expected Delivery Date"
-                      type="date"
-                      value={expectedDate}
-                      onChange={setExpectedDate}
-                      autoComplete="off"
-                    />
-                    <InlineStack>
-                      <Button
-                        variant="primary"
-                        loading={isBusy}
-                        onClick={() =>
-                          fetcher.submit(
-                            { intent: "mark_sent", expectedDeliveryDate: expectedDate },
-                            { method: "POST" },
-                          )
-                        }
-                      >
-                        Mark as Sent to Supplier
-                      </Button>
-                    </InlineStack>
-                  </BlockStack>
-                )}
-
-                {po.status === "sent" && (
-                  <BlockStack gap="300">
-                    <TextField
-                      label="Actual Delivery Date"
-                      type="date"
-                      value={actualDate}
-                      onChange={setActualDate}
-                      autoComplete="off"
-                    />
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      Adjust received quantities above if partial delivery. Stock will be updated accordingly.
-                    </Text>
-                    <InlineStack>
-                      <Button
-                        variant="primary"
-                        loading={isBusy}
-                        onClick={() => {
-                          const data: Record<string, string> = {
-                            intent: "mark_received",
-                            actualDeliveryDate: actualDate,
-                          };
-                          po.items.forEach((item) => {
-                            data[`received_${item.id}`] =
-                              receivedQtys[item.id] ?? String(item.quantityOrdered);
-                          });
-                          fetcher.submit(data, { method: "POST" });
-                        }}
-                      >
-                        Confirm Received — Update Stock
-                      </Button>
-                    </InlineStack>
-                  </BlockStack>
-                )}
-
-                {po.status === "received" && (
-                  <Banner tone="success">
-                    This PO was received on{" "}
-                    {po.actualDeliveryDate
-                      ? formatDate(po.actualDeliveryDate, timezone)
-                      : "—"}
-                    . Stock has been updated.
-                  </Banner>
-                )}
-              </BlockStack>
-            </Card>
-
-            <InlineStack gap="300">
-              <Button url="/app/purchase-orders">← Back to Purchase Orders</Button>
-              <Button onClick={() => window.print()} variant="secondary">
-                Print / PDF
+          {po.status === "sent" && (
+            <div>
+              <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>
+                Actual delivery date
+              </label>
+              <TextInput
+                type="date"
+                value={actualDate}
+                onChange={(e) => setActualDate(e.target.value)}
+                style={{ marginBottom: "8px", maxWidth: "240px" }}
+              />
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "14px" }}>
+                Adjust received quantities above for partial delivery. Stock updates accordingly.
+              </div>
+              <Button
+                variant="primary"
+                disabled={isBusy}
+                onClick={() => {
+                  const data: Record<string, string> = { intent: "mark_received", actualDeliveryDate: actualDate };
+                  po.items.forEach((item) => {
+                    data[`received_${item.id}`] = receivedQtys[item.id] ?? String(item.quantityOrdered);
+                  });
+                  fetcher.submit(data, { method: "POST" });
+                }}
+              >
+                Confirm received — update stock
               </Button>
-            </InlineStack>
-          </BlockStack>
-        </Layout.Section>
-      </Layout>
-    </Page>
+            </div>
+          )}
+
+          {po.status === "received" && (
+            <div style={{ fontSize: "12.5px", color: "var(--inv-status-healthy-fg)", fontWeight: 500 }}>
+              ✓ Received on {po.actualDeliveryDate ? formatDate(po.actualDeliveryDate, timezone) : "—"}. Stock has been updated.
+            </div>
+          )}
+        </Card>
+
+        <div style={{ display: "flex", gap: "9px" }}>
+          <Link to="/app/purchase-orders">
+            <Button variant="ghost">← Back to Purchase Orders</Button>
+          </Link>
+          <Button variant="ghost" onClick={() => window.print()}>Print / PDF</Button>
+        </div>
+      </div>
+    </div>
   );
 }

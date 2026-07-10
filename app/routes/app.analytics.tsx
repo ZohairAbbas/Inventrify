@@ -1,17 +1,5 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
 import { useLoaderData } from "@remix-run/react";
-import {
-  Page,
-  Layout,
-  Card,
-  Text,
-  BlockStack,
-  InlineStack,
-  Badge,
-  DataTable,
-  Divider,
-  Box,
-} from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import {
@@ -23,6 +11,7 @@ import {
   getHighReturnRateProducts,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
+import { BarChart, Card, DataTable, KpiCard, Pill, type DataTableColumn } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -32,277 +21,190 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const deadStockDays = settings?.deadStockDays ?? 60;
   const deadStockMinUnits = settings?.deadStockMinUnits ?? 20;
 
-  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate] =
-    await Promise.all([
-      getSalesTrend(shop, 30),
-      getPeriodComparison(shop),
-      getTopMovers(shop, 30, 10),
-      getDeadStock(shop, deadStockDays, deadStockMinUnits),
-      getStatusDistribution(shop),
-      getHighReturnRateProducts(shop, 10),
-    ]);
+  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate] = await Promise.all([
+    getSalesTrend(shop, 30),
+    getPeriodComparison(shop),
+    getTopMovers(shop, 30, 10),
+    getDeadStock(shop, deadStockDays, deadStockMinUnits),
+    getStatusDistribution(shop),
+    getHighReturnRateProducts(shop, 10),
+  ]);
 
-  return {
-    trend,
-    comparison,
-    topMovers,
-    deadStock,
-    statusDist,
-    highReturnRate,
-  };
+  return { trend, comparison, topMovers, deadStock, statusDist, highReturnRate };
 };
 
-function MiniBar({
-  value,
-  max,
-  color = "#008060",
-}: {
-  value: number;
-  max: number;
-  color?: string;
-}) {
-  const pct = max > 0 ? Math.max(2, (value / max) * 100) : 0;
-  return (
-    <div
-      style={{ background: color, height: 28, width: `${pct}%`, borderRadius: 3, minWidth: value > 0 ? 4 : 0 }}
-    />
-  );
-}
+const SEGMENT_COLORS: Record<string, string> = {
+  healthy: "var(--inv-status-healthy-dot)",
+  low: "#c9a227",
+  critical: "var(--inv-status-critical-dot)",
+  stockout: "var(--inv-status-stockout-dot)",
+};
 
 export default function Analytics() {
-  const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate } =
-    useLoaderData<typeof loader>();
+  const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate } = useLoaderData<typeof loader>();
 
-  const maxTrend = Math.max(...trend.map((d) => d.quantity), 1);
-  const totalHealthy =
-    statusDist.healthy + statusDist.low + statusDist.critical + statusDist.stockout;
-
-  const changeTone =
+  const totalHealthy = statusDist.healthy + statusDist.low + statusDist.critical + statusDist.stockout;
+  const changeColor =
     comparison.changePct == null
-      ? "subdued"
+      ? "var(--inv-muted)"
       : comparison.changePct >= 0
-        ? "success"
-        : "critical";
+        ? "var(--inv-status-healthy-fg)"
+        : "var(--inv-status-critical-fg)";
 
-  const topMoverRows = topMovers.map((m) => [
-    m.product.variantTitle
-      ? `${m.product.title} — ${m.product.variantTitle}`
-      : m.product.title,
-    m.product.sku ?? "—",
-    String(m.totalSold),
-    m.product.avgDailySales.toFixed(1),
-    m.product.currentStock > 0 && m.product.avgDailySales > 0
-      ? `${Math.floor(m.product.currentStock / m.product.avgDailySales)}d`
-      : "—",
-  ]);
+  const moverColumns: DataTableColumn[] = [
+    { header: "Product", width: "2.4fr" },
+    { header: "SKU", width: "1.2fr" },
+    { header: "Units sold", width: "1fr", align: "right" },
+    { header: "Daily avg", width: "1fr", align: "right" },
+    { header: "Days left", width: "1fr", align: "right" },
+  ];
+  const moverRows = topMovers.map((m) => ({
+    key: m.product.id,
+    cells: [
+      <span key="n" style={{ fontWeight: 500 }}>
+        {m.product.variantTitle ? `${m.product.title} — ${m.product.variantTitle}` : m.product.title}
+      </span>,
+      <span key="s" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>{m.product.sku ?? "—"}</span>,
+      <span key="u" style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600 }}>{m.totalSold}</span>,
+      <span key="a" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>{m.product.avgDailySales.toFixed(1)}</span>,
+      <span key="d" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+        {m.product.currentStock > 0 && m.product.avgDailySales > 0
+          ? `${Math.floor(m.product.currentStock / m.product.avgDailySales)}d`
+          : "—"}
+      </span>,
+    ],
+  }));
 
-  const deadStockRows = deadStock.map((p) => [
-    p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
-    p.sku ?? "—",
-    String(p.currentStock),
-    p.avgMargin > 0 ? `${(p.avgMargin * 100).toFixed(0)}%` : "—",
-  ]);
+  const returnColumns: DataTableColumn[] = [
+    { header: "Product", width: "2.4fr" },
+    { header: "SKU", width: "1.2fr" },
+    { header: "Return rate", width: "1fr", align: "right" },
+    { header: "Daily sales", width: "1fr", align: "right" },
+  ];
+  const returnRows = highReturnRate.map((p) => ({
+    key: p.id,
+    cells: [
+      <span key="n" style={{ fontWeight: 500 }}>{p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title}</span>,
+      <span key="s" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>{p.sku ?? "—"}</span>,
+      <span key="r" style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600, color: "var(--inv-status-critical-fg)" }}>{(p.codReturnRate * 100).toFixed(0)}%</span>,
+      <span key="a" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>{p.avgDailySales.toFixed(1)}</span>,
+    ],
+  }));
 
-  const returnRateRows = highReturnRate.map((p) => [
-    p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
-    p.sku ?? "—",
-    `${(p.codReturnRate * 100).toFixed(0)}%`,
-    p.avgDailySales.toFixed(1),
-  ]);
+  const deadColumns: DataTableColumn[] = [
+    { header: "Product", width: "2.6fr" },
+    { header: "SKU", width: "1.2fr" },
+    { header: "Units on hand", width: "1fr", align: "right" },
+    { header: "Margin", width: "1fr", align: "right" },
+  ];
+  const deadRows = deadStock.map((p) => ({
+    key: p.id,
+    cells: [
+      <span key="n" style={{ fontWeight: 500 }}>{p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title}</span>,
+      <span key="s" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>{p.sku ?? "—"}</span>,
+      <span key="u" style={{ fontFamily: "var(--inv-font-mono)" }}>{p.currentStock}</span>,
+      <span key="m" style={{ fontFamily: "var(--inv-font-mono)", color: p.avgMargin > 0 ? "var(--inv-text-2)" : "var(--inv-faint)" }}>
+        {p.avgMargin > 0 ? `${(p.avgMargin * 100).toFixed(0)}%` : "—"}
+      </span>,
+    ],
+  }));
 
   return (
-    <Page fullWidth>
+    <div className="inv-root" style={{ minHeight: "100vh" }}>
       <TitleBar title="Analytics" />
-      <Layout>
-        <Layout.Section>
-          <BlockStack gap="500">
+      <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
+        <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "11px", letterSpacing: "1px", color: "var(--inv-muted)", textTransform: "uppercase", marginBottom: "6px" }}>
+          Inventory intelligence
+        </div>
+        <h1 style={{ margin: "0 0 18px", fontSize: "25px", fontWeight: 600, letterSpacing: "-.5px" }}>Analytics</h1>
 
-            {/* KPI Row */}
-            <Layout>
-              <Layout.Section variant="oneThird">
-                <Card>
-                  <BlockStack gap="200">
-                    <Text as="p" variant="bodySm" tone="subdued">Units Sold (Last 30d)</Text>
-                    <Text as="h2" variant="headingXl">{comparison.currentTotal.toLocaleString()}</Text>
-                    {comparison.changePct != null && (
-                      <InlineStack gap="100">
-                        <Text as="span" variant="bodySm" tone={changeTone}>
-                          {comparison.changePct >= 0 ? "+" : ""}
-                          {comparison.changePct.toFixed(1)}% vs prior 30d
-                        </Text>
-                      </InlineStack>
-                    )}
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-              <Layout.Section variant="oneThird">
-                <Card>
-                  <BlockStack gap="200">
-                    <Text as="p" variant="bodySm" tone="subdued">Inventory Health</Text>
-                    <Text as="h2" variant="headingXl">{statusDist.healthy}</Text>
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      healthy · {statusDist.low} low · {statusDist.critical} critical · {statusDist.stockout} out
-                    </Text>
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-              <Layout.Section variant="oneThird">
-                <Card>
-                  <BlockStack gap="200">
-                    <Text as="p" variant="bodySm" tone="subdued">Dead Stock Items</Text>
-                    <Text as="h2" variant="headingXl">{deadStock.length}</Text>
-                    <Text as="p" variant="bodySm" tone="subdued">
-                      products with no recent sales
-                    </Text>
-                  </BlockStack>
-                </Card>
-              </Layout.Section>
-            </Layout>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: "12px", marginBottom: "14px" }}>
+          <KpiCard
+            label="Units sold — 30d"
+            value={comparison.currentTotal.toLocaleString()}
+            sub={comparison.changePct != null ? `${comparison.changePct >= 0 ? "+" : ""}${comparison.changePct.toFixed(1)}% vs prior 30d` : undefined}
+            valueColor={comparison.changePct != null ? changeColor : undefined}
+          />
+          <KpiCard
+            label="Inventory health"
+            value={statusDist.healthy}
+            sub={`${statusDist.healthy} healthy · ${statusDist.low} low · ${statusDist.critical} crit · ${statusDist.stockout} out`}
+          />
+          <KpiCard label="Dead stock items" value={deadStock.length} sub="products with no recent sales" valueColor="var(--inv-status-critical-fg)" />
+        </div>
 
-            {/* Inventory health bar */}
-            {totalHealthy > 0 && (
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">Inventory Health Distribution</Text>
-                  <div style={{ display: "flex", height: 32, borderRadius: 6, overflow: "hidden", gap: 2 }}>
-                    {statusDist.healthy > 0 && (
-                      <div
-                        style={{
-                          flex: statusDist.healthy,
-                          background: "#007f5f",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                        }}
-                      >
-                        <Text as="span" variant="bodySm" tone="text-inverse">{statusDist.healthy} healthy</Text>
-                      </div>
-                    )}
-                    {statusDist.low > 0 && (
-                      <div
-                        style={{
-                          flex: statusDist.low,
-                          background: "#ffd79d",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                        }}
-                      >
-                        <Text as="span" variant="bodySm">{statusDist.low} low</Text>
-                      </div>
-                    )}
-                    {statusDist.critical > 0 && (
-                      <div
-                        style={{
-                          flex: statusDist.critical,
-                          background: "#f97316",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                        }}
-                      >
-                        <Text as="span" variant="bodySm" tone="text-inverse">{statusDist.critical} critical</Text>
-                      </div>
-                    )}
-                    {statusDist.stockout > 0 && (
-                      <div
-                        style={{
-                          flex: statusDist.stockout,
-                          background: "#d72c0d",
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                        }}
-                      >
-                        <Text as="span" variant="bodySm" tone="text-inverse">{statusDist.stockout} out</Text>
-                      </div>
-                    )}
-                  </div>
-                </BlockStack>
-              </Card>
-            )}
-
-            {/* Daily sales trend chart */}
-            <Card>
-              <BlockStack gap="400">
-                <InlineStack align="space-between">
-                  <Text as="h2" variant="headingMd">Daily Sales — Last 30 Days</Text>
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    All products combined
-                  </Text>
-                </InlineStack>
-                <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 80 }}>
-                  {trend.map((d) => (
+        {totalHealthy > 0 && (
+          <Card style={{ marginBottom: "14px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "12px" }}>Inventory health distribution</div>
+            <div style={{ display: "flex", height: "34px", borderRadius: "9px", overflow: "hidden", gap: "2px" }}>
+              {(["healthy", "low", "critical", "stockout"] as const).map(
+                (key) =>
+                  statusDist[key] > 0 && (
                     <div
-                      key={d.date}
-                      style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}
+                      key={key}
+                      style={{
+                        width: `${(statusDist[key] / totalHealthy) * 100}%`,
+                        background: SEGMENT_COLORS[key],
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        color: "#fff",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        minWidth: "34px",
+                      }}
                     >
-                      <MiniBar value={d.quantity} max={maxTrend} />
+                      {statusDist[key]}
                     </div>
-                  ))}
-                </div>
-                <InlineStack align="space-between">
-                  <Text as="span" variant="bodySm" tone="subdued">
-                    {trend[0]?.date}
-                  </Text>
-                  <Text as="span" variant="bodySm" tone="subdued">
-                    {trend[trend.length - 1]?.date}
-                  </Text>
-                </InlineStack>
-              </BlockStack>
-            </Card>
+                  ),
+              )}
+            </div>
+            <div style={{ display: "flex", gap: "16px", marginTop: "10px", fontSize: "11.5px", color: "var(--inv-text-2)", flexWrap: "wrap" }}>
+              {(["healthy", "low", "critical", "stockout"] as const).map((key) => (
+                <span key={key}>
+                  <span style={{ color: SEGMENT_COLORS[key] }}>■ </span>
+                  {key} {statusDist[key]}
+                </span>
+              ))}
+            </div>
+          </Card>
+        )}
 
-            {/* Top movers */}
-            {topMovers.length > 0 && (
-              <Card>
-                <BlockStack gap="300">
-                  <Text as="h2" variant="headingMd">Top Movers — Last 30 Days</Text>
-                  <DataTable
-                    columnContentTypes={["text", "text", "numeric", "numeric", "text"]}
-                    headings={["Product", "SKU", "Units Sold", "Daily Avg", "Days Left"]}
-                    rows={topMoverRows}
-                  />
-                </BlockStack>
-              </Card>
-            )}
+        <Card style={{ marginBottom: "14px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "14px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600 }}>Daily sales — last 30 days</div>
+            <span style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>all products combined</span>
+          </div>
+          <BarChart values={trend.map((d) => d.quantity)} labels={[trend[0]?.date ?? "", trend[trend.length - 1]?.date ?? ""]} />
+        </Card>
 
-            {/* COD return rate leaders */}
-            {highReturnRate.length > 0 && (
-              <Card>
-                <BlockStack gap="300">
-                  <InlineStack align="space-between">
-                    <Text as="h2" variant="headingMd">High COD Return Rates</Text>
-                    <Badge tone="warning">Review these products</Badge>
-                  </InlineStack>
-                  <DataTable
-                    columnContentTypes={["text", "text", "numeric", "numeric"]}
-                    headings={["Product", "SKU", "Return Rate", "Daily Sales"]}
-                    rows={returnRateRows}
-                  />
-                </BlockStack>
-              </Card>
-            )}
+        {topMovers.length > 0 && (
+          <div style={{ marginBottom: "14px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Top movers — last 30 days</div>
+            <DataTable columns={moverColumns} rows={moverRows} />
+          </div>
+        )}
 
-            {/* Dead stock */}
-            {deadStock.length > 0 && (
-              <Card>
-                <BlockStack gap="300">
-                  <InlineStack align="space-between">
-                    <Text as="h2" variant="headingMd">Dead Stock Candidates</Text>
-                    <Badge tone="critical">No recent sales</Badge>
-                  </InlineStack>
-                  <DataTable
-                    columnContentTypes={["text", "text", "numeric", "text"]}
-                    headings={["Product", "SKU", "Units on Hand", "Margin"]}
-                    rows={deadStockRows}
-                  />
-                </BlockStack>
-              </Card>
-            )}
+        {highReturnRate.length > 0 && (
+          <div style={{ marginBottom: "14px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "10px" }}>
+              <div style={{ fontSize: "14px", fontWeight: 600 }}>High COD return rates</div>
+              <Pill label="Review these products" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
+            </div>
+            <DataTable columns={returnColumns} rows={returnRows} />
+          </div>
+        )}
 
-          </BlockStack>
-        </Layout.Section>
-      </Layout>
-    </Page>
+        {deadStock.length > 0 && (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "10px" }}>
+              <div style={{ fontSize: "14px", fontWeight: 600 }}>Dead stock candidates</div>
+              <Pill label="No recent sales" bg="var(--inv-status-stockout-bg)" fg="var(--inv-status-stockout-fg)" />
+            </div>
+            <DataTable columns={deadColumns} rows={deadRows} />
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

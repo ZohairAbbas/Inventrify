@@ -1,25 +1,12 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { formatCurrency } from "../lib/format";
-import {
-  Page,
-  Layout,
-  Card,
-  BlockStack,
-  TextField,
-  Select,
-  Button,
-  DataTable,
-  Text,
-  InlineStack,
-  Divider,
-  Banner,
-} from "@shopify/polaris";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { useState, useCallback, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { Button, Card, PageHead, SelectInput, TextArea, TextInput } from "../design";
 
 function generatePoNumber(): string {
   const d = new Date();
@@ -70,10 +57,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     unitCost: parseFloat(unitCosts[i] ?? "0"),
   }));
 
-  const totalCost = items.reduce(
-    (s, item) => s + item.quantityOrdered * item.unitCost,
-    0,
-  );
+  const totalCost = items.reduce((s, item) => s + item.quantityOrdered * item.unitCost, 0);
 
   await prisma.purchaseOrder.create({
     data: {
@@ -89,15 +73,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   return { ok: true };
 };
 
-interface LineItem { productId: string; quantity: number; unitCost: number }
+interface LineItem {
+  productId: string;
+  quantity: number;
+  unitCost: number;
+}
 
 export default function NewPurchaseOrder() {
-  const { products, suppliers, prefilledProductId, prefilledQty } =
-    useLoaderData<typeof loader>();
+  const { products, suppliers, prefilledProductId, prefilledQty } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
-  const { currency = "USD" } =
-    useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
+  const { currency = "USD" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const [supplierId, setSupplierId] = useState("");
   const [notes, setNotes] = useState("");
@@ -111,22 +97,11 @@ export default function NewPurchaseOrder() {
   const isBusy = fetcher.state !== "idle";
   const error = (fetcher.data as { error?: string } | undefined)?.error;
 
-  // Navigate away on success
   useEffect(() => {
     if (fetcher.data && !error) {
       navigate("/app/purchase-orders");
     }
   }, [fetcher.data, error, navigate]);
-
-  const productOptions = products.map((p) => ({
-    label: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
-    value: p.id,
-  }));
-
-  const supplierOptions = [
-    { label: "— No supplier —", value: "" },
-    ...suppliers.map((s) => ({ label: s.name, value: s.id })),
-  ];
 
   const addLine = useCallback(() => {
     setLines((l) => [...l, { productId: products[0]?.id ?? "", quantity: 1, unitCost: 0 }]);
@@ -139,9 +114,7 @@ export default function NewPurchaseOrder() {
   const updateLine = useCallback((idx: number, field: keyof LineItem, value: string) => {
     setLines((l) =>
       l.map((line, i) =>
-        i === idx
-          ? { ...line, [field]: field === "productId" ? value : parseFloat(value) || 0 }
-          : line,
+        i === idx ? { ...line, [field]: field === "productId" ? value : parseFloat(value) || 0 } : line,
       ),
     );
   }, []);
@@ -161,104 +134,98 @@ export default function NewPurchaseOrder() {
 
   const totalCost = lines.reduce((s, l) => s + l.quantity * l.unitCost, 0);
 
-  const tableRows = lines.map((line, idx) => [
-    <Select
-      key={`p-${idx}`}
-      label=""
-      labelHidden
-      options={productOptions}
-      value={line.productId}
-      onChange={(v) => updateLine(idx, "productId", v)}
-    />,
-    <TextField
-      key={`q-${idx}`}
-      label=""
-      labelHidden
-      type="number"
-      value={String(line.quantity)}
-      onChange={(v) => updateLine(idx, "quantity", v)}
-      autoComplete="off"
-      min={1}
-    />,
-    <TextField
-      key={`c-${idx}`}
-      label=""
-      labelHidden
-      type="number"
-      value={String(line.unitCost)}
-      onChange={(v) => updateLine(idx, "unitCost", v)}
-      prefix="$"
-      autoComplete="off"
-      min={0}
-      step={0.01}
-    />,
-    formatCurrency(line.quantity * line.unitCost, currency),
-    <Button key={`r-${idx}`} tone="critical" size="slim" onClick={() => removeLine(idx)}>
-      Remove
-    </Button>,
-  ]);
-
   return (
-    <Page>
+    <div className="inv-root" style={{ minHeight: "100vh" }}>
       <TitleBar title="Create Purchase Order" />
-      <Layout>
-        <Layout.Section>
-          <BlockStack gap="500">
-            {error && <Banner tone="critical">{error}</Banner>}
+      <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
+        <PageHead eyebrow="New" title="Create Purchase Order" />
 
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">Order Details</Text>
-                <Select
-                  label="Supplier"
-                  options={supplierOptions}
-                  value={supplierId}
-                  onChange={setSupplierId}
-                  helpText="Add suppliers in the Suppliers section"
-                />
-                <TextField
-                  label="Notes"
-                  value={notes}
-                  onChange={setNotes}
-                  autoComplete="off"
-                  multiline={2}
-                  placeholder="Optional notes for this purchase order"
-                />
-              </BlockStack>
-            </Card>
+        {error && (
+          <Card padding="12px 16px" style={{ marginBottom: "16px" }}>
+            <span style={{ color: "var(--inv-status-critical-fg)", fontSize: "13px" }}>{error}</span>
+          </Card>
+        )}
 
-            <Card>
-              <BlockStack gap="400">
-                <InlineStack align="space-between">
-                  <Text as="h2" variant="headingMd">Line Items</Text>
-                  <Button onClick={addLine} size="slim">Add Item</Button>
-                </InlineStack>
-                <DataTable
-                  columnContentTypes={["text", "numeric", "numeric", "numeric", "text"]}
-                  headings={["Product", "Qty", "Unit Cost", "Line Total", ""]}
-                  rows={tableRows}
-                />
-                <Divider />
-                <InlineStack align="end">
-                  <Text as="p" variant="headingMd">Total: {formatCurrency(totalCost, currency)}</Text>
-                </InlineStack>
-              </BlockStack>
-            </Card>
+        <Card style={{ marginBottom: "14px" }}>
+          <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "16px" }}>Order details</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: "16px" }}>
+            <div>
+              <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>Supplier</label>
+              <SelectInput value={supplierId} onChange={(e) => setSupplierId(e.target.value)}>
+                <option value="">— No supplier —</option>
+                {suppliers.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </SelectInput>
+              <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginTop: "5px" }}>Add suppliers in the Suppliers section</div>
+            </div>
+            <div>
+              <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>Notes</label>
+              <TextArea
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                rows={2}
+                placeholder="Optional notes for this purchase order"
+              />
+            </div>
+          </div>
+        </Card>
 
-            <InlineStack gap="300" align="end">
-              <Button url="/app/purchase-orders">Cancel</Button>
-              <Button
-                variant="primary"
-                loading={isBusy}
-                onClick={handleSubmit}
-                disabled={lines.length === 0}
-              >
-                Create PO
-              </Button>
-            </InlineStack>
-          </BlockStack>
-        </Layout.Section>
-      </Layout>
-    </Page>
+        <Card style={{ marginBottom: "14px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
+            <div style={{ fontSize: "15px", fontWeight: 600 }}>Line items</div>
+            <Button variant="ghost" onClick={addLine}>+ Add item</Button>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {lines.map((line, idx) => (
+              <div key={idx} style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 1fr 1fr auto", gap: "10px", alignItems: "center" }}>
+                <SelectInput value={line.productId} onChange={(e) => updateLine(idx, "productId", e.target.value)}>
+                  {products.map((p) => (
+                    <option key={p.id} value={p.id}>{p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title}</option>
+                  ))}
+                </SelectInput>
+                <TextInput
+                  type="number"
+                  min={1}
+                  value={line.quantity}
+                  onChange={(e) => updateLine(idx, "quantity", e.target.value)}
+                />
+                <TextInput
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  value={line.unitCost}
+                  onChange={(e) => updateLine(idx, "unitCost", e.target.value)}
+                />
+                <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "13px" }}>
+                  {formatCurrency(line.quantity * line.unitCost, currency)}
+                </span>
+                <button
+                  onClick={() => removeLine(idx)}
+                  style={{ fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-status-stockout-fg)", padding: "6px 10px", borderRadius: "8px", cursor: "pointer" }}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ height: "1px", background: "var(--inv-divider)", margin: "16px 0" }} />
+          <div style={{ textAlign: "right", fontSize: "15px", fontWeight: 600 }}>
+            Total: {formatCurrency(totalCost, currency)}
+          </div>
+        </Card>
+
+        <div style={{ display: "flex", gap: "9px", justifyContent: "flex-end" }}>
+          <Link to="/app/purchase-orders">
+            <Button variant="ghost">Cancel</Button>
+          </Link>
+          <Button variant="primary" disabled={isBusy || lines.length === 0} onClick={handleSubmit}>
+            Create PO
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }

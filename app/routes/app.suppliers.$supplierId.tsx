@@ -1,21 +1,10 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate } from "@remix-run/react";
-import {
-  Page,
-  Layout,
-  Card,
-  BlockStack,
-  TextField,
-  Button,
-  InlineStack,
-  Text,
-  Badge,
-  Banner,
-} from "@shopify/polaris";
+import { useLoaderData, useFetcher, useNavigate, Link } from "@remix-run/react";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { Button, Card, FormField, POStatusPill, TextArea, TextInput } from "../design";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -77,151 +66,102 @@ export default function EditSupplier() {
   }, [fetcher.data, error, navigate]);
 
   const handleSubmit = () => {
-    fetcher.submit(
-      { name, contactName, email, phone, address, leadTimeDays, notes },
-      { method: "POST" },
-    );
-  };
-
-  const poStatusTone: Record<string, "success" | "warning" | "new"> = {
-    received: "success",
-    sent: "warning",
-    draft: "new",
+    fetcher.submit({ name, contactName, email, phone, address, leadTimeDays, notes }, { method: "POST" });
   };
 
   return (
-    <Page>
+    <div className="inv-root" style={{ minHeight: "100vh" }}>
       <TitleBar title={`Edit — ${supplier.name}`} />
-      <Layout>
-        <Layout.Section>
-          <BlockStack gap="500">
-            {error && <Banner tone="critical">{error}</Banner>}
-            <Card>
-              <BlockStack gap="400">
-                <Text as="h2" variant="headingMd">Supplier Details</Text>
-                <TextField
-                  label="Supplier Name"
-                  value={name}
-                  onChange={setName}
-                  autoComplete="off"
-                  requiredIndicator
-                />
-                <TextField
-                  label="Contact Name"
-                  value={contactName}
-                  onChange={setContactName}
-                  autoComplete="off"
-                />
-                <InlineStack gap="400">
-                  <div style={{ flex: 1 }}>
-                    <TextField
-                      label="Email"
-                      value={email}
-                      onChange={setEmail}
-                      type="email"
-                      autoComplete="email"
-                    />
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <TextField
-                      label="Phone"
-                      value={phone}
-                      onChange={setPhone}
-                      type="tel"
-                      autoComplete="tel"
-                    />
-                  </div>
-                </InlineStack>
-                <TextField
-                  label="Address"
-                  value={address}
-                  onChange={setAddress}
-                  autoComplete="off"
-                  multiline={2}
-                />
-                <TextField
-                  label="Default Lead Time (days)"
-                  value={leadTimeDays}
-                  onChange={setLeadTimeDays}
-                  type="number"
-                  autoComplete="off"
-                  min={1}
-                />
-                <TextField
-                  label="Notes"
-                  value={notes}
-                  onChange={setNotes}
-                  autoComplete="off"
-                  multiline={3}
-                />
-              </BlockStack>
+      <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: "14px", alignItems: "start" }}>
+          <div>
+            {error && (
+              <Card padding="12px 16px" style={{ marginBottom: "16px" }}>
+                <span style={{ color: "var(--inv-status-critical-fg)", fontSize: "13px" }}>{error}</span>
+              </Card>
+            )}
+            <Card style={{ marginBottom: "14px" }}>
+              <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "16px" }}>Supplier details</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+                <FormField label="Supplier name *">
+                  <TextInput value={name} onChange={(e) => setName(e.target.value)} />
+                </FormField>
+                <FormField label="Contact name">
+                  <TextInput value={contactName} onChange={(e) => setContactName(e.target.value)} />
+                </FormField>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
+                  <FormField label="Email">
+                    <TextInput type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+                  </FormField>
+                  <FormField label="Phone">
+                    <TextInput type="tel" value={phone} onChange={(e) => setPhone(e.target.value)} />
+                  </FormField>
+                </div>
+                <FormField label="Address">
+                  <TextArea value={address} onChange={(e) => setAddress(e.target.value)} rows={2} />
+                </FormField>
+                <FormField label="Default lead time (days)">
+                  <TextInput type="number" min={1} value={leadTimeDays} onChange={(e) => setLeadTimeDays(e.target.value)} style={{ maxWidth: "160px" }} />
+                </FormField>
+                <FormField label="Notes">
+                  <TextArea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} />
+                </FormField>
+              </div>
             </Card>
-            <InlineStack gap="300" align="end">
-              <Button url="/app/suppliers">Cancel</Button>
-              <Button
-                variant="primary"
-                loading={isBusy}
-                onClick={handleSubmit}
-                disabled={!name.trim()}
-              >
-                Save Changes
+            <div style={{ display: "flex", gap: "9px", justifyContent: "flex-end" }}>
+              <Link to="/app/suppliers">
+                <Button variant="ghost">Cancel</Button>
+              </Link>
+              <Button variant="primary" disabled={isBusy || !name.trim()} onClick={handleSubmit}>
+                Save changes
               </Button>
-            </InlineStack>
-          </BlockStack>
-        </Layout.Section>
+            </div>
+          </div>
 
-        <Layout.Section variant="oneThird">
-          <BlockStack gap="500">
+          <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
             <Card>
-              <BlockStack gap="300">
-                <Text as="h2" variant="headingMd">
-                  Linked Products ({supplier.products.length})
-                </Text>
-                {supplier.products.length === 0 ? (
-                  <Text as="p" variant="bodySm" tone="subdued">
-                    No products linked to this supplier yet.
-                  </Text>
-                ) : (
-                  <BlockStack gap="200">
-                    {supplier.products.map((p) => (
-                      <InlineStack key={p.id} align="space-between">
-                        <BlockStack gap="050">
-                          <Text as="span" variant="bodySm" fontWeight="semibold">
-                            {p.title}{p.variantTitle ? ` — ${p.variantTitle}` : ""}
-                          </Text>
-                          <Text as="span" variant="bodySm" tone="subdued">
-                            {p.sku ?? "No SKU"} · {p.currentStock} units
-                          </Text>
-                        </BlockStack>
-                      </InlineStack>
-                    ))}
-                  </BlockStack>
-                )}
-              </BlockStack>
+              <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>
+                Linked products ({supplier.products.length})
+              </div>
+              {supplier.products.length === 0 ? (
+                <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>No products linked to this supplier yet.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                  {supplier.products.map((p) => (
+                    <div key={p.id}>
+                      <div style={{ fontSize: "12.5px", fontWeight: 600 }}>
+                        {p.title}
+                        {p.variantTitle ? ` — ${p.variantTitle}` : ""}
+                      </div>
+                      <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
+                        {p.sku ?? "No SKU"} · {p.currentStock} units
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </Card>
 
             <Card>
-              <BlockStack gap="300">
-                <Text as="h2" variant="headingMd">Recent POs</Text>
-                {supplier.purchaseOrders.length === 0 ? (
-                  <Text as="p" variant="bodySm" tone="subdued">No purchase orders yet.</Text>
-                ) : (
-                  <BlockStack gap="200">
-                    {supplier.purchaseOrders.map((po) => (
-                      <InlineStack key={po.id} align="space-between">
-                        <Button variant="plain" url={`/app/purchase-orders/${po.id}`}>
-                          {po.poNumber}
-                        </Button>
-                        <Badge tone={poStatusTone[po.status] ?? "new"}>{po.status}</Badge>
-                      </InlineStack>
-                    ))}
-                  </BlockStack>
-                )}
-              </BlockStack>
+              <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Recent POs</div>
+              {supplier.purchaseOrders.length === 0 ? (
+                <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>No purchase orders yet.</div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  {supplier.purchaseOrders.map((po) => (
+                    <div key={po.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <Link to={`/app/purchase-orders/${po.id}`} style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12.5px", fontWeight: 600, color: "var(--inv-accent)" }}>
+                        {po.poNumber}
+                      </Link>
+                      <POStatusPill status={po.status} />
+                    </div>
+                  ))}
+                </div>
+              )}
             </Card>
-          </BlockStack>
-        </Layout.Section>
-      </Layout>
-    </Page>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }

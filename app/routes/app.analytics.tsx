@@ -1,5 +1,6 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData } from "@remix-run/react";
+import { useLoaderData, useRouteLoaderData } from "@remix-run/react";
+import type { loader as appLoader } from "./app";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import {
@@ -42,6 +43,7 @@ const SEGMENT_COLORS: Record<string, string> = {
 
 export default function Analytics() {
   const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate } = useLoaderData<typeof loader>();
+  const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const totalHealthy = statusDist.healthy + statusDist.low + statusDist.critical + statusDist.stockout;
   const changeColor =
@@ -110,7 +112,7 @@ export default function Analytics() {
   }));
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Analytics" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "11px", letterSpacing: "1px", color: "var(--inv-muted)", textTransform: "uppercase", marginBottom: "6px" }}>

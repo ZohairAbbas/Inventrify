@@ -42,8 +42,12 @@ model ShopSettings {
   // Notifications
   notificationEmail  String?
   slackWebhookUrl    String?
+  whatsappNumber     String?
   timezone           String   @default("UTC")
   currency           String   @default("USD")
+  theme              String   @default("emerald")
+  // Incremental cursor for the Courierify returns pull (?updatedSince=). Null = never synced.
+  courierifyReturnsCursor DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 }
@@ -86,6 +90,12 @@ model Product {
   codReturnRate   Float     @default(0)
   avgMargin       Float     @default(0)
   avgDailySales   Float     @default(0)
+  // Fulfilment pipeline — live per-SKU snapshot synced from Courierify shipment statuses.
+  // Damaged is NOT here; it is derived from StockAdjustment(reason="damage"). See contract doc.
+  fulfilledDelivered Int    @default(0)
+  fulfilledInTransit Int    @default(0)
+  fulfilledReturned  Int    @default(0)
+  fulfilmentSyncedAt DateTime?
   // Safety stock — auto-computed on sync
   safetyStock     Int       @default(0)
   supplierId      String?
@@ -99,11 +109,49 @@ model Product {
   stockSnapshots   StockSnapshot[]
   adjustments      StockAdjustment[]
   returnRateHistory ReturnRateHistory[]
+  locationStock    ProductLocationStock[]
+  transferItems    StockTransferItem[]
+  returnItems      ReturnItem[]
 
   @@index([shop])
   @@index([productGid])
   @@index([inventoryItemId])
   @@index([shop, sku])
+}
+
+// Physical stock locations synced from Shopify (source of truth for per-location inventory)
+model Location {
+  id                String   @id @default(cuid())
+  shop              String
+  shopifyLocationId String // Shopify location GID
+  name              String
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  stockLevels ProductLocationStock[]
+  transfersFrom StockTransfer[] @relation("TransferFrom")
+  transfersTo   StockTransfer[] @relation("TransferTo")
+
+  @@unique([shop, shopifyLocationId])
+  @@index([shop])
+}
+
+// Per-location stock — the real source of truth; Product.currentStock is a cached sum(onHand)
+model ProductLocationStock {
+  id         String   @id @default(cuid())
+  shop       String
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  onHand     Int      @default(0)
+  reserved   Int      @default(0) // available = onHand - reserved
+  updatedAt  DateTime @updatedAt
+
+  @@unique([productId, locationId])
+  @@index([shop])
+  @@index([locationId])
 }
 
 model SalesRecord {
@@ -139,10 +187,11 @@ model StockAdjustment {
   shop      String
   productId String
   product   Product  @relation(fields: [productId], references: [id])
-  delta     Int      // positive=added, negative=removed
-  reason    String   // damage | count_correction | sample | return | other
-  note      String?
-  createdAt DateTime @default(now())
+  delta      Int      // positive=added, negative=removed
+  reason     String   // damage | count_correction | sample | return | other
+  note       String?
+  locationId String?  // Location.id this adjustment applied to (null = legacy/primary)
+  createdAt  DateTime @default(now())
 
   @@index([shop, productId])
 }
@@ -241,4 +290,61 @@ model Alert {
 
   @@index([shop, isRead])
   @@index([shop, type])
+}
+
+// Stock transfers between locations — draft → in-transit → received
+model StockTransfer {
+  id             String    @id @default(cuid())
+  shop           String
+  transferNumber String    @unique
+  status         String    @default("draft") // draft | in-transit | received
+  fromLocationId String
+  toLocationId   String
+  fromLocation   Location  @relation("TransferFrom", fields: [fromLocationId], references: [id])
+  toLocation     Location  @relation("TransferTo", fields: [toLocationId], references: [id])
+  notes          String?
+  shippedAt      DateTime?
+  receivedAt     DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  items StockTransferItem[]
+
+  @@index([shop])
+  @@index([shop, status])
+}
+
+model StockTransferItem {
+  id               String        @id @default(cuid())
+  stockTransferId  String
+  stockTransfer    StockTransfer @relation(fields: [stockTransferId], references: [id], onDelete: Cascade)
+  productId        String
+  product          Product       @relation(fields: [productId], references: [id])
+  quantitySent     Int
+  quantityReceived Int           @default(0)
+}
+
+// Returns-to-restock queue — one row per returned line item pulled from Courierify
+// (shipment where isReturnReceived=true). The merchant resolves each into the physical
+// stock: restock (adds units back via a StockAdjustment) or write-off (records damage).
+model ReturnItem {
+  id             String   @id @default(cuid())
+  shop           String
+  // Courierify shipment identity — (shipmentId, sku) is the idempotency key for pulls.
+  shipmentId     String
+  shopifyOrderName String?
+  sku            String
+  productId      String?  // matched to Product by sku; null if no local match
+  product        Product? @relation(fields: [productId], references: [id])
+  quantity       Int      @default(1)
+  returnReceivedAt DateTime?
+  reasonCategory String?  // from Courierify ReturnReason.category
+  status         String   @default("pending") // pending | restocked | written_off
+  locationId     String?  // where it was restocked (null until resolved)
+  resolvedAt     DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([shipmentId, sku])
+  @@index([shop, status])
 }

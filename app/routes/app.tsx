@@ -37,6 +37,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     apiKey: process.env.SHOPIFY_API_KEY || "",
     timezone: settings?.timezone ?? "UTC",
     currency: settings?.currency ?? "USD",
+    theme: settings?.theme ?? "emerald",
   };
 };
 
@@ -51,6 +52,8 @@ export default function App() {
         <Link to="/app/forecast">Forecast</Link>
         <Link to="/app/analytics">Analytics</Link>
         <Link to="/app/purchase-orders">Purchase Orders</Link>
+        <Link to="/app/transfers">Transfers</Link>
+        <Link to="/app/returns">Returns</Link>
         <Link to="/app/suppliers">Suppliers</Link>
         <Link to="/app/seasonal-events">Seasonal Events</Link>
         <Link to="/app/stock-adjustments">Stock Adjustments</Link>

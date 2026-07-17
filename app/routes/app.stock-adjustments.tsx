@@ -1,10 +1,11 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher } from "@remix-run/react";
+import { useLoaderData, useFetcher, useRouteLoaderData } from "@remix-run/react";
+import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { applyShopifyInventoryDelta } from "../lib/shopify-sync.server";
+import { applyStockDelta } from "../lib/stock.server";
 import { Button, Card, DataTable, PageHead, Pill, SelectInput, TextArea, type DataTableColumn } from "../design";
 
 const REASONS = [
@@ -19,7 +20,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const [products, adjustments] = await Promise.all([
+  const [products, adjustments, locations] = await Promise.all([
     prisma.product.findMany({
       where: { shop },
       orderBy: { title: "asc" },
@@ -31,36 +32,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       orderBy: { createdAt: "desc" },
       take: 50,
     }),
+    prisma.location.findMany({
+      where: { shop, isActive: true },
+      orderBy: { createdAt: "asc" },
+      select: { id: true, name: true },
+    }),
   ]);
 
-  return { products, adjustments };
+  return { products, adjustments, locations };
 };
-
-async function applyAdjustment(
-  admin: Parameters<typeof applyShopifyInventoryDelta>[0],
-  shop: string,
-  productId: string,
-  delta: number,
-  reason: string,
-  note: string | null,
-) {
-  const product = await prisma.product.findFirst({ where: { id: productId, shop } });
-  if (!product) return { error: "Product not found" };
-
-  const newStock = product.currentStock + delta;
-  if (newStock < 0) {
-    return { error: `Cannot remove ${Math.abs(delta)} units — only ${product.currentStock} in stock` };
-  }
-
-  await prisma.$transaction([
-    prisma.stockAdjustment.create({ data: { shop, productId, delta, reason, note } }),
-    prisma.product.update({ where: { id: productId }, data: { currentStock: newStock } }),
-  ]);
-
-  const shopifySync = await applyShopifyInventoryDelta(admin, product.inventoryItemId, delta);
-
-  return { ok: true as const, newStock, shopifySynced: shopifySync.ok, shopifyError: shopifySync.error };
-}
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -73,13 +53,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const original = await prisma.stockAdjustment.findFirst({ where: { id: adjustmentId, shop } });
     if (!original) return { error: "Adjustment not found" };
 
-    return applyAdjustment(
+    return applyStockDelta(
       admin,
       shop,
       original.productId,
       -original.delta,
       "reversal",
       `Reversal of adjustment from ${original.createdAt.toLocaleDateString()}`,
+      original.locationId,
     );
   }
 
@@ -87,6 +68,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const deltaStr = formData.get("delta") as string;
   const reason = formData.get("reason") as string;
   const note = (formData.get("note") as string)?.trim() || null;
+  const locationId = (formData.get("locationId") as string) || null;
 
   const delta = parseInt(deltaStr, 10);
   if (!productId || isNaN(delta) || delta === 0) {
@@ -96,11 +78,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { error: "Please select a reason" };
   }
 
-  return applyAdjustment(admin, shop, productId, delta, reason, note);
+  return applyStockDelta(admin, shop, productId, delta, reason, note, locationId);
 };
 
 export default function StockAdjustments() {
-  const { products, adjustments } = useLoaderData<typeof loader>();
+  const { products, adjustments, locations } = useLoaderData<typeof loader>();
+  const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
 
@@ -108,6 +91,7 @@ export default function StockAdjustments() {
   const [delta, setDelta] = useState(0);
   const [reason, setReason] = useState("count_correction");
   const [note, setNote] = useState("");
+  const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
 
   const isBusy = fetcher.state !== "idle";
   const result = fetcher.data as Record<string, unknown> | undefined;
@@ -169,7 +153,7 @@ export default function StockAdjustments() {
   }));
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Stock Adjustments" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead eyebrow="Manual +/- with audit trail" title="Stock Adjustments" />
@@ -193,6 +177,17 @@ export default function StockAdjustments() {
               </SelectInput>
             </div>
           </div>
+
+          {locations.length > 1 && (
+            <div style={{ marginTop: "16px", maxWidth: "480px" }}>
+              <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>Location</label>
+              <SelectInput value={locationId} onChange={(e) => setLocationId(e.target.value)}>
+                {locations.map((l) => (
+                  <option key={l.id} value={l.id}>{l.name}</option>
+                ))}
+              </SelectInput>
+            </div>
+          )}
 
           <div style={{ display: "flex", alignItems: "flex-end", gap: "24px", marginTop: "20px", flexWrap: "wrap" }}>
             <div>
@@ -239,7 +234,7 @@ export default function StockAdjustments() {
             <Button
               variant="primary"
               disabled={isBusy || !delta}
-              onClick={() => fetcher.submit({ productId, delta: String(delta), reason, note }, { method: "POST" })}
+              onClick={() => fetcher.submit({ productId, delta: String(delta), reason, note, locationId }, { method: "POST" })}
             >
               Apply adjustment
             </Button>

@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData } from "@remix-run/react";
+import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
@@ -33,6 +34,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const pendingPOs = await prisma.purchaseOrder.count({
     where: { shop, status: { in: ["draft", "sent"] } },
   });
+  const locationCount = await prisma.location.count({ where: { shop, isActive: true } });
 
   const stockStatuses = products.map((p) => {
     const avgDailySales = p.avgDailySales || 0.5;
@@ -72,6 +74,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     lowStock,
     critical,
     pendingPOs,
+    locationCount,
     stockStatuses,
     alerts,
     reorderItems,
@@ -89,6 +92,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 export default function Dashboard() {
   const data = useLoaderData<typeof loader>();
+  const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const navigate = useNavigate();
@@ -133,7 +137,7 @@ export default function Dashboard() {
   }));
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Inventorify" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead
@@ -185,7 +189,11 @@ export default function Dashboard() {
         )}
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
-          <KpiCard label="Total SKUs tracked" value={data.totalSkus} sub="across 1 location" />
+          <KpiCard
+            label="Total SKUs tracked"
+            value={data.totalSkus}
+            sub={`across ${data.locationCount} location${data.locationCount !== 1 ? "s" : ""}`}
+          />
           <KpiCard
             label="Low stock"
             value={data.lowStock}

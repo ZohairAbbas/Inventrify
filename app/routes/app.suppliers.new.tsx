@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useFetcher, useNavigate, Link } from "@remix-run/react";
+import { useFetcher, useNavigate, useRouteLoaderData, Link } from "@remix-run/react";
+import type { loader as appLoader } from "./app";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
@@ -37,6 +38,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 export default function NewSupplier() {
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
+  const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const [name, setName] = useState("");
   const [contactName, setContactName] = useState("");
@@ -60,7 +62,7 @@ export default function NewSupplier() {
   };
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Add Supplier" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         {error && (

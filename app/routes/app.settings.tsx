@@ -1,14 +1,19 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher } from "@remix-run/react";
+import { useLoaderData, useFetcher, useRouteLoaderData } from "@remix-run/react";
+import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
-import { syncCourierifyReturnRates } from "../lib/courierify.server";
+import {
+  syncCourierifyReturnRates,
+  syncCourierifyFulfilmentStatus,
+  syncCourierifyReturns,
+} from "../lib/courierify.server";
 import { syncFinancifyMargins } from "../lib/financify.server";
-import { Button, Card, FormField, PageHead, TextInput } from "../design";
+import { Button, Card, FilterChips, FormField, PageHead, TextInput } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -29,6 +34,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     deadStockMinUnits: settings?.deadStockMinUnits ?? 20,
     notificationEmail: settings?.notificationEmail ?? "",
     slackWebhookUrl: settings?.slackWebhookUrl ?? "",
+    whatsappNumber: settings?.whatsappNumber ?? "",
     courierifyConnected: !!settings?.courierifyApiKey,
     financifyConnected: !!settings?.financifyApiKey,
     cronSecret: process.env.CRON_SECRET ? "set" : "not set",
@@ -67,6 +73,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const deadStockMinUnits = parseInt(formData.get("deadStockMinUnits") as string, 10);
     const notificationEmail = (formData.get("notificationEmail") as string)?.trim() || null;
     const slackWebhookUrl = (formData.get("slackWebhookUrl") as string)?.trim() || null;
+    const whatsappNumber = (formData.get("whatsappNumber") as string)?.trim() || null;
 
     const update: Record<string, unknown> = {};
     if (!isNaN(leadTimeDays) && leadTimeDays > 0) {
@@ -79,8 +86,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!isNaN(deadStockMinUnits) && deadStockMinUnits >= 0) update.deadStockMinUnits = deadStockMinUnits;
     update.notificationEmail = notificationEmail;
     update.slackWebhookUrl = slackWebhookUrl;
+    update.whatsappNumber = whatsappNumber;
 
     await prisma.shopSettings.upsert({ where: { shop }, create: { shop, ...update }, update });
+    return { intent, updated: true };
+  }
+
+  if (intent === "update_theme") {
+    const theme = (formData.get("theme") as string) === "indigo" ? "indigo" : "emerald";
+    await prisma.shopSettings.upsert({
+      where: { shop },
+      create: { shop, theme },
+      update: { theme },
+    });
     return { intent, updated: true };
   }
 
@@ -91,11 +109,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const result = await syncCourierifyReturnRates(shop, apiKey);
     if (result.error) return { intent, error: result.error };
 
+    // Persist the key first so the returns cursor has a ShopSettings row to update.
     await prisma.shopSettings.upsert({
       where: { shop },
       create: { shop, courierifyApiKey: apiKey },
       update: { courierifyApiKey: apiKey },
     });
+
+    // Broaden the sync: fulfilment-status snapshot + returns queue. Both best-effort —
+    // a failure here doesn't undo the successful rate sync / connection.
+    await syncCourierifyFulfilmentStatus(shop, apiKey);
+    await syncCourierifyReturns(shop, apiKey);
+
     return { intent, synced: result.synced };
   }
 
@@ -209,6 +234,7 @@ export default function Settings() {
   const data = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
+  const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const [courierifyKey, setCourierifyKey] = useState("");
   const [financifyKey, setFinancifyKey] = useState("");
@@ -219,6 +245,7 @@ export default function Settings() {
   const [deadStockMinUnits, setDeadStockMinUnits] = useState(String(data.deadStockMinUnits));
   const [notificationEmail, setNotificationEmail] = useState(data.notificationEmail ?? "");
   const [slackWebhookUrl, setSlackWebhookUrl] = useState(data.slackWebhookUrl ?? "");
+  const [whatsappNumber, setWhatsappNumber] = useState(data.whatsappNumber ?? "");
 
   const isBusy = fetcher.state !== "idle";
   const result = fetcher.data as Record<string, unknown> | undefined;
@@ -237,11 +264,13 @@ export default function Settings() {
       else shopify.toast.show(`Financify connected — ${result.synced} SKUs updated`);
     } else if (result.intent === "disconnect_courierify" || result.intent === "disconnect_financify") {
       shopify.toast.show("Disconnected");
+    } else if (result.intent === "update_theme") {
+      shopify.toast.show("Theme updated");
     }
   }, [result, shopify]);
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Settings" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead eyebrow="Sync · intelligence · integrations" title="Settings" />
@@ -288,13 +317,22 @@ export default function Settings() {
           <div style={{ height: "1px", background: "var(--inv-divider)", margin: "18px 0" }} />
 
           <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Notifications</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "18px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "8px" }}>
             <FormField label="Notification email">
               <TextInput type="email" value={notificationEmail} onChange={(e) => setNotificationEmail(e.target.value)} placeholder="alerts@yourbusiness.com" />
             </FormField>
             <FormField label="Slack webhook URL">
               <TextInput value={slackWebhookUrl} onChange={(e) => setSlackWebhookUrl(e.target.value)} placeholder="https://hooks.slack.com/services/…" />
             </FormField>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "8px" }}>
+            <FormField label="WhatsApp number" hint="Destination number for alert delivery via WAHA">
+              <TextInput value={whatsappNumber} onChange={(e) => setWhatsappNumber(e.target.value)} placeholder="+92300…" />
+            </FormField>
+          </div>
+          <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "18px" }}>
+            WhatsApp delivery uses WAHA, an unofficial WhatsApp client (not the Meta Business API) —
+            treat it as best-effort; sends can fail if WhatsApp flags the paired number.
           </div>
 
           <Button
@@ -311,6 +349,7 @@ export default function Settings() {
                   deadStockMinUnits,
                   notificationEmail,
                   slackWebhookUrl,
+                  whatsappNumber,
                 },
                 { method: "POST" },
               )
@@ -318,6 +357,18 @@ export default function Settings() {
           >
             Save settings
           </Button>
+        </Card>
+
+        <Card style={{ marginBottom: "14px" }}>
+          <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "16px" }}>Appearance</div>
+          <FilterChips
+            options={[
+              { value: "emerald", label: "Emerald" },
+              { value: "indigo", label: "Indigo" },
+            ]}
+            active={theme}
+            onChange={(value) => fetcher.submit({ intent: "update_theme", theme: value }, { method: "POST" })}
+          />
         </Card>
 
         <Card style={{ marginBottom: "14px" }}>
@@ -356,7 +407,7 @@ export default function Settings() {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
             <IntegrationCard
               name="Courierify"
-              desc="Syncs COD return rates per SKU to power accurate net demand forecasts."
+              desc="Syncs COD return rates, per-SKU fulfilment status (delivered · in-transit · returned), and returned parcels into the restock queue."
               connected={data.courierifyConnected}
               keyValue={courierifyKey}
               onKeyChange={setCourierifyKey}

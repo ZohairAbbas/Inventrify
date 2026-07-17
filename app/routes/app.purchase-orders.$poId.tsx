@@ -161,7 +161,7 @@ export default function PODetail() {
   const { po, products, suppliers } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
-  const { timezone = "UTC", currency = "USD" } =
+  const { timezone = "UTC", currency = "USD", theme = "emerald" } =
     useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const [expectedDate, setExpectedDate] = useState(
@@ -267,7 +267,7 @@ export default function PODetail() {
   });
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title={`PO ${po.poNumber}`}>
         <button onClick={() => window.print()}>Print / PDF</button>
       </TitleBar>

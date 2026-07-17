@@ -1,5 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useSearchParams, useFetcher, useRevalidator, Link } from "@remix-run/react";
+import { useLoaderData, useSearchParams, useFetcher, useRevalidator, useRouteLoaderData, Link } from "@remix-run/react";
+import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
@@ -19,7 +20,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
 
   if (products.length === 0)
-    return { products: [], selected: null, forecasts: null, upcomingEvents: [], recentSales: null };
+    return { products: [], selected: null, forecasts: null, upcomingEvents: [], recentSales: null, locationAvailability: [] };
 
   const product = products.find((p) => p.id === selectedProductId) ?? products[0];
 
@@ -41,6 +42,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const upcomingEvents = await getUpcomingEvents(session.shop, 90);
 
+  // Per-location available stock for the selected product — drives the allocation breakdown
+  const locationStock = await prisma.productLocationStock.findMany({
+    where: { productId: product.id },
+    include: { location: { select: { name: true, isActive: true } } },
+  });
+  const locationAvailability = locationStock
+    .filter((ls) => ls.location.isActive)
+    .map((ls) => ({ name: ls.location.name, available: Math.max(0, ls.onHand - ls.reserved) }));
+
   return {
     products,
     selected: product,
@@ -50,6 +60,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       days: recentSales._count.id,
     },
     upcomingEvents,
+    locationAvailability,
   };
 };
 
@@ -75,6 +86,7 @@ const HORIZONS = [
 
 export default function Forecast() {
   const data = useLoaderData<typeof loader>();
+  const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const [, setSearchParams] = useSearchParams();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
@@ -93,7 +105,7 @@ export default function Forecast() {
 
   if (data.products.length === 0) {
     return (
-      <div className="inv-root" style={{ minHeight: "100vh" }}>
+      <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
         <TitleBar title="Demand Forecast" />
         <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
           <PageHead eyebrow="COD-adjusted · the differentiator" title="Demand Forecast" />
@@ -110,7 +122,7 @@ export default function Forecast() {
 
   const products = data.products as NonNullable<(typeof data.products)[number]>[];
   const upcomingEvents = data.upcomingEvents as NonNullable<(typeof data.upcomingEvents)[number]>[];
-  const { selected, forecasts, recentSales } = data;
+  const { selected, forecasts, recentSales, locationAvailability } = data;
   const fc = forecasts ? forecasts[`f${horizon}` as "f30" | "f60" | "f90"] : null;
   const delivery = selected ? Math.round((1 - selected.codReturnRate) * 100) : 0;
   const confColor = fc
@@ -122,7 +134,7 @@ export default function Forecast() {
     : "var(--inv-muted)";
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Demand Forecast" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead eyebrow="COD-adjusted · the differentiator" title="Demand Forecast" />
@@ -245,6 +257,46 @@ export default function Forecast() {
                           <b style={{ color: "var(--inv-ink)" }}>{fc.netDemand + fc.safetyStockUsed} to order</b>
                         </div>
                       </div>
+                      {locationAvailability.length > 1 &&
+                        (() => {
+                          const toOrder = fc.netDemand + fc.safetyStockUsed;
+                          const totalAvail = locationAvailability.reduce((s, l) => s + l.available, 0);
+                          // Proportional to each location's available stock (even split if all empty),
+                          // largest-remainder rounding so the parts sum to `toOrder`.
+                          const raw = locationAvailability.map((l) => ({
+                            name: l.name,
+                            exact: totalAvail > 0 ? (toOrder * l.available) / totalAvail : toOrder / locationAvailability.length,
+                          }));
+                          const floors = raw.map((r) => ({ name: r.name, qty: Math.floor(r.exact), frac: r.exact - Math.floor(r.exact) }));
+                          let remainder = toOrder - floors.reduce((s, r) => s + r.qty, 0);
+                          floors
+                            .slice()
+                            .sort((a, b) => b.frac - a.frac)
+                            .forEach((r) => {
+                              if (remainder > 0) {
+                                r.qty += 1;
+                                remainder -= 1;
+                              }
+                            });
+                          return (
+                            <div style={{ marginTop: "12px" }}>
+                              <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginBottom: "8px" }}>
+                                Suggested allocation by location
+                              </div>
+                              <div style={{ border: "1px solid var(--inv-divider-3)", borderRadius: "12px", overflow: "hidden" }}>
+                                {floors.map((r) => (
+                                  <div
+                                    key={r.name}
+                                    style={{ display: "flex", justifyContent: "space-between", fontSize: "12.5px", padding: "8px 14px", borderBottom: "1px solid var(--inv-divider)" }}
+                                  >
+                                    <span>{r.name}</span>
+                                    <span style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600 }}>{r.qty}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })()}
                     </>
                   )
                 )}

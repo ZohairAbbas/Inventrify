@@ -2,6 +2,15 @@ import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
 import { calculateReorderPoint } from "./forecast.server";
 
+const LOCATIONS_QUERY = `
+  query getLocations($cursor: String) {
+    locations(first: 50, after: $cursor) {
+      edges { node { id name isActive } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
 const PRIMARY_LOCATION_QUERY = `
   query getPrimaryLocation {
     locations(first: 1) {
@@ -18,22 +27,68 @@ const INVENTORY_ADJUST_MUTATION = `
   }
 `;
 
+interface ShopifyLocation {
+  id: string;
+  name: string;
+  isActive: boolean;
+}
+
+/**
+ * Upserts every Shopify location into the local `Location` table so per-location
+ * stock has a stable foreign key. Returns a map of shopifyLocationId → Location.id.
+ */
+export async function syncLocations(
+  admin: AdminApiContext,
+  shop: string,
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  let cursor: string | null = null;
+  let hasNextPage = true;
+
+  while (hasNextPage) {
+    const resp = await admin.graphql(LOCATIONS_QUERY, { variables: { cursor } });
+    const json = await resp.json();
+    const data = json.data?.locations;
+    if (!data) break;
+
+    for (const { node } of data.edges as { node: ShopifyLocation }[]) {
+      const location = await prisma.location.upsert({
+        where: { shop_shopifyLocationId: { shop, shopifyLocationId: node.id } },
+        create: { shop, shopifyLocationId: node.id, name: node.name, isActive: node.isActive },
+        update: { name: node.name, isActive: node.isActive },
+      });
+      map.set(node.id, location.id);
+    }
+
+    hasNextPage = data.pageInfo.hasNextPage;
+    cursor = data.pageInfo.endCursor;
+  }
+
+  return map;
+}
+
 /**
  * Pushes a stock-adjustment delta to Shopify's own inventory count so it stays
  * in sync with Inventrify's tracked stock. Non-fatal on failure — the local
  * adjustment already succeeded, so we surface the error without rolling back.
+ * When `shopifyLocationId` is given the delta targets that location; otherwise
+ * it falls back to the shop's first (primary) location.
  */
 export async function applyShopifyInventoryDelta(
   admin: AdminApiContext,
   inventoryItemId: string | null,
   delta: number,
+  shopifyLocationId?: string | null,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!inventoryItemId) return { ok: false, error: "Product not linked to a Shopify inventory item" };
 
   try {
-    const locResp = await admin.graphql(PRIMARY_LOCATION_QUERY);
-    const locJson = await locResp.json();
-    const locationId: string | undefined = locJson.data?.locations?.edges?.[0]?.node?.id;
+    let locationId = shopifyLocationId ?? undefined;
+    if (!locationId) {
+      const locResp = await admin.graphql(PRIMARY_LOCATION_QUERY);
+      const locJson = await locResp.json();
+      locationId = locJson.data?.locations?.edges?.[0]?.node?.id;
+    }
     if (!locationId) return { ok: false, error: "No Shopify location found" };
 
     const resp = await admin.graphql(INVENTORY_ADJUST_MUTATION, {
@@ -70,7 +125,17 @@ const PRODUCTS_QUERY = `
                 title
                 sku
                 inventoryQuantity
-                inventoryItem { id }
+                inventoryItem {
+                  id
+                  inventoryLevels(first: 20) {
+                    edges {
+                      node {
+                        location { id }
+                        quantities(names: ["available", "on_hand"]) { name quantity }
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -81,12 +146,20 @@ const PRODUCTS_QUERY = `
   }
 `;
 
+interface ShopifyInventoryLevel {
+  location: { id: string };
+  quantities: { name: string; quantity: number }[];
+}
+
 interface ShopifyVariant {
   id: string;
   title: string;
   sku: string | null;
   inventoryQuantity: number | null;
-  inventoryItem: { id: string } | null;
+  inventoryItem: {
+    id: string;
+    inventoryLevels?: { edges: { node: ShopifyInventoryLevel }[] };
+  } | null;
 }
 
 interface ShopifyProduct {
@@ -108,6 +181,9 @@ export async function syncShopifyInventory(
   const settings = await prisma.shopSettings.findUnique({ where: { shop } });
   const defaultLeadTime = settings?.defaultLeadTime ?? 7;
 
+  // Sync locations first so per-location stock has stable FKs (shopifyLocationId → Location.id)
+  const locationMap = await syncLocations(admin, shop);
+
   while (hasNextPage) {
     const response = await admin.graphql(PRODUCTS_QUERY, {
       variables: { cursor },
@@ -125,10 +201,31 @@ export async function syncShopifyInventory(
       for (const { node: variant } of product.variants.edges) {
         seenVariantIds.add(variant.id);
         try {
-          const currentStock = variant.inventoryQuantity ?? 0;
           const variantTitle =
             variant.title === "Default Title" ? null : variant.title;
           const inventoryItemId = variant.inventoryItem?.id ?? null;
+
+          // Build per-location stock from inventory levels; fall back to the
+          // aggregate inventoryQuantity when no levels are returned.
+          const levels = variant.inventoryItem?.inventoryLevels?.edges ?? [];
+          const perLocation: { locationId: string; onHand: number; reserved: number }[] = [];
+          for (const { node: level } of levels) {
+            const localLocationId = locationMap.get(level.location.id);
+            if (!localLocationId) continue;
+            const qtyByName = new Map(level.quantities.map((q) => [q.name, q.quantity]));
+            const onHand = qtyByName.get("on_hand") ?? qtyByName.get("available") ?? 0;
+            const available = qtyByName.get("available") ?? onHand;
+            perLocation.push({
+              locationId: localLocationId,
+              onHand,
+              reserved: Math.max(0, onHand - available),
+            });
+          }
+
+          const currentStock =
+            perLocation.length > 0
+              ? perLocation.reduce((sum, l) => sum + l.onHand, 0)
+              : variant.inventoryQuantity ?? 0;
 
           const existing = await prisma.product.findUnique({
             where: { id: variant.id },
@@ -165,6 +262,14 @@ export async function syncShopifyInventory(
               inventoryItemId,
             },
           });
+
+          for (const l of perLocation) {
+            await prisma.productLocationStock.upsert({
+              where: { productId_locationId: { productId: variant.id, locationId: l.locationId } },
+              create: { shop, productId: variant.id, locationId: l.locationId, onHand: l.onHand, reserved: l.reserved },
+              update: { onHand: l.onHand, reserved: l.reserved },
+            });
+          }
 
           synced++;
         } catch {

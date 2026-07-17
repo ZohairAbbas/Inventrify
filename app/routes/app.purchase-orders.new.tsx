@@ -83,7 +83,7 @@ export default function NewPurchaseOrder() {
   const { products, suppliers, prefilledProductId, prefilledQty } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
-  const { currency = "USD" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
+  const { currency = "USD", theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const [supplierId, setSupplierId] = useState("");
   const [notes, setNotes] = useState("");
@@ -135,7 +135,7 @@ export default function NewPurchaseOrder() {
   const totalCost = lines.reduce((s, l) => s + l.quantity * l.unitCost, 0);
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Create Purchase Order" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead eyebrow="New" title="Create Purchase Order" />

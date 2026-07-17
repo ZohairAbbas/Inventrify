@@ -76,7 +76,7 @@ export default function PurchaseOrders() {
   const shopify = useAppBridge();
   const navigate = useNavigate();
   const [filter, setFilter] = useState("all");
-  const { timezone = "UTC", currency = "USD" } =
+  const { timezone = "UTC", currency = "USD", theme = "emerald" } =
     useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   useEffect(() => {
@@ -147,7 +147,7 @@ export default function PurchaseOrders() {
   }));
 
   return (
-    <div className="inv-root" style={{ minHeight: "100vh" }}>
+    <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Purchase Orders" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead

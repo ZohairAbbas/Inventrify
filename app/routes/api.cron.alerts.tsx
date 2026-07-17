@@ -1,7 +1,8 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import prisma from "../db.server";
-import { generateAlerts } from "../lib/alerts.server";
+import { generateAlerts, getUnreadAlerts } from "../lib/alerts.server";
+import { dispatchAlerts } from "../lib/alert-dispatch.server";
 
 /**
  * Cron endpoint — protected by CRON_SECRET header.
@@ -29,6 +30,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const count = await generateAlerts(shop);
     totalAlerts += count;
     results.push({ shop, alerts: count });
+
+    if (count > 0) {
+      const newAlerts = await getUnreadAlerts(shop);
+      await dispatchAlerts(shop, newAlerts);
+    }
   }
 
   return json({ shops: shops.length, totalAlerts, results });

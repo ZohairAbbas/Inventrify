@@ -38,3 +38,20 @@ export function POStatusPill({ status }: { status: string }) {
   const s = poStatusMeta(status);
   return <Pill label={status} bg={s.bg} fg={s.fg} />;
 }
+
+export type TransferStatus = "draft" | "in-transit" | "received";
+
+const TRANSFER_STATUS: Record<TransferStatus, { bg: string; fg: string }> = {
+  draft: { bg: "var(--inv-divider-3)", fg: "var(--inv-text-2)" },
+  "in-transit": { bg: "var(--inv-status-low-bg)", fg: "var(--inv-status-low-fg)" },
+  received: { bg: "var(--inv-status-healthy-bg)", fg: "var(--inv-status-healthy-fg)" },
+};
+
+export function transferStatusMeta(status: string) {
+  return TRANSFER_STATUS[status as TransferStatus] ?? TRANSFER_STATUS.draft;
+}
+
+export function TransferStatusPill({ status }: { status: string }) {
+  const s = transferStatusMeta(status);
+  return <Pill label={status} bg={s.bg} fg={s.fg} />;
+}

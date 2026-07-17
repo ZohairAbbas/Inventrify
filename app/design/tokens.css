@@ -56,6 +56,12 @@
   background: var(--inv-canvas);
 }
 
+.inv-root[data-theme="indigo"] {
+  --inv-accent: #4b52c9;
+  --inv-accent-soft: #ecebf7;
+  --inv-accent-glow: rgba(75, 82, 201, 0.5);
+}
+
 .inv-root * {
   box-sizing: border-box;
 }

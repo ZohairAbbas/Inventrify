@@ -46,3 +46,5 @@ Thumbs.db
 Current Flow/
 Inventorify app redesign prep/
 Plans/
+*.md
+courierify-schema.prisma

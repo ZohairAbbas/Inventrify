@@ -1,6 +1,9 @@
 import prisma from "../db.server";
 
-const COURIERIFY_BASE = "https://api.courierify.app";
+// Base URL of Courierify's deployment. Set COURIERIFY_BASE_URL per environment
+// (prod: https://courierify.growzar.com). Fallback is the same prod host so a missing
+// env var degrades to prod rather than an unresolvable placeholder.
+const COURIERIFY_BASE = (process.env.COURIERIFY_BASE_URL || "https://courierify.growzar.com").replace(/\/$/, "");
 // Courierify's external API is served under /api/external with flat-file routing
 // (see COURIERIFY_EXTERNAL_API.md). All responses go through a shared wrapper that
 // envelopes the payload as { timestamp, rows: [...] } and errors as { error, errorType }.

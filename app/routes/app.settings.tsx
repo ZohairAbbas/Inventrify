@@ -124,6 +124,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { intent, synced: result.synced };
   }
 
+  // Re-run all three Courierify pulls using the already-stored key (no re-entry needed).
+  if (intent === "resync_courierify") {
+    const settings = await prisma.shopSettings.findUnique({
+      where: { shop },
+      select: { courierifyApiKey: true },
+    });
+    const apiKey = settings?.courierifyApiKey;
+    if (!apiKey) return { intent, error: "Courierify is not connected" };
+
+    const result = await syncCourierifyReturnRates(shop, apiKey);
+    if (result.error) return { intent, error: result.error };
+    await syncCourierifyFulfilmentStatus(shop, apiKey);
+    await syncCourierifyReturns(shop, apiKey);
+
+    return { intent, synced: result.synced };
+  }
+
   if (intent === "save_financify") {
     const apiKey = (formData.get("financifyKey") as string)?.trim();
     if (!apiKey) return { intent, error: "API key is required" };
@@ -168,6 +185,7 @@ function IntegrationCard({
   onKeyChange,
   onConnect,
   onDisconnect,
+  onResync,
   isBusy,
 }: {
   name: string;
@@ -177,6 +195,7 @@ function IntegrationCard({
   onKeyChange: (v: string) => void;
   onConnect: () => void;
   onDisconnect: () => void;
+  onResync?: () => void;
   isBusy: boolean;
 }) {
   return (
@@ -210,9 +229,16 @@ function IntegrationCard({
       </div>
       <div style={{ fontSize: "12px", color: "var(--inv-text-2)", lineHeight: 1.5, marginBottom: "13px" }}>{desc}</div>
       {connected ? (
-        <Button variant="ghost" disabled={isBusy} onClick={onDisconnect} style={{ width: "100%" }}>
-          Disconnect
-        </Button>
+        <div style={{ display: "flex", gap: "8px" }}>
+          {onResync && (
+            <Button variant="primary" disabled={isBusy} onClick={onResync} style={{ flex: 1 }}>
+              Sync now
+            </Button>
+          )}
+          <Button variant="ghost" disabled={isBusy} onClick={onDisconnect} style={{ flex: 1 }}>
+            Disconnect
+          </Button>
+        </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
           <TextInput
@@ -259,6 +285,9 @@ export default function Settings() {
     } else if (result.intent === "save_courierify") {
       if (result.error) shopify.toast.show(String(result.error), { isError: true });
       else shopify.toast.show(`Courierify connected — ${result.synced} SKUs updated`);
+    } else if (result.intent === "resync_courierify") {
+      if (result.error) shopify.toast.show(String(result.error), { isError: true });
+      else shopify.toast.show(`Courierify synced — ${result.synced} SKUs updated`);
     } else if (result.intent === "save_financify") {
       if (result.error) shopify.toast.show(String(result.error), { isError: true });
       else shopify.toast.show(`Financify connected — ${result.synced} SKUs updated`);
@@ -414,6 +443,7 @@ export default function Settings() {
               isBusy={isBusy}
               onConnect={() => fetcher.submit({ intent: "save_courierify", courierifyKey }, { method: "POST" })}
               onDisconnect={() => fetcher.submit({ intent: "disconnect_courierify" }, { method: "POST" })}
+              onResync={() => fetcher.submit({ intent: "resync_courierify" }, { method: "POST" })}
             />
             <IntegrationCard
               name="Financify"

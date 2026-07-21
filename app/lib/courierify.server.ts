@@ -53,10 +53,15 @@ interface StatusSummaryEntry {
 
 interface ReturnEventEntry {
   shipmentId: string;
+  lineItemId: string; // Courierify ShipmentLineItem.id — always present, our dedup key
   shopifyOrderName?: string | null;
-  sku: string;
+  sku?: string | null; // nullable — SKU-less products
+  shopifyVariantId?: string | null; // fallback match key (= Product.id, the variant GID)
+  title?: string | null;
+  variantTitle?: string | null;
   quantity: number;
   returnReceivedAt?: string | null;
+  updatedAt?: string | null; // the field Courierify filters on — drives the cursor
   isShopifyReturnClosed?: boolean;
   reasonCategory?: string | null;
 }
@@ -145,10 +150,11 @@ export async function syncCourierifyFulfilmentStatus(
 
 /**
  * Pull return-received events from Courierify since the shop's stored cursor and
- * upsert them into the ReturnItem queue (keyed on shipmentId+sku). Matches each SKU
- * to a local Product. Already-resolved rows (restocked/written_off) are never reopened;
- * an incoming isShopifyReturnClosed only reconciles. Advances courierifyReturnsCursor
- * on success. Best-effort: returns { queued, error? } and never throws.
+ * upsert them into the ReturnItem queue (keyed on shipmentId+lineItemId). Matches each
+ * line to a local Product by sku, then by Shopify variant GID; unmatched lines are still
+ * queued (surfaced for manual assignment) rather than dropped. Already-resolved rows are
+ * never reopened. Advances courierifyReturnsCursor to max(updatedAt) seen − buffer (never
+ * to wall-clock now). Best-effort: returns { queued, error? } and never throws.
  */
 export async function syncCourierifyReturns(
   shop: string,
@@ -166,29 +172,45 @@ export async function syncCourierifyReturns(
 
     const data = result.rows ?? [];
     let queued = 0;
+    let maxUpdatedAt: Date | null = null;
 
     for (const evt of data) {
-      if (!evt.sku) continue;
-      const product = await prisma.product.findFirst({
-        where: { shop, sku: evt.sku },
-        select: { id: true },
-      });
+      if (!evt.lineItemId) continue; // dedup key must be present
+
+      // Track the newest updatedAt seen — this drives the cursor (the field Courierify
+      // filters on), not returnReceivedAt (a different, earlier field) or wall-clock now.
+      const updatedAt = evt.updatedAt ? new Date(evt.updatedAt) : null;
+      if (updatedAt && (!maxUpdatedAt || updatedAt > maxUpdatedAt)) maxUpdatedAt = updatedAt;
+
+      // Match to a local Product: prefer sku, fall back to the Shopify variant GID
+      // (Product.id IS the variant GID). null = unmatched → surfaced for manual assignment.
+      let productId: string | null = null;
+      if (evt.sku) {
+        productId = (await prisma.product.findFirst({ where: { shop, sku: evt.sku }, select: { id: true } }))?.id ?? null;
+      }
+      if (!productId && evt.shopifyVariantId) {
+        productId = (await prisma.product.findFirst({ where: { shop, id: evt.shopifyVariantId }, select: { id: true } }))?.id ?? null;
+      }
 
       const receivedAt = evt.returnReceivedAt ? new Date(evt.returnReceivedAt) : null;
 
-      // Idempotent upsert. Never resets an already-resolved row back to pending.
+      // Idempotent upsert keyed on (shipmentId, lineItemId). Never resets a resolved row.
       const existing = await prisma.returnItem.findUnique({
-        where: { shipmentId_sku: { shipmentId: evt.shipmentId, sku: evt.sku } },
+        where: { shipmentId_lineItemId: { shipmentId: evt.shipmentId, lineItemId: evt.lineItemId } },
       });
 
       if (existing) {
-        // Only refresh descriptive fields; leave status/resolution alone.
+        // Refresh descriptive/match fields; leave status/resolution alone.
         await prisma.returnItem.update({
           where: { id: existing.id },
           data: {
             shopifyOrderName: evt.shopifyOrderName ?? existing.shopifyOrderName,
+            sku: evt.sku ?? existing.sku,
+            shopifyVariantId: evt.shopifyVariantId ?? existing.shopifyVariantId,
+            title: evt.title ?? existing.title,
+            variantTitle: evt.variantTitle ?? existing.variantTitle,
             reasonCategory: evt.reasonCategory ?? existing.reasonCategory,
-            productId: existing.productId ?? product?.id ?? null,
+            productId: existing.productId ?? productId,
             returnReceivedAt: receivedAt ?? existing.returnReceivedAt,
           },
         });
@@ -197,9 +219,13 @@ export async function syncCourierifyReturns(
           data: {
             shop,
             shipmentId: evt.shipmentId,
+            lineItemId: evt.lineItemId,
             shopifyOrderName: evt.shopifyOrderName ?? null,
-            sku: evt.sku,
-            productId: product?.id ?? null,
+            sku: evt.sku ?? null,
+            shopifyVariantId: evt.shopifyVariantId ?? null,
+            title: evt.title ?? null,
+            variantTitle: evt.variantTitle ?? null,
+            productId,
             quantity: Math.max(1, evt.quantity ?? 1),
             returnReceivedAt: receivedAt,
             reasonCategory: evt.reasonCategory ?? null,
@@ -209,11 +235,20 @@ export async function syncCourierifyReturns(
       }
     }
 
-    // Advance the cursor to now so the next pull is incremental.
-    await prisma.shopSettings.update({
-      where: { shop },
-      data: { courierifyReturnsCursor: new Date() },
-    });
+    // Advance the cursor to the newest updatedAt actually seen, minus a small overlap
+    // buffer so a boundary/skew case is re-fetched (the upsert makes re-pulls idempotent).
+    // Only advance when we saw timestamped rows — an empty pull must not move the cursor
+    // forward (that's what silently skipped returns before).
+    if (maxUpdatedAt) {
+      const OVERLAP_MS = 60_000;
+      const next = new Date(maxUpdatedAt.getTime() - OVERLAP_MS);
+      // Never move the cursor backwards past where it already was.
+      const advanced = cursor && next < cursor ? cursor : next;
+      await prisma.shopSettings.update({
+        where: { shop },
+        data: { courierifyReturnsCursor: advanced },
+      });
+    }
 
     return { queued };
   } catch (err) {

@@ -330,11 +330,19 @@ model StockTransferItem {
 model ReturnItem {
   id             String   @id @default(cuid())
   shop           String
-  // Courierify shipment identity — (shipmentId, sku) is the idempotency key for pulls.
+  // Courierify shipment identity. (shipmentId, lineItemId) is the idempotency key —
+  // lineItemId (Courierify ShipmentLineItem.id) is always present and unique per line,
+  // so two null-SKU lines on one shipment stay distinct.
   shipmentId     String
+  lineItemId     String
   shopifyOrderName String?
-  sku            String
-  productId      String?  // matched to Product by sku; null if no local match
+  // Product identity from Courierify. sku/shopifyVariantId are nullable (SKU-less products);
+  // title/variantTitle are for display when the line can't be matched to a local Product.
+  sku              String?
+  shopifyVariantId String?
+  title            String?
+  variantTitle     String?
+  productId      String?  // matched Product: by sku, then shopifyVariantId; null = unmatched
   product        Product? @relation(fields: [productId], references: [id])
   quantity       Int      @default(1)
   returnReceivedAt DateTime?
@@ -345,6 +353,6 @@ model ReturnItem {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  @@unique([shipmentId, sku])
+  @@unique([shipmentId, lineItemId])
   @@index([shop, status])
 }

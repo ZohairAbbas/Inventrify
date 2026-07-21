@@ -22,7 +22,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const [returns, locations, settings] = await Promise.all([
+  const [returns, locations, settings, products] = await Promise.all([
     prisma.returnItem.findMany({
       where: { shop },
       include: { product: { select: { id: true, title: true, variantTitle: true } } },
@@ -34,9 +34,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       select: { id: true, name: true },
     }),
     prisma.shopSettings.findUnique({ where: { shop }, select: { courierifyApiKey: true } }),
+    // For the manual-assignment picker on unmatched returns.
+    prisma.product.findMany({
+      where: { shop },
+      orderBy: { title: "asc" },
+      select: { id: true, title: true, variantTitle: true, sku: true },
+    }),
   ]);
 
-  return { returns, locations, courierifyConnected: !!settings?.courierifyApiKey };
+  return { returns, locations, products, courierifyConnected: !!settings?.courierifyApiKey };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -62,11 +68,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const errors: string[] = [];
 
     for (const item of items) {
-      if (!item.productId) {
-        errors.push(`${item.sku}: no matching product`);
-        continue;
-      }
+      const label = item.sku ?? item.title ?? item.shipmentId;
       if (intent === "restock") {
+        // Restock needs a product to add stock to; write-off can proceed unmatched
+        // (you're discarding a parcel you may not be able to identify).
+        if (!item.productId) {
+          errors.push(`${label}: assign a product first`);
+          continue;
+        }
         const result = await applyStockDelta(
           admin,
           shop,
@@ -77,7 +86,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           locationId,
         );
         if ("error" in result) {
-          errors.push(`${item.sku}: ${result.error}`);
+          errors.push(`${label}: ${result.error}`);
           continue;
         }
       }
@@ -99,6 +108,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { intent, ok: true, resolved, errors };
   }
 
+  // Manually link an unmatched return to a local product (SKU-less / unmatched lines).
+  if (intent === "assign") {
+    const returnId = formData.get("returnId") as string;
+    const productId = formData.get("productId") as string;
+    if (!returnId || !productId) return { intent, error: "Pick a product to assign" };
+
+    const product = await prisma.product.findFirst({ where: { id: productId, shop }, select: { id: true } });
+    if (!product) return { intent, error: "Product not found" };
+
+    await prisma.returnItem.updateMany({
+      where: { id: returnId, shop, status: "pending" },
+      data: { productId: product.id },
+    });
+    return { intent, ok: true, assigned: true };
+  }
+
   return { intent, error: "Unknown action" };
 };
 
@@ -116,7 +141,7 @@ const RETURN_PILL: Record<string, { bg: string; fg: string }> = {
 };
 
 export default function ReturnsQueue() {
-  const { returns, locations, courierifyConnected } = useLoaderData<typeof loader>();
+  const { returns, locations, products, courierifyConnected } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const { timezone = "UTC", theme = "emerald" } =
@@ -125,20 +150,31 @@ export default function ReturnsQueue() {
   const [filter, setFilter] = useState("pending");
   const [selected, setSelected] = useState<string[]>([]);
   const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
+  // Per-row product choice for unmatched returns awaiting manual assignment.
+  const [assignChoice, setAssignChoice] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    const r = fetcher.data as { intent?: string; ok?: boolean; error?: string; resolved?: number; errors?: string[] } | undefined;
+    const r = fetcher.data as { intent?: string; ok?: boolean; error?: string; resolved?: number; errors?: string[]; assigned?: boolean } | undefined;
     if (!r) return;
     if (r.error) {
       shopify.toast.show(r.error, { isError: true });
       return;
     }
     if (r.ok) {
+      if (r.assigned) {
+        shopify.toast.show("Product assigned — you can restock now");
+        return;
+      }
       const errSuffix = r.errors && r.errors.length > 0 ? ` (${r.errors.length} failed)` : "";
       shopify.toast.show(`${r.resolved ?? 0} return${(r.resolved ?? 0) === 1 ? "" : "s"} resolved${errSuffix}`);
       setSelected([]);
     }
   }, [fetcher.data, shopify]);
+
+  const assign = (returnId: string, productId: string) => {
+    if (!productId) return;
+    fetcher.submit({ intent: "assign", returnId, productId }, { method: "POST" });
+  };
 
   const list = returns.filter((r) => filter === "all" || r.status === filter);
   const pendingIds = list.filter((r) => r.status === "pending").map((r) => r.id);
@@ -171,11 +207,27 @@ export default function ReturnsQueue() {
   ];
 
   const rows = list.map((r) => {
-    const displayName = r.product
+    const unmatched = !r.productId;
+    // Prefer the matched product's name; else the name Courierify sent; else a placeholder.
+    const nameText = r.product
       ? r.product.variantTitle
         ? `${r.product.title} — ${r.product.variantTitle}`
         : r.product.title
-      : <span style={{ color: "var(--inv-status-stockout-fg)" }}>Unmatched SKU</span>;
+      : r.title
+        ? r.variantTitle
+          ? `${r.title} — ${r.variantTitle}`
+          : r.title
+        : "Unknown product";
+    const displayName = (
+      <span>
+        {nameText}
+        {unmatched && (
+          <span style={{ marginLeft: "6px", fontSize: "10.5px", fontWeight: 600, color: "var(--inv-status-stockout-fg)" }}>
+            · needs assignment
+          </span>
+        )}
+      </span>
+    );
     const pill = RETURN_PILL[r.status] ?? RETURN_PILL.pending;
     return {
       key: r.id,
@@ -194,7 +246,7 @@ export default function ReturnsQueue() {
           {r.shopifyOrderName ?? "—"}
         </span>,
         <span key="name" style={{ fontWeight: 500 }}>{displayName}</span>,
-        <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>{r.sku}</span>,
+        <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>{r.sku ?? "—"}</span>,
         <span key="qty" style={{ fontFamily: "var(--inv-font-mono)" }}>{r.quantity}</span>,
         <span key="reason" style={{ fontSize: "12px", color: "var(--inv-muted)" }}>{r.reasonCategory ?? "—"}</span>,
         <span key="received" style={{ fontSize: "12px", color: "var(--inv-muted)" }}>
@@ -202,22 +254,56 @@ export default function ReturnsQueue() {
         </span>,
         <Pill key="status" label={r.status.replace("_", " ")} bg={pill.bg} fg={pill.fg} />,
         r.status === "pending" ? (
+          unmatched ? (
+            // Unmatched line — let the merchant assign a product before resolving.
+            <div key="actions" style={{ display: "flex", gap: "6px", justifyContent: "flex-end", alignItems: "center" }}>
+              <div style={{ minWidth: "160px" }}>
+                <SelectInput
+                  value={assignChoice[r.id] ?? ""}
+                  onChange={(e) => setAssignChoice((s) => ({ ...s, [r.id]: e.target.value }))}
+                >
+                  <option value="">Assign product…</option>
+                  {products.map((pr) => (
+                    <option key={pr.id} value={pr.id}>
+                      {(pr.variantTitle ? `${pr.title} — ${pr.variantTitle}` : pr.title) + (pr.sku ? ` (${pr.sku})` : "")}
+                    </option>
+                  ))}
+                </SelectInput>
+              </div>
+              <button
+                onClick={() => assign(r.id, assignChoice[r.id] ?? "")}
+                disabled={fetcher.state !== "idle" || !assignChoice[r.id]}
+                style={{ fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-accent)", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
+              >
+                Assign
+              </button>
+              <button
+                onClick={() => resolve("writeoff", [r.id])}
+                disabled={fetcher.state !== "idle"}
+                title="Write off without restocking"
+                style={{ fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-status-stockout-fg)", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
+              >
+                Write off
+              </button>
+            </div>
+          ) : (
           <div key="actions" style={{ display: "flex", gap: "6px", justifyContent: "flex-end" }}>
             <button
               onClick={() => resolve("restock", [r.id])}
-              disabled={fetcher.state !== "idle" || !r.productId}
+              disabled={fetcher.state !== "idle"}
               style={{ fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-status-healthy-fg)", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
             >
               Restock
             </button>
             <button
               onClick={() => resolve("writeoff", [r.id])}
-              disabled={fetcher.state !== "idle" || !r.productId}
+              disabled={fetcher.state !== "idle"}
               style={{ fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-status-stockout-fg)", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
             >
               Write off
             </button>
           </div>
+          )
         ) : (
           <span key="actions" style={{ fontSize: "11.5px", color: "var(--inv-muted)", display: "block", textAlign: "right" }}>
             {r.locationId ? locations.find((l) => l.id === r.locationId)?.name ?? "" : ""}

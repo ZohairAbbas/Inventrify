@@ -1,7 +1,32 @@
 import { Resend } from "resend";
 import prisma from "../db.server";
 
-type DispatchableAlert = { type: string; message: string };
+type DispatchableAlert = {
+  type: string;
+  message: string;
+  severity?: string;
+  revenueAtRisk?: number;
+};
+
+/**
+ * Alert messages embed merchant-controlled product titles. Interpolating them straight
+ * into the email body allowed any title containing markup to inject HTML into the mail
+ * we send on the merchant's behalf.
+ */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const SEVERITY_LABEL: Record<string, string> = {
+  critical: "Critical",
+  warning: "Warning",
+  info: "Info",
+};
 
 async function sendEmail(notificationEmail: string, alerts: DispatchableAlert[]) {
   const apiKey = process.env.RESEND_API_KEY;
@@ -11,12 +36,18 @@ async function sendEmail(notificationEmail: string, alerts: DispatchableAlert[])
   }
   try {
     const resend = new Resend(apiKey);
-    const listHtml = alerts.map((a) => `<li>${a.message}</li>`).join("");
+    const listHtml = alerts
+      .map((a) => {
+        const label = SEVERITY_LABEL[a.severity ?? ""] ?? "";
+        const prefix = label ? `<strong>${escapeHtml(label)}:</strong> ` : "";
+        return `<li>${prefix}${escapeHtml(a.message)}</li>`;
+      })
+      .join("");
     await resend.emails.send({
-      from: process.env.RESEND_FROM_EMAIL || "alerts@inventrify.app",
+      from: process.env.RESEND_FROM_EMAIL || "alerts@inventorify.app",
       to: notificationEmail,
-      subject: `Inventrify — ${alerts.length} inventory alert${alerts.length !== 1 ? "s" : ""}`,
-      html: `<p>Your latest inventory alerts:</p><ul>${listHtml}</ul>`,
+      subject: `Inventorify — ${alerts.length} inventory alert${alerts.length !== 1 ? "s" : ""}`,
+      html: `<p>Your latest inventory alerts, most urgent first:</p><ul>${listHtml}</ul>`,
     });
   } catch (err) {
     console.error("[alert-dispatch] email send failed:", err instanceof Error ? err.message : err);
@@ -52,7 +83,7 @@ async function sendWhatsapp(whatsappNumber: string, alerts: DispatchableAlert[])
 
   try {
     const chatId = `${whatsappNumber.replace(/\D/g, "")}@c.us`;
-    const text = `Inventrify — ${alerts.length} inventory alert${alerts.length !== 1 ? "s" : ""}:\n\n${alerts
+    const text = `Inventorify — ${alerts.length} inventory alert${alerts.length !== 1 ? "s" : ""}:\n\n${alerts
       .map((a) => `• ${a.message}`)
       .join("\n")}`;
     const resp = await fetch(`${baseUrl}/api/sendText`, {

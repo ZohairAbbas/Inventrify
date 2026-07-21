@@ -1,19 +1,23 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import prisma from "../db.server";
-import { generateAlerts, getUnreadAlerts } from "../lib/alerts.server";
+import {
+  generateAlerts,
+  getDispatchableAlerts,
+  markAlertsNotified,
+} from "../lib/alerts.server";
 import { dispatchAlerts } from "../lib/alert-dispatch.server";
+import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
 
 /**
  * Cron endpoint — protected by CRON_SECRET header.
- * Call this daily from your scheduler (Railway, Heroku Scheduler, GitHub Actions cron, etc.)
+ * Call this daily from your scheduler.
  *
  * POST /api/cron/alerts
  * Header: x-cron-secret: <CRON_SECRET env var>
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const secret = request.headers.get("x-cron-secret");
-  if (!secret || secret !== process.env.CRON_SECRET) {
+  if (!isAuthorisedCronRequest(request)) {
     return json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -24,16 +28,35 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   });
 
   let totalAlerts = 0;
-  const results: { shop: string; alerts: number }[] = [];
+  const results: {
+    shop: string;
+    total: number;
+    opened: number;
+    resolved: number;
+    notified: number;
+    error?: string;
+  }[] = [];
 
   for (const { shop } of shops) {
-    const count = await generateAlerts(shop);
-    totalAlerts += count;
-    results.push({ shop, alerts: count });
+    try {
+      const { total, opened, resolved } = await generateAlerts(shop);
+      totalAlerts += total;
 
-    if (count > 0) {
-      const newAlerts = await getUnreadAlerts(shop);
-      await dispatchAlerts(shop, newAlerts);
+      // Only push what is actually worth pushing: unresolved, unsnoozed, and outside
+      // the notification cooldown. Previously every unread alert was re-sent on every
+      // run, so a standing condition mailed the merchant daily until they muted us.
+      const dispatchable = await getDispatchableAlerts(shop);
+      if (dispatchable.length > 0) {
+        await dispatchAlerts(shop, dispatchable);
+        await markAlertsNotified(dispatchable.map((a) => a.id));
+      }
+
+      results.push({ shop, total, opened, resolved, notified: dispatchable.length });
+    } catch (err) {
+      // One bad shop must not abort the whole run.
+      const message = err instanceof Error ? err.message : "Unknown error";
+      console.error(`[cron/alerts] ${shop} failed:`, message);
+      results.push({ shop, total: 0, opened: 0, resolved: 0, notified: 0, error: message });
     }
   }
 
@@ -41,6 +64,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 };
 
 // GET: healthcheck — returns 200 so uptime monitors can ping it
-export const loader = async ({ request }: LoaderFunctionArgs) => {
+export const loader = async (_args: LoaderFunctionArgs) => {
   return json({ ok: true, ts: new Date().toISOString() });
 };

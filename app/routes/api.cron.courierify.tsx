@@ -5,6 +5,7 @@ import {
   syncCourierifyFulfilmentStatus,
   syncCourierifyReturns,
 } from "../lib/courierify.server";
+import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
 
 /**
  * Cron endpoint — protected by CRON_SECRET header.
@@ -19,8 +20,7 @@ import {
  * Header: x-cron-secret: <CRON_SECRET env var>
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const secret = request.headers.get("x-cron-secret");
-  if (!secret || secret !== process.env.CRON_SECRET) {
+  if (!isAuthorisedCronRequest(request)) {
     return json({ error: "Unauthorized" }, { status: 401 });
   }
 

@@ -382,35 +382,46 @@ function DeliveryPipeline({
   const total = delivered + inTransit + returned + damaged || 1;
   const pct = (n: number) => (n <= 0 ? "0%" : `${Math.max(3, Math.round((n / total) * 100))}%`);
 
-  const tile = (
-    label: string,
-    value: number,
-    sub: string,
-    color: string,
-    onClick?: () => void,
-  ) => {
-    const Tag = onClick ? "button" : "div";
+  // Segment colors — indigo transit is distinct from the amber "low" status.
+  const DELIVERED = "var(--inv-status-healthy-dot)";
+  const TRANSIT = "var(--inv-transit-dot)";
+  const RETURNED = "var(--inv-status-critical-fg)";
+  const DAMAGED = "var(--inv-status-stockout-fg)";
+
+  // A pipeline tile: tinted card, dotted label, big mono value, sub caption. Prototype order is
+  // Stuck in-transit → Delivered → Returned → Damaged. Returned/Damaged open the returns queue.
+  const tile = (opts: {
+    label: string;
+    value: React.ReactNode;
+    sub: string;
+    bg: string;
+    border: string;
+    fg: string;
+    valueColor: string;
+    onClick?: () => void;
+  }) => {
+    const Tag = opts.onClick ? "button" : "div";
     return (
       <Tag
-        onClick={onClick}
+        onClick={opts.onClick}
         style={{
           textAlign: "left",
-          border: `1px solid ${color}`,
-          background: "var(--inv-subtle)",
+          border: `1px solid ${opts.border}`,
+          background: opts.bg,
           borderRadius: "13px",
           padding: "14px 15px",
-          cursor: onClick ? "pointer" : "default",
+          cursor: opts.onClick ? "pointer" : "default",
           font: "inherit",
         }}
       >
-        <div style={{ fontSize: "11.5px", color, fontWeight: 600, marginBottom: "9px", display: "flex", alignItems: "center", gap: "6px" }}>
-          <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: color, display: "inline-block" }} />
-          {label}
+        <div style={{ fontSize: "11.5px", color: opts.fg, fontWeight: 600, marginBottom: "9px", display: "flex", alignItems: "center", gap: "6px" }}>
+          <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: opts.fg, display: "inline-block" }} />
+          {opts.label}
         </div>
-        <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "22px", fontWeight: 600, letterSpacing: "-.5px", color }}>
-          {value}
+        <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "22px", fontWeight: 600, letterSpacing: "-.5px", color: opts.valueColor }}>
+          {opts.value}
         </div>
-        <div style={{ fontSize: "11.5px", color: "var(--inv-text-2)", marginTop: "5px" }}>{sub}</div>
+        <div style={{ fontSize: "11.5px", color: "var(--inv-text-2)", marginTop: "5px" }}>{opts.sub}</div>
       </Tag>
     );
   };
@@ -422,24 +433,19 @@ function DeliveryPipeline({
     </span>
   );
 
-  const DELIVERED = "var(--inv-status-healthy-fg)";
-  const TRANSIT = "var(--inv-status-low-fg)";
-  const RETURNED = "var(--inv-status-critical-fg)";
-  const DAMAGED = "var(--inv-status-stockout-fg)";
-
   return (
     <Card padding="18px 20px" style={{ marginBottom: "16px" }}>
       <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: "16px", marginBottom: "15px", flexWrap: "wrap" }}>
         <div>
           <div style={{ fontSize: "15px", fontWeight: 600, display: "flex", alignItems: "center", gap: "9px" }}>
             Delivery pipeline
-            <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: ".3px", color: DELIVERED, background: "var(--inv-status-healthy-bg)", padding: "3px 9px", borderRadius: "20px", display: "inline-flex", alignItems: "center", gap: "5px" }}>
-              <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: DELIVERED, display: "inline-block" }} />
+            <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: ".3px", color: "var(--inv-status-healthy-fg)", background: "var(--inv-status-healthy-bg)", padding: "3px 9px", borderRadius: "20px", display: "inline-flex", alignItems: "center", gap: "5px" }}>
+              <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "var(--inv-status-healthy-dot)", display: "inline-block" }} />
               Courierify live
             </span>
           </div>
           <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "3px" }}>
-            Live fulfilment snapshot · delivered, in-transit, returned &amp; damaged across tracked SKUs
+            Live fulfilment snapshot · in-transit, delivered, returned &amp; damaged across tracked SKUs
           </div>
         </div>
         <button
@@ -451,10 +457,44 @@ function DeliveryPipeline({
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
-        {tile("Delivered", delivered, "units reached customers", DELIVERED)}
-        {tile("In-transit", inTransit, "units moving now", TRANSIT)}
-        {tile("Returned", returned, `${returnRate.toFixed(1)}% return rate`, RETURNED, onReviewReturns)}
-        {tile("Damaged", damaged, `${damageRate.toFixed(1)}% of handled`, DAMAGED, onReviewReturns)}
+        {tile({
+          label: "Stuck in-transit",
+          value: inTransit,
+          sub: "units moving now",
+          bg: "var(--inv-transit-bg)",
+          border: "var(--inv-transit-border)",
+          fg: "var(--inv-transit-fg)",
+          valueColor: "var(--inv-transit-value)",
+        })}
+        {tile({
+          label: "Delivered",
+          value: delivered,
+          sub: "units reached customers",
+          bg: "#f4f9f6",
+          border: "#dcece4",
+          fg: "var(--inv-status-healthy-dot)",
+          valueColor: "var(--inv-status-healthy-fg)",
+        })}
+        {tile({
+          label: "Returned",
+          value: returned,
+          sub: `${returnRate.toFixed(1)}% return rate`,
+          bg: "#fbf6ee",
+          border: "#f0e2d0",
+          fg: "var(--inv-status-critical-fg)",
+          valueColor: "#a5470f",
+          onClick: onReviewReturns,
+        })}
+        {tile({
+          label: "Damaged",
+          value: damaged,
+          sub: `${damageRate.toFixed(1)}% of handled`,
+          bg: "#fdf5f3",
+          border: "#f2d9d5",
+          fg: "var(--inv-status-stockout-fg)",
+          valueColor: "var(--inv-status-stockout-fg)",
+          onClick: onReviewReturns,
+        })}
       </div>
 
       <div style={{ display: "flex", height: "9px", borderRadius: "6px", overflow: "hidden", background: "var(--inv-divider-3)" }}>

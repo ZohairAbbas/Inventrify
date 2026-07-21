@@ -470,46 +470,57 @@ export default function Inventory() {
     { header: "COD ret.", width: ".9fr", align: "right" },
     { header: "Margin", width: "1fr", align: "right" },
     { header: "Supplier", width: "1.1fr" },
-    { header: "Pipeline", width: "1.5fr" },
+    { header: "Pipeline · Courierify", width: "2fr" },
     { header: "Status", width: "1fr", align: "right" },
   ];
 
   // Compact fulfilment-pipeline chips. Delivered/Transit/Returned come from Courierify;
   // Damaged from Inventrify's own damage-adjustment tally. Degrades gracefully when
   // Courierify isn't connected (shows Damaged only).
-  const pipelineChip = (label: string, value: number, color: string, href?: string) => {
+  // One pipeline cell: mono value stacked over an uppercase label (prototype pipeCell).
+  // Delivered/Transit are static; Returned/Damaged (when > 0) link to the returns queue.
+  const pipeCell = (
+    key: string,
+    value: number,
+    label: string,
+    color: string,
+    title: string,
+    href?: string,
+  ) => {
+    const linkable = !!href && value > 0;
     const inner = (
       <>
-        <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: color }} />
-        {value}
+        <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "13.5px", fontWeight: 600, lineHeight: 1.05, color: value > 0 ? color : "var(--inv-faint)" }}>
+          {value}
+        </div>
+        <div style={{ fontSize: "8.5px", letterSpacing: ".4px", textTransform: "uppercase", color: "var(--inv-muted)", marginTop: "3px" }}>
+          {label}
+        </div>
       </>
     );
-    const chipStyle = {
-      display: "inline-flex",
-      alignItems: "center",
-      gap: "3px",
-      fontFamily: "var(--inv-font-mono)",
-      fontSize: "11px",
-      color: "var(--inv-text-2)",
-    } as const;
-    // Returned/Damaged link to the returns queue; delivered/in-transit stay static.
-    if (href && value > 0) {
+    const cellStyle = {
+      textAlign: "center" as const,
+      minWidth: "34px",
+      padding: "2px 4px",
+      borderRadius: "7px",
+    };
+    if (linkable) {
       return (
         <Link
-          key={label}
+          key={key}
           to={href}
-          title={`${label} — open returns`}
+          title={`${title} — open returns`}
           onClick={(e) => e.stopPropagation()}
-          style={{ ...chipStyle, textDecoration: "none" }}
+          style={{ ...cellStyle, display: "block", cursor: "pointer", textDecoration: "none" }}
         >
           {inner}
         </Link>
       );
     }
     return (
-      <span key={label} title={label} style={chipStyle}>
+      <div key={key} title={title} style={cellStyle}>
         {inner}
-      </span>
+      </div>
     );
   };
 
@@ -560,11 +571,11 @@ export default function Inventory() {
       <span key="supplier" style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>
         {p.supplier?.name ?? "—"}
       </span>,
-      <div key="pipeline" style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-        {courierifyConnected && pipelineChip("Delivered", p.fulfilledDelivered, "var(--inv-status-healthy-fg)")}
-        {courierifyConnected && pipelineChip("In-transit", p.fulfilledInTransit, "var(--inv-status-low-fg)")}
-        {courierifyConnected && pipelineChip("Returned", p.fulfilledReturned, "var(--inv-status-critical-fg)", "/app/returns")}
-        {pipelineChip("Damaged", p.damaged, "var(--inv-muted)", "/app/returns")}
+      <div key="pipeline" style={{ display: "flex", gap: "10px", justifyContent: "flex-start" }}>
+        {courierifyConnected && pipeCell("deliv", p.fulfilledDelivered, "Deliv", "var(--inv-status-healthy-dot)", "Delivered — live snapshot")}
+        {courierifyConnected && pipeCell("transit", p.fulfilledInTransit, "Transit", "var(--inv-transit-fg)", "In-transit — live now")}
+        {courierifyConnected && pipeCell("ret", p.fulfilledReturned, "Ret", "var(--inv-status-critical-fg)", "Returned", "/app/returns")}
+        {pipeCell("dmg", p.damaged, "Dmg", "var(--inv-status-stockout-fg)", "Damaged", "/app/returns")}
       </div>,
       <StatusBadge key="status" status={p.status as StockStatus} />,
     ],

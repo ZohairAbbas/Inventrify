@@ -34,6 +34,13 @@
   --inv-status-stockout-fg: #b3271b;
   --inv-status-stockout-dot: #d1493f;
 
+  /* Fulfilment pipeline — in-transit (indigo, distinct from amber "low") */
+  --inv-transit-bg: #f5f6fd;
+  --inv-transit-border: #e2e6f6;
+  --inv-transit-fg: #3a40a8;
+  --inv-transit-value: #2a2f8a;
+  --inv-transit-dot: #3a40a8;
+
   --inv-link: #4b52c9;
   --inv-link-hover: #3a40a8;
 

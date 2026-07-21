@@ -46,6 +46,14 @@ model ShopSettings {
   timezone           String   @default("UTC")
   currency           String   @default("USD")
   theme              String   @default("emerald")
+  // Comma-separated Shopify gateway names the merchant treats as cash-on-delivery.
+  // Empty = fall back to heuristic matching (see lib/cod.server.ts).
+  codGateways        String   @default("")
+  // Target days of cover used when suggesting purchase-order quantities.
+  coverageDays       Int      @default(30)
+  // Typical round-trip days for an RTO parcel to come back and be re-shelved.
+  // Returning units are scheduled as inbound supply over this window.
+  rtoTransitDays     Int      @default(14)
   // Incremental cursor for the Courierify returns pull (?updatedSince=). Null = never synced.
   courierifyReturnsCursor DateTime?
   createdAt          DateTime @default(now())
@@ -63,8 +71,14 @@ model Supplier {
   leadTimeDays      Int      @default(7)
   // Computed from PO history
   avgActualLeadTime Float?   // actual avg days from sent → received
-  leadTimeVariance  Float?   // std dev of actual lead times
+  leadTimeVariance  Float?   // std dev (sigma) of actual lead times — derived from leadTimeM2
+  // Welford's online algorithm accumulator: sum of squared deviations from the running
+  // mean. sigma = sqrt(leadTimeM2 / totalPosReceived). Kept so variance stays correct
+  // when POs are received one at a time.
+  leadTimeM2        Float    @default(0)
   totalPosReceived  Int      @default(0)
+  // Supplier minimum order value — PO suggestions top up to reach it.
+  minOrderValue     Float    @default(0)
   notes             String?
   isActive          Boolean  @default(true)
   createdAt         DateTime @default(now())
@@ -87,9 +101,35 @@ model Product {
   currentStock    Int       @default(0)
   reorderPoint    Int       @default(0)
   leadTimeDays    Int       @default(7)
+  // Resolved RTO rate used by all planning maths. Precedence is applied in
+  // lib/returns-rate.server.ts: courierRtoRate (real delivery outcomes) wins over
+  // estimatedRtoRate (locally inferred). Never written directly by two sources.
   codReturnRate   Float     @default(0)
+  // Authoritative per-SKU RTO rate from Courierify delivery outcomes.
+  courierRtoRate  Float?
+  // Locally inferred fallback when Courierify is not connected.
+  estimatedRtoRate Float?
+  // "courierify" | "estimated" | "none" — provenance shown in the UI.
+  returnRateSource String   @default("none")
+  // Pre-dispatch cancellation rate. Economically distinct from RTO: the unit never
+  // left the warehouse, so it must NOT widen safety stock. Tracked separately.
+  cancellationRate Float    @default(0)
+  // Landed unit cost — drives inventory value, revenue-at-risk ranking and PO totals.
+  unitCost        Float     @default(0)
+  // Purchasing constraints applied when suggesting order quantities.
+  moq             Int       @default(1)
+  casePackSize    Int       @default(1)
   avgMargin       Float     @default(0)
   avgDailySales   Float     @default(0)
+  // Demand/variability classification, recomputed by the planning job.
+  abcClass        String?   // A | B | C by revenue contribution
+  xyzClass        String?   // X | Y | Z by demand variability (CV)
+  // Rolling forecast-accuracy cache (see ForecastAccuracy).
+  forecastMape    Float?
+  forecastBias    Float?
+  // Earliest date this variant actually sold — bounds the demand-variance window so
+  // new products are not padded with fake zero-demand days.
+  firstSoldAt     DateTime?
   // Fulfilment pipeline — live per-SKU snapshot synced from Courierify shipment statuses.
   // Damaged is NOT here; it is derived from StockAdjustment(reason="damage"). See contract doc.
   fulfilledDelivered Int    @default(0)
@@ -98,6 +138,10 @@ model Product {
   fulfilmentSyncedAt DateTime?
   // Safety stock — auto-computed on sync
   safetyStock     Int       @default(0)
+  // Soft delete. Products missing from Shopify are archived, never hard-deleted, so
+  // demand history survives a partial/throttled sync.
+  isArchived      Boolean   @default(false)
+  archivedAt      DateTime?
   supplierId      String?
   supplier        Supplier? @relation(fields: [supplierId], references: [id])
   createdAt       DateTime  @default(now())
@@ -113,10 +157,13 @@ model Product {
   transferItems    StockTransferItem[]
   returnItems      ReturnItem[]
 
+  forecastAccuracy ForecastAccuracy[]
+
   @@index([shop])
   @@index([productGid])
   @@index([inventoryItemId])
   @@index([shop, sku])
+  @@index([shop, isArchived])
 }
 
 // Physical stock locations synced from Shopify (source of truth for per-location inventory)
@@ -219,6 +266,9 @@ model SeasonalEvent {
   startDate        DateTime
   endDate          DateTime
   impactMultiplier Float    @default(1.0) // 1.5 = 50% demand increase
+  // Lead times stretch during peaks (customs, courier backlog). Applied to the
+  // lead-time used for reorder points while the event is in the ordering window.
+  leadTimeMultiplier Float  @default(1.0)
   // comma-separated Product ids this event affects (empty = all products)
   productIds       String   @default("")
   notes            String?
@@ -235,8 +285,18 @@ model Forecast {
   product      Product  @relation(fields: [productId], references: [id])
   forecastDate DateTime
   horizon      Int      // 30, 60, or 90 days
+  // grossDemand = units that must physically SHIP (drives stock cover).
   grossDemand  Int
+  // netDemand = units expected to be DELIVERED and kept (drives revenue, not stock).
   netDemand    Int
+  // Units to actually BUY = shipUnits - sellable returns arriving in the horizon.
+  procurementUnits Int   @default(0)
+  expectedReturnsSellable Int @default(0)
+  // 80% prediction interval around grossDemand, from holdout residuals.
+  pi80Low      Int      @default(0)
+  pi80High     Int      @default(0)
+  // Which model produced this row: croston | sba | damped_trend | moving_average
+  method       String   @default("moving_average")
   confidence   Float
   // AI enhancements
   seasonalityApplied Boolean @default(false)
@@ -257,6 +317,9 @@ model PurchaseOrder {
   supplier             Supplier? @relation(fields: [supplierId], references: [id])
   notes                String?
   totalCost            Float     @default(0)
+  // When the PO was actually sent to the supplier. Lead time is measured
+  // sentAt -> actualDeliveryDate, NOT createdAt (a draft may sit for weeks).
+  sentAt               DateTime?
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
   createdAt            DateTime  @default(now())
@@ -286,10 +349,25 @@ model Alert {
   productId String
   message   String
   isRead    Boolean  @default(false)
+  // Stable identity across runs (shop + type + productId). Lets the generator upsert
+  // instead of delete-and-recreate, so read state and snoozes survive.
+  dedupeKey String
+  severity  String   @default("info") // critical | warning | info
+  // Estimated revenue exposed by this condition — used to rank the digest.
+  revenueAtRisk Float @default(0)
+  snoozedUntil  DateTime?
+  // Last time this alert was actually pushed to email/WhatsApp — prevents
+  // re-notifying daily for the same standing condition.
+  lastNotifiedAt DateTime?
+  // Set when the condition clears; the row is kept for history.
+  resolvedAt     DateTime?
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
+  @@unique([shop, dedupeKey])
   @@index([shop, isRead])
   @@index([shop, type])
+  @@index([shop, resolvedAt])
 }
 
 // Stock transfers between locations — draft → in-transit → received
@@ -355,4 +433,36 @@ model ReturnItem {
 
   @@unique([shipmentId, lineItemId])
   @@index([shop, status])
+}
+
+// Webhook idempotency ledger. Shopify retries on any non-2xx or timeout; without this
+// ORDERS_CREATE double-counts on every retry. Keyed on the X-Shopify-Webhook-Id header.
+model WebhookEvent {
+  id         String   @id // X-Shopify-Webhook-Id
+  shop       String
+  topic      String
+  receivedAt DateTime @default(now())
+
+  @@index([shop, topic])
+  @@index([receivedAt])
+}
+
+// Forecast-vs-actual ledger. Every forecast writes a row due at forecastDate; a job
+// fills in `actual` once that date passes, giving per-SKU MAPE and bias. Bias is what
+// catches systematic under/over-buying (e.g. planning on net instead of gross demand).
+model ForecastAccuracy {
+  id          String    @id @default(cuid())
+  shop        String
+  productId   String
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  horizon     Int
+  forecastedAt DateTime @default(now())
+  dueAt       DateTime  // forecastedAt + horizon days
+  predicted   Int
+  actual      Int?
+  evaluatedAt DateTime?
+
+  @@unique([productId, horizon, dueAt])
+  @@index([shop, dueAt])
+  @@index([shop, evaluatedAt])
 }

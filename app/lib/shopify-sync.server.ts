@@ -139,7 +139,8 @@ const PRODUCT_VARIANTS_QUERY = `
           title
           sku
           inventoryQuantity
-          product { id title }
+          image { url }
+          product { id title featuredImage { url } }
           inventoryItem {
             id
             inventoryLevels(first: 50) {
@@ -190,7 +191,8 @@ interface ShopifyVariant {
   title: string;
   sku: string | null;
   inventoryQuantity: number | null;
-  product: { id: string; title: string };
+  image: { url: string } | null;
+  product: { id: string; title: string; featuredImage: { url: string } | null };
   inventoryItem: {
     id: string;
     inventoryLevels?: Paged<ShopifyInventoryLevel>;
@@ -239,6 +241,9 @@ export async function syncShopifyInventory(
         try {
           const variantTitle = variant.title === "Default Title" ? null : variant.title;
           const inventoryItemId = variant.inventoryItem?.id ?? null;
+          // Variant image when it has its own, else the product's featured image.
+          const imageUrl =
+            variant.image?.url ?? variant.product.featuredImage?.url ?? null;
 
           // Build per-location stock from inventory levels; fall back to the
           // aggregate inventoryQuantity when no levels are returned.
@@ -292,6 +297,7 @@ export async function syncShopifyInventory(
               title: variant.product.title,
               variantTitle,
               sku: variant.sku ?? null,
+              imageUrl,
               currentStock,
               reorderPoint,
               leadTimeDays,
@@ -303,6 +309,7 @@ export async function syncShopifyInventory(
               title: variant.product.title,
               variantTitle,
               sku: variant.sku ?? null,
+              imageUrl,
               currentStock,
               inventoryItemId,
               productGid: variant.product.id,

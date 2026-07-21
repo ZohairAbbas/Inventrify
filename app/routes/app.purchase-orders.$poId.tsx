@@ -6,7 +6,7 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, PageHead, POStatusPill, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, PageHead, POStatusPill, ProductThumb, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -241,7 +241,12 @@ export default function PODetail() {
     return {
       key: item.id,
       cells: [
-        <span key="name" style={{ fontWeight: 500 }}>{name}</span>,
+        <div key="name" style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
+          <ProductThumb src={item.product.imageUrl} name={name} size={30} />
+          <span style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {name}
+          </span>
+        </div>,
         <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>
           {item.product.sku ?? "—"}
         </span>,

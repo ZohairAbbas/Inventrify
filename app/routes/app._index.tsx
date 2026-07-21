@@ -21,6 +21,7 @@ import { generateAlerts, getUnreadAlerts } from "../lib/alerts.server";
 import {
   Card,
   DataTable,
+  ProductThumb,
   HeroBand,
   KpiCard,
   PageHead,
@@ -196,7 +197,12 @@ export default function Dashboard() {
   const rows = data.stockStatuses.map((p) => ({
     key: p.id,
     cells: [
-      p.displayName,
+      <div key="name" style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
+        <ProductThumb src={p.imageUrl} name={p.displayName} />
+        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          {p.displayName}
+        </span>
+      </div>,
       <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>
         {p.sku ?? "—"}
       </span>,

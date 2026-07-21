@@ -14,6 +14,7 @@ import {
   FilterChips,
   PageHead,
   Pill,
+  ProductThumb,
   SelectInput,
   type DataTableColumn,
 } from "../design";
@@ -25,7 +26,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const [returns, locations, settings, products] = await Promise.all([
     prisma.returnItem.findMany({
       where: { shop },
-      include: { product: { select: { id: true, title: true, variantTitle: true } } },
+      include: {
+        product: {
+          select: { id: true, title: true, variantTitle: true, imageUrl: true },
+        },
+      },
       orderBy: [{ status: "asc" }, { returnReceivedAt: "desc" }],
     }),
     prisma.location.findMany({
@@ -245,7 +250,12 @@ export default function ReturnsQueue() {
         <span key="order" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12.5px", color: "var(--inv-text-2)" }}>
           {r.shopifyOrderName ?? "—"}
         </span>,
-        <span key="name" style={{ fontWeight: 500 }}>{displayName}</span>,
+        <div key="name" style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
+          <ProductThumb src={r.product?.imageUrl} name={nameText} size={30} />
+          <span style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {displayName}
+          </span>
+        </div>,
         <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>{r.sku ?? "—"}</span>,
         <span key="qty" style={{ fontFamily: "var(--inv-font-mono)" }}>{r.quantity}</span>,
         <span key="reason" style={{ fontSize: "12px", color: "var(--inv-muted)" }}>{r.reasonCategory ?? "—"}</span>,

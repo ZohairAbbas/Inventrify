@@ -26,6 +26,7 @@ import {
   FilterChips,
   PageHead,
   SelectInput,
+  ProductThumb,
   StatusBadge,
   Toast,
   type DataTableColumn,
@@ -592,9 +593,12 @@ export default function Inventory() {
         onClick={(e) => e.stopPropagation()}
         onChange={() => toggleOne(p.id)}
       />,
-      <div key="name">
-        <div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-          {p.displayName}
+      <div key="name" style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
+        <ProductThumb src={p.imageUrl} name={p.displayName} />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {p.displayName}
+          </div>
         </div>
       </div>,
       <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>
@@ -808,9 +812,14 @@ export default function Inventory() {
                 {drawerProduct.sku ?? "—"}
               </span>
             </div>
-            <div style={{ fontSize: "19px", fontWeight: 600, marginBottom: "2px" }}>{drawerProduct.title}</div>
-            <div style={{ fontSize: "13px", color: "var(--inv-muted)", marginBottom: "18px" }}>
-              {drawerProduct.variantTitle ?? ""}
+            <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "18px" }}>
+              <ProductThumb src={drawerProduct.imageUrl} name={drawerProduct.displayName} size={56} />
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: "19px", fontWeight: 600, marginBottom: "2px" }}>{drawerProduct.title}</div>
+                <div style={{ fontSize: "13px", color: "var(--inv-muted)" }}>
+                  {drawerProduct.variantTitle ?? ""}
+                </div>
+              </div>
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "18px" }}>
               {[

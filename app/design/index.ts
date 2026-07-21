@@ -18,5 +18,6 @@ export { Pill, POStatusPill, poStatusMeta, TransferStatusPill, transferStatusMet
 export type { POStatus, TransferStatus } from "./Pill";
 export { FormField, TextInput, TextArea, SelectInput } from "./FormField";
 export { BarChart } from "./BarChart";
+export { ProductThumb } from "./ProductThumb";
 export { ProductPicker } from "./ProductPicker";
 export type { PickerProduct } from "./ProductPicker";

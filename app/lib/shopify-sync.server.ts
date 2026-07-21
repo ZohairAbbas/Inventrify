@@ -2,6 +2,89 @@ import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
 import { calculateReorderPoint } from "./forecast.server";
 
+/** Run `limit` promises at a time. Keeps sync fast without stampeding the DB pool. */
+async function mapPool<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Shopify's GraphQL API is cost-throttled: over-budget queries come back as a 429, or
+ * as a 200 carrying a THROTTLED error. Either way the previous code treated the page as
+ * "no data" and silently stopped — which, combined with the orphan sweep below, used to
+ * delete every product the aborted pagination had not reached yet.
+ *
+ * This retries with exponential backoff and *throws* when it finally gives up, so
+ * callers must decide explicitly what a failed page means. Never returns partial data.
+ */
+async function graphqlWithRetry<T>(
+  admin: AdminApiContext,
+  query: string,
+  variables: Record<string, unknown> = {},
+  attempts = 5,
+): Promise<T> {
+  let lastError = "unknown error";
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) await sleep(Math.min(1000 * 2 ** (attempt - 1), 8000));
+
+    let json: {
+      data?: T;
+      errors?: { message?: string; extensions?: { code?: string } }[];
+    };
+    try {
+      const response = await admin.graphql(query, { variables });
+      if (response.status === 429) {
+        lastError = "throttled (429)";
+        continue;
+      }
+      if (!response.ok) {
+        lastError = `HTTP ${response.status}`;
+        // 5xx is worth retrying; other 4xx will not fix themselves.
+        if (response.status < 500) throw new Error(lastError);
+        continue;
+      }
+      json = await response.json();
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : "request failed";
+      continue;
+    }
+
+    const throttled = json.errors?.some(
+      (e) => e.extensions?.code === "THROTTLED" || /throttl/i.test(e.message ?? ""),
+    );
+    if (throttled) {
+      lastError = "throttled";
+      continue;
+    }
+    if (json.errors?.length) {
+      throw new Error(json.errors.map((e) => e.message ?? "graphql error").join(", "));
+    }
+    if (!json.data) {
+      lastError = "response contained no data";
+      continue;
+    }
+    return json.data;
+  }
+
+  throw new Error(`Shopify GraphQL failed after ${attempts} attempts: ${lastError}`);
+}
+
 const LOCATIONS_QUERY = `
   query getLocations($cursor: String) {
     locations(first: 50, after: $cursor) {
@@ -33,6 +116,18 @@ interface ShopifyLocation {
   isActive: boolean;
 }
 
+interface Paged<N> {
+  edges: { node: N }[];
+  pageInfo: { hasNextPage: boolean; endCursor: string | null };
+}
+
+// Named response shapes. These are annotated at the call sites rather than left to
+// inference: `cursor` is assigned out of the same object it is used to fetch, and TS
+// reports that round trip as circular (TS7022) unless the result type is explicit.
+interface LocationsResponse {
+  locations: Paged<ShopifyLocation>;
+}
+
 /**
  * Upserts every Shopify location into the local `Location` table so per-location
  * stock has a stable foreign key. Returns a map of shopifyLocationId → Location.id.
@@ -46,12 +141,13 @@ export async function syncLocations(
   let hasNextPage = true;
 
   while (hasNextPage) {
-    const resp = await admin.graphql(LOCATIONS_QUERY, { variables: { cursor } });
-    const json = await resp.json();
-    const data = json.data?.locations;
-    if (!data) break;
+    const data: LocationsResponse = await graphqlWithRetry<LocationsResponse>(
+      admin,
+      LOCATIONS_QUERY,
+      { cursor },
+    );
 
-    for (const { node } of data.edges as { node: ShopifyLocation }[]) {
+    for (const { node } of data.locations.edges) {
       const location = await prisma.location.upsert({
         where: { shop_shopifyLocationId: { shop, shopifyLocationId: node.id } },
         create: { shop, shopifyLocationId: node.id, name: node.name, isActive: node.isActive },
@@ -60,8 +156,8 @@ export async function syncLocations(
       map.set(node.id, location.id);
     }
 
-    hasNextPage = data.pageInfo.hasNextPage;
-    cursor = data.pageInfo.endCursor;
+    hasNextPage = data.locations.pageInfo.hasNextPage;
+    cursor = data.locations.pageInfo.endCursor;
   }
 
   return map;
@@ -69,7 +165,7 @@ export async function syncLocations(
 
 /**
  * Pushes a stock-adjustment delta to Shopify's own inventory count so it stays
- * in sync with Inventrify's tracked stock. Non-fatal on failure — the local
+ * in sync with Inventorify's tracked stock. Non-fatal on failure — the local
  * adjustment already succeeded, so we surface the error without rolling back.
  * When `shopifyLocationId` is given the delta targets that location; otherwise
  * it falls back to the shop's first (primary) location.
@@ -85,25 +181,26 @@ export async function applyShopifyInventoryDelta(
   try {
     let locationId = shopifyLocationId ?? undefined;
     if (!locationId) {
-      const locResp = await admin.graphql(PRIMARY_LOCATION_QUERY);
-      const locJson = await locResp.json();
-      locationId = locJson.data?.locations?.edges?.[0]?.node?.id;
+      const locData = await graphqlWithRetry<{
+        locations: { edges: { node: { id: string } }[] };
+      }>(admin, PRIMARY_LOCATION_QUERY);
+      locationId = locData.locations?.edges?.[0]?.node?.id;
     }
     if (!locationId) return { ok: false, error: "No Shopify location found" };
 
-    const resp = await admin.graphql(INVENTORY_ADJUST_MUTATION, {
-      variables: {
-        input: {
-          reason: "correction",
-          name: "available",
-          changes: [{ delta, inventoryItemId, locationId }],
-        },
+    const data = await graphqlWithRetry<{
+      inventoryAdjustQuantities?: { userErrors: { message: string }[] };
+    }>(admin, INVENTORY_ADJUST_MUTATION, {
+      input: {
+        reason: "correction",
+        name: "available",
+        changes: [{ delta, inventoryItemId, locationId }],
       },
     });
-    const json = await resp.json();
-    const userErrors = json.data?.inventoryAdjustQuantities?.userErrors ?? [];
+
+    const userErrors = data.inventoryAdjustQuantities?.userErrors ?? [];
     if (userErrors.length > 0) {
-      return { ok: false, error: userErrors.map((e: { message: string }) => e.message).join(", ") };
+      return { ok: false, error: userErrors.map((e) => e.message).join(", ") };
     }
     return { ok: true };
   } catch (err) {
@@ -111,32 +208,35 @@ export async function applyShopifyInventoryDelta(
   }
 }
 
-const PRODUCTS_QUERY = `
-  query getProducts($cursor: String) {
-    products(first: 50, after: $cursor) {
+/**
+ * Flat pagination over every variant in the shop.
+ *
+ * This deliberately does NOT nest variants under products. The old query asked for
+ * `products(first: 50) { variants(first: 20) }`, which silently dropped variant 21+ of
+ * any product — and those dropped variants were then treated as deleted-from-Shopify
+ * and hard-deleted along with their sales history. A flat `productVariants` connection
+ * has no such ceiling.
+ */
+const PRODUCT_VARIANTS_QUERY = `
+  query getProductVariants($cursor: String) {
+    productVariants(first: 100, after: $cursor) {
       edges {
         node {
           id
           title
-          variants(first: 20) {
-            edges {
-              node {
-                id
-                title
-                sku
-                inventoryQuantity
-                inventoryItem {
-                  id
-                  inventoryLevels(first: 20) {
-                    edges {
-                      node {
-                        location { id }
-                        quantities(names: ["available", "on_hand"]) { name quantity }
-                      }
-                    }
-                  }
+          sku
+          inventoryQuantity
+          product { id title }
+          inventoryItem {
+            id
+            inventoryLevels(first: 50) {
+              edges {
+                node {
+                  location { id }
+                  quantities(names: ["available", "on_hand"]) { name quantity }
                 }
               }
+              pageInfo { hasNextPage endCursor }
             }
           }
         }
@@ -146,9 +246,30 @@ const PRODUCTS_QUERY = `
   }
 `;
 
+/** Follow-up pagination for the rare variant stocked at more than 50 locations. */
+const INVENTORY_LEVELS_QUERY = `
+  query getInventoryLevels($id: ID!, $cursor: String) {
+    inventoryItem(id: $id) {
+      inventoryLevels(first: 50, after: $cursor) {
+        edges {
+          node {
+            location { id }
+            quantities(names: ["available", "on_hand"]) { name quantity }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+`;
+
 interface ShopifyInventoryLevel {
   location: { id: string };
   quantities: { name: string; quantity: number }[];
+}
+
+interface ProductVariantsResponse {
+  productVariants: Paged<ShopifyVariant>;
 }
 
 interface ShopifyVariant {
@@ -156,26 +277,19 @@ interface ShopifyVariant {
   title: string;
   sku: string | null;
   inventoryQuantity: number | null;
+  product: { id: string; title: string };
   inventoryItem: {
     id: string;
-    inventoryLevels?: { edges: { node: ShopifyInventoryLevel }[] };
+    inventoryLevels?: Paged<ShopifyInventoryLevel>;
   } | null;
-}
-
-interface ShopifyProduct {
-  id: string;
-  title: string;
-  variants: { edges: { node: ShopifyVariant }[] };
 }
 
 export async function syncShopifyInventory(
   admin: AdminApiContext,
   shop: string,
-): Promise<{ synced: number; errors: number }> {
+): Promise<{ synced: number; errors: number; archived: number; completed: boolean; error?: string }> {
   let synced = 0;
   let errors = 0;
-  let cursor: string | null = null;
-  let hasNextPage = true;
   const seenVariantIds = new Set<string>();
 
   const settings = await prisma.shopSettings.findUnique({ where: { shop } });
@@ -184,32 +298,54 @@ export async function syncShopifyInventory(
   // Sync locations first so per-location stock has stable FKs (shopifyLocationId → Location.id)
   const locationMap = await syncLocations(admin, shop);
 
-  while (hasNextPage) {
-    const response = await admin.graphql(PRODUCTS_QUERY, {
-      variables: { cursor },
-    });
+  // One read instead of a findUnique per variant.
+  const existingRows = await prisma.product.findMany({
+    where: { shop },
+    select: { id: true, leadTimeDays: true, avgDailySales: true, reorderPoint: true, isArchived: true },
+  });
+  const existingById = new Map(existingRows.map((p) => [p.id, p]));
 
-    const json = await response.json();
-    const productsData = json.data?.products;
-    if (!productsData) break;
+  let cursor: string | null = null;
+  let hasNextPage = true;
+  // Only a clean, complete walk of the catalogue may drive the archive sweep below.
+  let completed = false;
+  let fatalError: string | undefined;
 
-    const products: ShopifyProduct[] = productsData.edges.map(
-      (e: { node: ShopifyProduct }) => e.node,
-    );
+  try {
+    while (hasNextPage) {
+      const data: ProductVariantsResponse = await graphqlWithRetry<ProductVariantsResponse>(
+        admin,
+        PRODUCT_VARIANTS_QUERY,
+        { cursor },
+      );
 
-    for (const product of products) {
-      for (const { node: variant } of product.variants.edges) {
-        seenVariantIds.add(variant.id);
+      const variants = data.productVariants.edges.map((e) => e.node);
+      for (const v of variants) seenVariantIds.add(v.id);
+
+      await mapPool(variants, 8, async (variant) => {
         try {
-          const variantTitle =
-            variant.title === "Default Title" ? null : variant.title;
+          const variantTitle = variant.title === "Default Title" ? null : variant.title;
           const inventoryItemId = variant.inventoryItem?.id ?? null;
 
           // Build per-location stock from inventory levels; fall back to the
           // aggregate inventoryQuantity when no levels are returned.
-          const levels = variant.inventoryItem?.inventoryLevels?.edges ?? [];
+          const levelNodes: ShopifyInventoryLevel[] =
+            variant.inventoryItem?.inventoryLevels?.edges.map((e) => e.node) ?? [];
+
+          // Rare, but a variant stocked at >50 locations must not be truncated.
+          let levelPage = variant.inventoryItem?.inventoryLevels?.pageInfo;
+          while (levelPage?.hasNextPage && inventoryItemId) {
+            const more = await graphqlWithRetry<{
+              inventoryItem: { inventoryLevels: Paged<ShopifyInventoryLevel> } | null;
+            }>(admin, INVENTORY_LEVELS_QUERY, { id: inventoryItemId, cursor: levelPage.endCursor });
+            const page = more.inventoryItem?.inventoryLevels;
+            if (!page) break;
+            levelNodes.push(...page.edges.map((e) => e.node));
+            levelPage = page.pageInfo;
+          }
+
           const perLocation: { locationId: string; onHand: number; reserved: number }[] = [];
-          for (const { node: level } of levels) {
+          for (const level of levelNodes) {
             const localLocationId = locationMap.get(level.location.id);
             if (!localLocationId) continue;
             const qtyByName = new Map(level.quantities.map((q) => [q.name, q.quantity]));
@@ -227,24 +363,20 @@ export async function syncShopifyInventory(
               ? perLocation.reduce((sum, l) => sum + l.onHand, 0)
               : variant.inventoryQuantity ?? 0;
 
-          const existing = await prisma.product.findUnique({
-            where: { id: variant.id },
-          });
-
+          const existing = existingById.get(variant.id);
           const leadTimeDays = existing?.leadTimeDays ?? defaultLeadTime;
           const avgDailySales = existing?.avgDailySales ?? 0;
           const reorderPoint =
-            existing?.reorderPoint ??
-            calculateReorderPoint(avgDailySales || 1, leadTimeDays);
+            existing?.reorderPoint ?? calculateReorderPoint(avgDailySales, leadTimeDays);
 
           await prisma.product.upsert({
             where: { id: variant.id },
             create: {
               id: variant.id,
               shop,
-              productGid: product.id,
+              productGid: variant.product.id,
               inventoryItemId,
-              title: product.title,
+              title: variant.product.title,
               variantTitle,
               sku: variant.sku ?? null,
               currentStock,
@@ -255,11 +387,15 @@ export async function syncShopifyInventory(
               avgDailySales: 0,
             },
             update: {
-              title: product.title,
+              title: variant.product.title,
               variantTitle,
               sku: variant.sku ?? null,
               currentStock,
               inventoryItemId,
+              productGid: variant.product.id,
+              // A variant that reappears in Shopify is un-archived rather than recreated,
+              // so its demand history stays attached.
+              ...(existing?.isArchived ? { isArchived: false, archivedAt: null } : {}),
             },
           });
 
@@ -275,47 +411,61 @@ export async function syncShopifyInventory(
         } catch {
           errors++;
         }
+      });
+
+      hasNextPage = data.productVariants.pageInfo.hasNextPage;
+      cursor = data.productVariants.pageInfo.endCursor;
+    }
+    completed = true;
+  } catch (err) {
+    fatalError = err instanceof Error ? err.message : "Unknown error";
+    console.error(`[inventorify] product sync aborted for ${shop}: ${fatalError}`);
+  }
+
+  let archived = 0;
+
+  // Archive products that no longer exist in Shopify.
+  //
+  // Guarded on `completed`: if pagination died partway through, everything we had not
+  // reached yet is missing from seenVariantIds through no fault of its own. Sweeping on a
+  // partial walk is what previously destroyed products and their 90 days of demand
+  // history on a single throttled request.
+  if (completed) {
+    const orphanIds = existingRows
+      .map((p) => p.id)
+      .filter((id) => !seenVariantIds.has(id));
+
+    if (orphanIds.length > 0) {
+      // Never archive something still referenced by an open PO.
+      const blocked = await prisma.purchaseOrderItem.findMany({
+        where: {
+          productId: { in: orphanIds },
+          purchaseOrder: { status: { in: ["draft", "sent"] } },
+        },
+        select: { productId: true },
+        distinct: ["productId"],
+      });
+      const blockedIds = new Set(blocked.map((b) => b.productId));
+      const toArchive = orphanIds.filter((id) => !blockedIds.has(id));
+
+      if (toArchive.length > 0) {
+        // Soft delete. History (sales, forecasts, adjustments, returns) is retained:
+        // it is the only record of demand for a SKU Shopify no longer lists, and it is
+        // needed if the variant comes back.
+        const res = await prisma.product.updateMany({
+          where: { id: { in: toArchive }, shop, isArchived: false },
+          data: { isArchived: true, archivedAt: new Date() },
+        });
+        archived = res.count;
       }
     }
-
-    hasNextPage = productsData.pageInfo.hasNextPage;
-    cursor = productsData.pageInfo.endCursor;
   }
 
-  // Remove products deleted from Shopify (skip if in active POs)
-  const allDbProducts = await prisma.product.findMany({
-    where: { shop },
-    select: { id: true },
-  });
-  const orphanIds = allDbProducts
-    .map((p) => p.id)
-    .filter((id) => !seenVariantIds.has(id));
-
-  for (const orphanId of orphanIds) {
-    const activePOItem = await prisma.purchaseOrderItem.findFirst({
-      where: {
-        productId: orphanId,
-        purchaseOrder: { status: { in: ["draft", "sent"] } },
-      },
-    });
-    if (activePOItem) continue;
-
-    await prisma.$transaction([
-      prisma.salesRecord.deleteMany({ where: { productId: orphanId } }),
-      prisma.forecast.deleteMany({ where: { productId: orphanId } }),
-      prisma.stockSnapshot.deleteMany({ where: { productId: orphanId } }),
-      prisma.stockAdjustment.deleteMany({ where: { productId: orphanId } }),
-      prisma.returnRateHistory.deleteMany({ where: { productId: orphanId } }),
-      prisma.purchaseOrderItem.deleteMany({ where: { productId: orphanId } }),
-      prisma.product.delete({ where: { id: orphanId } }),
-    ]);
-  }
-
-  // Daily stock snapshot
+  // Daily stock snapshot — live products only.
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
   const allProducts = await prisma.product.findMany({
-    where: { shop },
+    where: { shop, isArchived: false },
     select: { id: true, currentStock: true },
   });
   await prisma.stockSnapshot.createMany({
@@ -328,5 +478,5 @@ export async function syncShopifyInventory(
     skipDuplicates: true,
   });
 
-  return { synced, errors };
+  return { synced, errors, archived, completed, error: fatalError };
 }

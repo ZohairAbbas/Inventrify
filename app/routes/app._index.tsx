@@ -125,10 +125,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
-  const { synced, errors } = await syncShopifyInventory(admin, shop);
+  const { synced, errors, archived, completed, error: syncError } =
+    await syncShopifyInventory(admin, shop);
   const { recordsSynced } = await syncOrderHistory(admin, shop);
   await generateAlerts(shop);
-  return { synced, errors, recordsSynced };
+  return { synced, errors, archived, completed, syncError, recordsSynced };
 };
 
 export default function Dashboard() {
@@ -143,8 +144,15 @@ export default function Dashboard() {
   useEffect(() => {
     if (fetcher.data) {
       const d = fetcher.data;
-      const msg = `Synced ${d.synced} variants · ${d.recordsSynced} sales records${d.errors ? ` · ${d.errors} errors` : ""}`;
-      shopify.toast.show(msg);
+      // Report an aborted catalogue walk as a failure. Showing only the counts made a
+      // partial sync look identical to a complete one.
+      const msg = d.completed
+        ? `Synced ${d.synced} variants · ${d.recordsSynced} sales records` +
+          `${d.archived ? ` · ${d.archived} archived` : ""}` +
+          `${d.errors ? ` · ${d.errors} errors` : ""}`
+        : `Sync incomplete — ${d.syncError ?? "Shopify request failed"}. ` +
+          `${d.synced} variants updated; nothing was archived.`;
+      shopify.toast.show(msg, d.completed ? undefined : { isError: true });
       setToast(msg);
     }
   }, [fetcher.data, shopify]);

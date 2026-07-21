@@ -49,7 +49,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const intent = formData.get("intent") as string;
 
   if (intent === "sync") {
-    const { synced, errors } = await syncShopifyInventory(admin, shop);
+    const { synced, errors, archived, completed, error: syncError } =
+      await syncShopifyInventory(admin, shop);
+    // A partial catalogue walk must not be reported as a successful sync — the
+    // merchant needs to know the numbers below are incomplete.
     const { recordsSynced } = await syncOrderHistory(admin, shop);
     try {
       const resp = await admin.graphql(`{ shop { ianaTimezone currencyCode } }`);
@@ -62,7 +65,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         update: { timezone, currency },
       });
     } catch { /* non-fatal */ }
-    return { intent, synced, errors, recordsSynced };
+    return { intent, synced, errors, archived, completed, syncError, recordsSynced };
   }
 
   if (intent === "update_thresholds") {
@@ -279,7 +282,14 @@ export default function Settings() {
   useEffect(() => {
     if (!result) return;
     if (result.intent === "sync") {
-      shopify.toast.show(`Synced ${result.synced} variants · ${result.recordsSynced} sales records`);
+      if (result.completed === false) {
+        shopify.toast.show(
+          `Sync incomplete — ${result.syncError ?? "Shopify request failed"}. Nothing was archived.`,
+          { isError: true },
+        );
+      } else {
+        shopify.toast.show(`Synced ${result.synced} variants · ${result.recordsSynced} sales records`);
+      }
     } else if (result.intent === "update_thresholds") {
       shopify.toast.show("Settings saved");
     } else if (result.intent === "save_courierify") {

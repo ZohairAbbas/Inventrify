@@ -8,8 +8,13 @@ import prisma from "../db.server";
 import {
   getStockStatus,
   calculateDaysRemaining,
-  calculateReorderPoint,
 } from "../lib/forecast.server";
+import {
+  computeProcurementPlan,
+  estimateRestockRate,
+  getInventoryPositions,
+  resolveReturnRate,
+} from "../lib/planning.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
 import { generateAlerts, getUnreadAlerts } from "../lib/alerts.server";
@@ -41,7 +46,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Product.fulfilled*. Damaged mirrors the inventory page's tally: damage stock-adjustments
   // plus returned units written off from the queue (§7.8 of the integration contract).
   const [settings, damageTally, writeOffTally] = await Promise.all([
-    prisma.shopSettings.findUnique({ where: { shop }, select: { courierifyApiKey: true } }),
+    prisma.shopSettings.findUnique({
+      where: { shop },
+      select: { courierifyApiKey: true, coverageDays: true },
+    }),
     prisma.stockAdjustment.groupBy({
       by: ["productId"],
       where: { shop, reason: "damage" },
@@ -68,12 +76,24 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const dmgDenom = pipeDelivered + pipeReturned + pipeDamaged;
   const damageRate = dmgDenom > 0 ? (pipeDamaged / dmgDenom) * 100 : 0;
 
+  // Replenishment decisions are made against inventory position, not on-hand: stock
+  // already on an open PO, or coming back through RTO, is supply that has been paid
+  // for. Judging on currentStock alone re-flags SKUs that were ordered yesterday.
+  const positions = await getInventoryPositions(shop, products.map((p) => p.id));
+  const shopRestockRate = await estimateRestockRate(shop);
+  const coverageDays = settings?.coverageDays ?? 30;
+
   const stockStatuses = products.map((p) => {
-    const avgDailySales = p.avgDailySales || 0.5;
+    const pos = positions.get(p.id);
+    const position = pos?.position ?? p.currentStock;
     return {
       ...p,
-      status: getStockStatus(p.currentStock, p.reorderPoint),
-      daysRemaining: calculateDaysRemaining(p.currentStock, avgDailySales),
+      inventoryPosition: position,
+      onOrder: pos?.onOrder ?? 0,
+      rtoInbound: pos?.rtoInbound ?? 0,
+      status: getStockStatus(position, p.reorderPoint),
+      // No demand means no runway — not a fabricated 0.5 units/day.
+      daysRemaining: calculateDaysRemaining(position, p.avgDailySales),
       displayName: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
     };
   });
@@ -92,13 +112,21 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       currentStock: p.currentStock,
       reorderPoint: p.reorderPoint,
       daysRemaining: p.daysRemaining,
-      suggestedQty: Math.max(
-        10,
-        calculateReorderPoint(p.avgDailySales || 1, p.leadTimeDays) * 2 - p.currentStock,
-      ),
+      onOrder: p.onOrder,
+      suggestedQty: computeProcurementPlan({
+        shipUnits: p.avgDailySales * coverageDays,
+        returnRate: resolveReturnRate(p).rate,
+        restockRate: shopRestockRate,
+        position: p.inventoryPosition,
+        safetyStock: p.safetyStock,
+        moq: p.moq,
+        casePackSize: p.casePackSize,
+      }).orderQty,
       status: p.status,
     }))
-    .sort((a, b) => a.daysRemaining - b.daysRemaining)
+    // SKUs with no demand have no runway; sort them last rather than treating
+    // "no data" as "zero days left".
+    .sort((a, b) => (a.daysRemaining ?? Infinity) - (b.daysRemaining ?? Infinity))
     .slice(0, 5);
 
   return {
@@ -179,7 +207,7 @@ export default function Dashboard() {
         {p.currentStock}
       </span>,
       <span key="days" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
-        {p.daysRemaining > 900 ? "N/A" : `${p.daysRemaining}d`}
+        {p.daysRemaining === null ? "No demand" : `${p.daysRemaining}d`}
       </span>,
       <StatusBadge key="status" status={p.status as StockStatus} />,
     ],
@@ -305,7 +333,7 @@ export default function Dashboard() {
                 <ReorderRow
                   key={item.productId}
                   title={item.title}
-                  sub={`${item.sku ?? "—"} · ${item.currentStock <= 0 ? "out of stock" : `${item.currentStock} left`} · ${item.daysRemaining > 900 ? "N/A" : `${item.daysRemaining}d`} left`}
+                  sub={`${item.sku ?? "—"} · ${item.currentStock <= 0 ? "out of stock" : `${item.currentStock} left`} · ${item.daysRemaining === null ? "no demand" : `${item.daysRemaining}d left`}`}
                   suggestedQty={item.suggestedQty}
                   status={item.status as StockStatus}
                   createPoHref={`/app/purchase-orders/new?product=${item.productId}&qty=${item.suggestedQty}`}

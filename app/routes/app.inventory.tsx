@@ -11,8 +11,13 @@ import { applyStockDelta } from "../lib/stock.server";
 import {
   getStockStatus,
   calculateDaysRemaining,
-  calculateReorderPoint,
 } from "../lib/forecast.server";
+import {
+  computeProcurementPlan,
+  estimateRestockRate,
+  getInventoryPositions,
+  resolveReturnRate,
+} from "../lib/planning.server";
 import {
   Button,
   Card,
@@ -54,6 +59,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     orderBy: { title: "asc" },
   });
 
+  const positions = await getInventoryPositions(
+    session.shop,
+    products.map((p) => p.id),
+  );
+
   const enriched = products
     .map((p) => {
       // When a location is selected, show that location's on-hand as the "stock"
@@ -72,8 +82,17 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           reserved: ls.reserved,
           available: ls.onHand - ls.reserved,
         })),
-        status: getStockStatus(effectiveStock, p.reorderPoint),
-        daysRemaining: calculateDaysRemaining(effectiveStock, p.avgDailySales || 0.5),
+        // Status is judged on inventory position (on-hand less reserved, plus stock
+        // already on order and coming back from RTO) rather than raw on-hand, so a SKU
+        // that was reordered yesterday stops being flagged as critical today.
+        // Per-location views stay on that location's physical stock.
+        status: getStockStatus(
+          locationFilter !== "all" ? effectiveStock : positions.get(p.id)?.position ?? effectiveStock,
+          p.reorderPoint,
+        ),
+        onOrder: positions.get(p.id)?.onOrder ?? 0,
+        rtoInbound: positions.get(p.id)?.rtoInbound ?? 0,
+        daysRemaining: calculateDaysRemaining(effectiveStock, p.avgDailySales),
         displayName: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
       };
     })
@@ -201,7 +220,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const productIds = formData.getAll("productIds") as string[];
     if (productIds.length === 0) return { error: "No products selected" };
 
-    const products = await prisma.product.findMany({ where: { id: { in: productIds } } });
+    // Shop-scoped. Without this, product ids posted from the client were looked up
+    // globally, so another shop's variant ids could be pulled into this shop's PO.
+    const products = await prisma.product.findMany({
+      where: { id: { in: productIds }, shop: session.shop },
+    });
+    if (products.length === 0) return { error: "No matching products" };
+
+    const poSettings = await prisma.shopSettings.findUnique({
+      where: { shop: session.shop },
+      select: { coverageDays: true },
+    });
+    const coverageDays = poSettings?.coverageDays ?? 30;
+    const restockRate = await estimateRestockRate(session.shop);
+    const poPositions = await getInventoryPositions(
+      session.shop,
+      products.map((p) => p.id),
+    );
 
     const bySupplier = new Map<string, typeof products>();
     for (const product of products) {
@@ -216,21 +251,43 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const datePart = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
       const poNumber = `PO-${datePart}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
-      const items = group.map((product) => ({
-        productId: product.id,
-        quantityOrdered: Math.max(
-          10,
-          calculateReorderPoint(product.avgDailySales || 1, product.leadTimeDays) * 2 - product.currentStock,
-        ),
-        unitCost: 0,
-      }));
+      // Real quantities: cover the configured horizon, credit stock already on order
+      // and sellable RTO units coming back, then respect MOQ and case packs. The old
+      // formula was max(10, reorderPoint * 2 - currentStock) with unitCost hardcoded
+      // to 0, so every generated PO also had a total of 0.
+      const items = group
+        .map((product) => {
+          const plan = computeProcurementPlan({
+            shipUnits: product.avgDailySales * coverageDays,
+            returnRate: resolveReturnRate(product).rate,
+            restockRate,
+            position: poPositions.get(product.id)?.position ?? product.currentStock,
+            safetyStock: product.safetyStock,
+            moq: product.moq,
+            casePackSize: product.casePackSize,
+          });
+          return {
+            productId: product.id,
+            quantityOrdered: plan.orderQty,
+            unitCost: product.unitCost,
+          };
+        })
+        // Nothing to buy for a SKU already covered by inbound stock.
+        .filter((item) => item.quantityOrdered > 0);
+
+      if (items.length === 0) continue;
+
+      const totalCost = items.reduce(
+        (sum, item) => sum + item.quantityOrdered * item.unitCost,
+        0,
+      );
 
       await prisma.purchaseOrder.create({
         data: {
           shop: session.shop,
           poNumber,
           supplierId: supplierKey === "__none__" ? null : supplierKey,
-          totalCost: 0,
+          totalCost,
           items: { create: items },
         },
       });
@@ -558,9 +615,9 @@ export default function Inventory() {
       </span>,
       <span
         key="days"
-        style={{ fontFamily: "var(--inv-font-mono)", color: p.daysRemaining <= 7 ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)" }}
+        style={{ fontFamily: "var(--inv-font-mono)", color: p.daysRemaining !== null && p.daysRemaining <= 7 ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)" }}
       >
-        {p.daysRemaining > 900 ? "N/A" : `${p.daysRemaining}d`}
+        {p.daysRemaining === null ? "No demand" : `${p.daysRemaining}d`}
       </span>,
       <span key="cod" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
         {p.codReturnRate > 0 ? `${(p.codReturnRate * 100).toFixed(0)}%` : "—"}
@@ -759,7 +816,7 @@ export default function Inventory() {
               {[
                 ["Stock", String(drawerProduct.currentStock)],
                 ["Reorder at", String(drawerProduct.reorderPoint)],
-                ["Days left", drawerProduct.daysRemaining > 900 ? "N/A" : `${drawerProduct.daysRemaining}d`],
+                ["Days left", drawerProduct.daysRemaining === null ? "No demand" : `${drawerProduct.daysRemaining}d`],
                 ["Avg daily", `${(drawerProduct.avgDailySales || 0).toFixed(1)}/d`],
                 ["COD return", drawerProduct.codReturnRate > 0 ? `${(drawerProduct.codReturnRate * 100).toFixed(0)}%` : "—"],
                 ["Margin", drawerProduct.avgMargin > 0 ? `${(drawerProduct.avgMargin * 100).toFixed(0)}%` : "—"],

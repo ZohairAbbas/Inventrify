@@ -1,5 +1,6 @@
 import prisma from "../db.server";
 import { getStockStatus } from "./forecast.server";
+import { getInventoryPositions } from "./planning.server";
 
 /** Daily sales totals across all products for the last N days */
 export async function getSalesTrend(shop: string, days = 30) {
@@ -64,7 +65,11 @@ export async function getTopMovers(shop: string, days = 30, limit = 10) {
   });
 
   const ids = sums.map((s) => s.productId);
-  const products = await prisma.product.findMany({ where: { id: { in: ids } } });
+  // Shop-scoped. The ids happen to come from a shop-filtered groupBy, but a bare
+  // findMany by id is one refactor away from leaking across tenants.
+  const products = await prisma.product.findMany({
+    where: { id: { in: ids }, shop },
+  });
   const productMap = new Map(products.map((p) => [p.id, p]));
 
   return sums
@@ -81,35 +86,47 @@ export async function getTopMovers(shop: string, days = 30, limit = 10) {
 /** Products with no sales in N days but stock above minimum */
 export async function getDeadStock(shop: string, days = 60, minUnits = 20) {
   const since = new Date(Date.now() - days * 86400000);
-  const activeSales = await prisma.salesRecord.groupBy({
+
+  // Candidates first, then subtract the ones that sold. Passing every active product id
+  // into a `notIn` sent the whole catalogue to the database on each call, which is fine
+  // at 500 SKUs and a problem at 50k.
+  const candidates = await prisma.product.findMany({
+    where: { shop, isArchived: false, currentStock: { gte: minUnits } },
+    orderBy: { currentStock: "desc" },
+    take: 200,
+  });
+  if (candidates.length === 0) return [];
+
+  const sold = await prisma.salesRecord.groupBy({
     by: ["productId"],
-    where: { shop, date: { gte: since } },
+    where: {
+      shop,
+      date: { gte: since },
+      productId: { in: candidates.map((c) => c.id) },
+    },
     _sum: { quantity: true },
     having: { quantity: { _sum: { gt: 0 } } },
   });
-  const activeIds = new Set(activeSales.map((s) => s.productId));
+  const soldIds = new Set(sold.map((s) => s.productId));
 
-  return prisma.product.findMany({
-    where: {
-      shop,
-      currentStock: { gte: minUnits },
-      id: { notIn: Array.from(activeIds) },
-    },
-    orderBy: { currentStock: "desc" },
-    take: 20,
-  });
+  return candidates.filter((c) => !soldIds.has(c.id)).slice(0, 20);
 }
 
 /** Count of products by stock status */
 export async function getStatusDistribution(shop: string) {
   const products = await prisma.product.findMany({
-    where: { shop },
-    select: { currentStock: true, reorderPoint: true },
+    where: { shop, isArchived: false },
+    select: { id: true, currentStock: true, reorderPoint: true },
   });
+
+  // Judged on inventory position so the distribution matches what the inventory page
+  // shows, rather than counting reordered SKUs as still critical.
+  const positions = await getInventoryPositions(shop, products.map((p) => p.id));
 
   const dist = { healthy: 0, low: 0, critical: 0, stockout: 0 };
   for (const p of products) {
-    dist[getStockStatus(p.currentStock, p.reorderPoint)]++;
+    const position = positions.get(p.id)?.position ?? p.currentStock;
+    dist[getStockStatus(position, p.reorderPoint)]++;
   }
   return dist;
 }
@@ -117,7 +134,7 @@ export async function getStatusDistribution(shop: string) {
 /** Top products by COD return rate */
 export async function getHighReturnRateProducts(shop: string, limit = 10) {
   return prisma.product.findMany({
-    where: { shop, codReturnRate: { gt: 0 } },
+    where: { shop, isArchived: false, codReturnRate: { gt: 0 } },
     orderBy: { codReturnRate: "desc" },
     take: limit,
     select: {

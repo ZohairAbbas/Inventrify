@@ -477,23 +477,41 @@ export default function Inventory() {
   // Compact fulfilment-pipeline chips. Delivered/Transit/Returned come from Courierify;
   // Damaged from Inventrify's own damage-adjustment tally. Degrades gracefully when
   // Courierify isn't connected (shows Damaged only).
-  const pipelineChip = (label: string, value: number, color: string) => (
-    <span
-      key={label}
-      title={label}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "3px",
-        fontFamily: "var(--inv-font-mono)",
-        fontSize: "11px",
-        color: "var(--inv-text-2)",
-      }}
-    >
-      <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: color }} />
-      {value}
-    </span>
-  );
+  const pipelineChip = (label: string, value: number, color: string, href?: string) => {
+    const inner = (
+      <>
+        <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: color }} />
+        {value}
+      </>
+    );
+    const chipStyle = {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: "3px",
+      fontFamily: "var(--inv-font-mono)",
+      fontSize: "11px",
+      color: "var(--inv-text-2)",
+    } as const;
+    // Returned/Damaged link to the returns queue; delivered/in-transit stay static.
+    if (href && value > 0) {
+      return (
+        <Link
+          key={label}
+          to={href}
+          title={`${label} — open returns`}
+          onClick={(e) => e.stopPropagation()}
+          style={{ ...chipStyle, textDecoration: "none" }}
+        >
+          {inner}
+        </Link>
+      );
+    }
+    return (
+      <span key={label} title={label} style={chipStyle}>
+        {inner}
+      </span>
+    );
+  };
 
   const rows = products.map((p) => ({
     key: p.id,
@@ -545,8 +563,8 @@ export default function Inventory() {
       <div key="pipeline" style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
         {courierifyConnected && pipelineChip("Delivered", p.fulfilledDelivered, "var(--inv-status-healthy-fg)")}
         {courierifyConnected && pipelineChip("In-transit", p.fulfilledInTransit, "var(--inv-status-low-fg)")}
-        {courierifyConnected && pipelineChip("Returned", p.fulfilledReturned, "var(--inv-status-critical-fg)")}
-        {pipelineChip("Damaged", p.damaged, "var(--inv-muted)")}
+        {courierifyConnected && pipelineChip("Returned", p.fulfilledReturned, "var(--inv-status-critical-fg)", "/app/returns")}
+        {pipelineChip("Damaged", p.damaged, "var(--inv-muted)", "/app/returns")}
       </div>,
       <StatusBadge key="status" status={p.status as StockStatus} />,
     ],

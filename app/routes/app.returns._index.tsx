@@ -196,14 +196,14 @@ export default function ReturnsQueue() {
 
   const columns: DataTableColumn[] = [
     { header: "", width: "34px" },
-    { header: "Order", width: "1fr" },
-    { header: "Product", width: "2.2fr" },
-    { header: "SKU", width: "1fr" },
-    { header: "Qty", width: ".5fr", align: "right" },
-    { header: "Reason", width: "1.1fr" },
-    { header: "Received", width: "1fr" },
-    { header: "Status", width: ".9fr" },
-    { header: "", width: "1.8fr", align: "right" },
+    { header: "Order", width: ".8fr" },
+    { header: "Product", width: "2fr" },
+    { header: "SKU", width: ".8fr" },
+    { header: "Qty", width: ".4fr", align: "right" },
+    { header: "Reason", width: ".9fr" },
+    { header: "Received", width: ".9fr" },
+    { header: "Status", width: ".8fr" },
+    { header: "", width: "3fr", align: "right" },
   ];
 
   const rows = list.map((r) => {
@@ -257,7 +257,7 @@ export default function ReturnsQueue() {
           unmatched ? (
             // Unmatched line — let the merchant assign a product before resolving.
             <div key="actions" style={{ display: "flex", gap: "6px", justifyContent: "flex-end", alignItems: "center" }}>
-              <div style={{ minWidth: "160px" }}>
+              <div style={{ minWidth: "160px", flex: "1 1 160px" }}>
                 <SelectInput
                   value={assignChoice[r.id] ?? ""}
                   onChange={(e) => setAssignChoice((s) => ({ ...s, [r.id]: e.target.value }))}

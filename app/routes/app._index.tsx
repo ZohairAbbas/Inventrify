@@ -36,6 +36,38 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
   const locationCount = await prisma.location.count({ where: { shop, isActive: true } });
 
+  // ---------- Courierify delivery pipeline (aggregate) ----------
+  // Delivered/In-transit/Returned are the live per-variant snapshot Courierify syncs onto
+  // Product.fulfilled*. Damaged mirrors the inventory page's tally: damage stock-adjustments
+  // plus returned units written off from the queue (§7.8 of the integration contract).
+  const [settings, damageTally, writeOffTally] = await Promise.all([
+    prisma.shopSettings.findUnique({ where: { shop }, select: { courierifyApiKey: true } }),
+    prisma.stockAdjustment.groupBy({
+      by: ["productId"],
+      where: { shop, reason: "damage" },
+      _sum: { delta: true },
+    }),
+    prisma.returnItem.groupBy({
+      by: ["productId"],
+      where: { shop, status: "written_off", productId: { not: null } },
+      _sum: { quantity: true },
+    }),
+  ]);
+
+  const courierifyConnected = !!settings?.courierifyApiKey;
+  const pipeDelivered = products.reduce((sum, p) => sum + (p.fulfilledDelivered || 0), 0);
+  const pipeInTransit = products.reduce((sum, p) => sum + (p.fulfilledInTransit || 0), 0);
+  const pipeReturned = products.reduce((sum, p) => sum + (p.fulfilledReturned || 0), 0);
+  let pipeDamaged = 0;
+  for (const d of damageTally) pipeDamaged += Math.abs(d._sum.delta ?? 0);
+  for (const w of writeOffTally) pipeDamaged += w._sum.quantity ?? 0;
+
+  // Return rate over resolved shipments (delivered + returned); damage rate over all handled.
+  const retDenom = pipeDelivered + pipeReturned;
+  const returnRate = retDenom > 0 ? (pipeReturned / retDenom) * 100 : 0;
+  const dmgDenom = pipeDelivered + pipeReturned + pipeDamaged;
+  const damageRate = dmgDenom > 0 ? (pipeDamaged / dmgDenom) * 100 : 0;
+
   const stockStatuses = products.map((p) => {
     const avgDailySales = p.avgDailySales || 0.5;
     return {
@@ -78,6 +110,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     stockStatuses,
     alerts,
     reorderItems,
+    courierifyConnected,
+    pipeline: {
+      delivered: pipeDelivered,
+      inTransit: pipeInTransit,
+      returned: pipeReturned,
+      damaged: pipeDamaged,
+      returnRate,
+      damageRate,
+    },
   };
 };
 
@@ -210,6 +251,10 @@ export default function Dashboard() {
           <KpiCard label="Pending POs" value={data.pendingPOs} sub="draft + sent" />
         </div>
 
+        {data.courierifyConnected && (
+          <DeliveryPipeline pipeline={data.pipeline} onReviewReturns={() => navigate("/app/returns")} />
+        )}
+
         <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: "14px", marginBottom: "16px" }}>
           <div
             id="reorder-queue"
@@ -314,5 +359,116 @@ export default function Dashboard() {
 
       {toast && <Toast message={toast} onDismiss={() => setToast("")} />}
     </div>
+  );
+}
+
+type PipelineData = {
+  delivered: number;
+  inTransit: number;
+  returned: number;
+  damaged: number;
+  returnRate: number;
+  damageRate: number;
+};
+
+function DeliveryPipeline({
+  pipeline,
+  onReviewReturns,
+}: {
+  pipeline: PipelineData;
+  onReviewReturns: () => void;
+}) {
+  const { delivered, inTransit, returned, damaged, returnRate, damageRate } = pipeline;
+  const total = delivered + inTransit + returned + damaged || 1;
+  const pct = (n: number) => (n <= 0 ? "0%" : `${Math.max(3, Math.round((n / total) * 100))}%`);
+
+  const tile = (
+    label: string,
+    value: number,
+    sub: string,
+    color: string,
+    onClick?: () => void,
+  ) => {
+    const Tag = onClick ? "button" : "div";
+    return (
+      <Tag
+        onClick={onClick}
+        style={{
+          textAlign: "left",
+          border: `1px solid ${color}`,
+          background: "var(--inv-subtle)",
+          borderRadius: "13px",
+          padding: "14px 15px",
+          cursor: onClick ? "pointer" : "default",
+          font: "inherit",
+        }}
+      >
+        <div style={{ fontSize: "11.5px", color, fontWeight: 600, marginBottom: "9px", display: "flex", alignItems: "center", gap: "6px" }}>
+          <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: color, display: "inline-block" }} />
+          {label}
+        </div>
+        <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "22px", fontWeight: 600, letterSpacing: "-.5px", color }}>
+          {value}
+        </div>
+        <div style={{ fontSize: "11.5px", color: "var(--inv-text-2)", marginTop: "5px" }}>{sub}</div>
+      </Tag>
+    );
+  };
+
+  const legend = (color: string, label: string) => (
+    <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+      <span style={{ width: "9px", height: "9px", borderRadius: "3px", background: color }} />
+      {label}
+    </span>
+  );
+
+  const DELIVERED = "var(--inv-status-healthy-fg)";
+  const TRANSIT = "var(--inv-status-low-fg)";
+  const RETURNED = "var(--inv-status-critical-fg)";
+  const DAMAGED = "var(--inv-status-stockout-fg)";
+
+  return (
+    <Card padding="18px 20px" style={{ marginBottom: "16px" }}>
+      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", gap: "16px", marginBottom: "15px", flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: "15px", fontWeight: 600, display: "flex", alignItems: "center", gap: "9px" }}>
+            Delivery pipeline
+            <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: ".3px", color: DELIVERED, background: "var(--inv-status-healthy-bg)", padding: "3px 9px", borderRadius: "20px", display: "inline-flex", alignItems: "center", gap: "5px" }}>
+              <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: DELIVERED, display: "inline-block" }} />
+              Courierify live
+            </span>
+          </div>
+          <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "3px" }}>
+            Live fulfilment snapshot · delivered, in-transit, returned &amp; damaged across tracked SKUs
+          </div>
+        </div>
+        <button
+          onClick={onReviewReturns}
+          style={{ border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-ink)", fontSize: "12.5px", fontWeight: 500, padding: "8px 13px", borderRadius: "9px", cursor: "pointer" }}
+        >
+          Review returns →
+        </button>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
+        {tile("Delivered", delivered, "units reached customers", DELIVERED)}
+        {tile("In-transit", inTransit, "units moving now", TRANSIT)}
+        {tile("Returned", returned, `${returnRate.toFixed(1)}% return rate`, RETURNED, onReviewReturns)}
+        {tile("Damaged", damaged, `${damageRate.toFixed(1)}% of handled`, DAMAGED, onReviewReturns)}
+      </div>
+
+      <div style={{ display: "flex", height: "9px", borderRadius: "6px", overflow: "hidden", background: "var(--inv-divider-3)" }}>
+        <div style={{ width: pct(delivered), background: DELIVERED }} />
+        <div style={{ width: pct(inTransit), background: TRANSIT }} />
+        <div style={{ width: pct(returned), background: RETURNED }} />
+        <div style={{ width: pct(damaged), background: DAMAGED }} />
+      </div>
+      <div style={{ display: "flex", gap: "18px", marginTop: "11px", fontSize: "11px", color: "var(--inv-muted)", flexWrap: "wrap" }}>
+        {legend(DELIVERED, "Delivered")}
+        {legend(TRANSIT, "In-transit")}
+        {legend(RETURNED, "Returned")}
+        {legend(DAMAGED, "Damaged")}
+      </div>
+    </Card>
   );
 }

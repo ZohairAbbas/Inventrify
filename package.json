@@ -21,7 +21,9 @@
     "shopify": "shopify",
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
-    "vite": "vite"
+    "vite": "vite",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "type": "module",
   "engines": {
@@ -59,7 +61,8 @@
     "eslint-config-prettier": "^10.0.1",
     "prettier": "^3.2.4",
     "typescript": "^5.2.2",
-    "vite": "^6.2.2"
+    "vite": "^6.2.2",
+    "vitest": "^2.1.9"
   },
   "workspaces": [
     "extensions/*"

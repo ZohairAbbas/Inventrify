@@ -106,10 +106,10 @@ export async function getInventoryPositions(
   const result = new Map<string, InventoryPosition>();
   if (productIds.length === 0) return result;
 
-  const [products, reservedRows, onOrderRows, settings] = await Promise.all([
+  const [products, reservedRows, onOrderRows] = await Promise.all([
     prisma.product.findMany({
       where: { shop, id: { in: productIds } },
-      select: { id: true, currentStock: true, fulfilledReturned: true },
+      select: { id: true, currentStock: true },
     }),
     prisma.productLocationStock.groupBy({
       by: ["productId"],
@@ -123,10 +123,6 @@ export async function getInventoryPositions(
         purchaseOrder: { shop, status: "sent" },
       },
       select: { productId: true, quantityOrdered: true, quantityReceived: true },
-    }),
-    prisma.shopSettings.findUnique({
-      where: { shop },
-      select: { rtoTransitDays: true },
     }),
   ]);
 
@@ -171,7 +167,6 @@ export async function getInventoryPositions(
     });
   }
 
-  void settings; // rtoTransitDays is used by the horizon maths, not the position sum.
   return result;
 }
 

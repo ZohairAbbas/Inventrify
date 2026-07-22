@@ -259,7 +259,10 @@ model ReturnRateHistory {
   product    Product  @relation(fields: [productId], references: [id])
   weekStart  DateTime // Monday midnight UTC
   returnRate Float    // 0.0–1.0
-  orderCount Int      @default(0)
+  orderCount Int      @default(0)   // COD units ordered this week — the denominator
+  // COD units cancelled before dispatch this week. Kept beside orderCount because a
+  // cancellation rate is only meaningful against the volume it is drawn from.
+  cancelledUnits Int  @default(0)
   createdAt  DateTime @default(now())
 
   @@unique([productId, weekStart])

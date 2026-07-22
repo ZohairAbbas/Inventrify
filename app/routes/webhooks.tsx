@@ -125,8 +125,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       // They are economically opposite: a cancelled order never left the warehouse (no
       // freight, no round trip, stock was only ever reserved), whereas an RTO is a full
       // outbound+inbound journey with damage risk. Conflating them inflated buffers and
-      // fought with the authoritative Courierify rate. Cancellations are tracked on
-      // their own field and deliberately do not widen safety stock.
+      // fought with the authoritative Courierify rate. Cancellations are tracked
+      // separately and deliberately do not widen safety stock.
       const data = payload as OrderPayload;
 
       const settings = await prisma.shopSettings.findUnique({
@@ -136,6 +136,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const timezone = settings?.timezone ?? "UTC";
       const placedAt = new Date(data.created_at);
       const dateKey = shopDateKey(placedAt, timezone);
+      const weekStart = shopWeekStart(placedAt, timezone);
+      // Only COD cancellations are counted, because orderCount — the denominator they
+      // are measured against — is only populated for COD orders.
+      const isCod = isCodOrder(data, parseCodGateways(settings?.codGateways));
 
       const byVariant = new Map<string, number>();
       for (const item of data.line_items) {
@@ -155,40 +159,33 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         if (qty <= 0) continue;
 
         // Back the cancelled units out of recorded demand: they were never shipped, so
-        // counting them as demand overstates what needs replenishing.
-        const existing = await prisma.salesRecord.findUnique({
-          where: { productId_date: { productId: product.id, date: dateKey } },
-          select: { quantity: true },
-        });
-        if (existing) {
-          await prisma.salesRecord.update({
-            where: { productId_date: { productId: product.id, date: dateKey } },
-            data: { quantity: Math.max(0, existing.quantity - qty) },
-          });
-        }
+        // counting them as demand overstates what needs replenishing. Done in SQL with
+        // GREATEST so concurrent cancellations cannot lose an update or drive the
+        // quantity negative.
+        await prisma.$executeRaw`
+          UPDATE "SalesRecord"
+          SET "quantity" = GREATEST(0, "quantity" - ${qty})
+          WHERE "productId" = ${product.id} AND "date" = ${dateKey}
+        `;
 
-        // Track the cancellation rate over the trailing 30 days of orders.
-        const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000);
-        const [orderedAgg, product30] = await Promise.all([
-          prisma.salesRecord.aggregate({
-            where: { productId: product.id, date: { gte: thirtyDaysAgo } },
-            _sum: { quantity: true },
-          }),
-          prisma.product.findUnique({
-            where: { id: product.id },
-            select: { cancellationRate: true },
-          }),
-        ]);
-        const denom = (orderedAgg._sum.quantity ?? 0) + qty;
-        if (denom > 0) {
-          const prior = product30?.cancellationRate ?? 0;
-          // Exponential smoothing keeps this stable against single-order noise.
-          const observed = qty / denom;
-          await prisma.product.update({
-            where: { id: product.id },
-            data: { cancellationRate: Math.min(1, prior * 0.8 + observed * 0.2) },
-          });
-        }
+        if (!isCod) continue;
+
+        // Record the cancellation against the same weekly bucket that holds the COD
+        // order count, so the rate is cancelled units over units actually ordered.
+        await prisma.returnRateHistory.upsert({
+          where: { productId_weekStart: { productId: product.id, weekStart } },
+          create: {
+            shop,
+            productId: product.id,
+            weekStart,
+            returnRate: 0,
+            orderCount: 0,
+            cancelledUnits: qty,
+          },
+          update: { cancelledUnits: { increment: qty } },
+        });
+
+        await recomputeCancellationRate(product.id);
       }
       break;
     }
@@ -282,3 +279,32 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   return new Response(null, { status: 200 });
 };
+
+/**
+ * Cancellation rate = COD units cancelled before dispatch / COD units ordered, over the
+ * trailing four weeks.
+ *
+ * An earlier version of this computed `qty / (30-day demand + qty)` per cancellation
+ * event and exponentially smoothed it. That is not a rate: it measures what share of a
+ * month's demand one cancellation represents, so it is inverted by volume — a SKU selling
+ * 4 units a month showed a 33% "cancellation rate" from a single 2-unit cancellation,
+ * while the same cancellation on a 400-unit SKU showed 0.5%.
+ */
+async function recomputeCancellationRate(productId: string) {
+  const fourWeeksAgo = new Date(Date.now() - 28 * 86400000);
+  const agg = await prisma.returnRateHistory.aggregate({
+    where: { productId, weekStart: { gte: fourWeeksAgo } },
+    _sum: { orderCount: true, cancelledUnits: true },
+  });
+
+  const ordered = agg._sum.orderCount ?? 0;
+  const cancelled = agg._sum.cancelledUnits ?? 0;
+  // No ordered volume yet means no rate can be computed; leave the previous value be
+  // rather than writing a number derived from nothing.
+  if (ordered <= 0) return;
+
+  await prisma.product.update({
+    where: { id: productId },
+    data: { cancellationRate: Math.min(1, Math.max(0, cancelled / ordered)) },
+  });
+}

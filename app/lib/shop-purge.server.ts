@@ -36,6 +36,9 @@ export async function purgeShopData(shop: string): Promise<void> {
   await prisma.purchaseOrder.deleteMany({ where: { shop } });
 
   // Standalone per-shop tables.
+  // OrderRegion holds customer delivery cities — the most personal data the app keeps —
+  // so it must not survive an uninstall or a redaction request.
+  await prisma.orderRegion.deleteMany({ where: { shop } });
   await prisma.alert.deleteMany({ where: { shop } });
   await prisma.seasonalEvent.deleteMany({ where: { shop } });
   await prisma.webhookEvent.deleteMany({ where: { shop } });

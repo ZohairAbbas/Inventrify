@@ -33,6 +33,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     safetyStockDays: settings?.safetyStockDays ?? 7,
     deadStockDays: settings?.deadStockDays ?? 60,
     deadStockMinUnits: settings?.deadStockMinUnits ?? 20,
+    coverageDays: settings?.coverageDays ?? 30,
+    rtoTransitDays: settings?.rtoTransitDays ?? 14,
+    codGateways: settings?.codGateways ?? "",
     notificationEmail: settings?.notificationEmail ?? "",
     slackWebhookUrl: settings?.slackWebhookUrl ?? "",
     whatsappNumber: settings?.whatsappNumber ?? "",
@@ -75,6 +78,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const safetyStockDays = parseInt(formData.get("safetyStockDays") as string, 10);
     const deadStockDays = parseInt(formData.get("deadStockDays") as string, 10);
     const deadStockMinUnits = parseInt(formData.get("deadStockMinUnits") as string, 10);
+    const coverageDays = parseInt(formData.get("coverageDays") as string, 10);
+    const rtoTransitDays = parseInt(formData.get("rtoTransitDays") as string, 10);
+    const codGateways = (formData.get("codGateways") as string)?.trim() ?? "";
     const notificationEmail = (formData.get("notificationEmail") as string)?.trim() || null;
     const slackWebhookUrl = (formData.get("slackWebhookUrl") as string)?.trim() || null;
     const whatsappNumber = (formData.get("whatsappNumber") as string)?.trim() || null;
@@ -88,6 +94,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!isNaN(safetyStockDays) && safetyStockDays > 0) update.safetyStockDays = safetyStockDays;
     if (!isNaN(deadStockDays) && deadStockDays > 0) update.deadStockDays = deadStockDays;
     if (!isNaN(deadStockMinUnits) && deadStockMinUnits >= 0) update.deadStockMinUnits = deadStockMinUnits;
+    if (!isNaN(coverageDays) && coverageDays > 0) update.coverageDays = coverageDays;
+    if (!isNaN(rtoTransitDays) && rtoTransitDays >= 0) update.rtoTransitDays = rtoTransitDays;
+    update.codGateways = codGateways;
     update.notificationEmail = notificationEmail;
     update.slackWebhookUrl = slackWebhookUrl;
     update.whatsappNumber = whatsappNumber;
@@ -273,6 +282,9 @@ export default function Settings() {
   const [safetyStockDays, setSafetyStockDays] = useState(String(data.safetyStockDays));
   const [deadStockDays, setDeadStockDays] = useState(String(data.deadStockDays));
   const [deadStockMinUnits, setDeadStockMinUnits] = useState(String(data.deadStockMinUnits));
+  const [coverageDays, setCoverageDays] = useState(String(data.coverageDays));
+  const [rtoTransitDays, setRtoTransitDays] = useState(String(data.rtoTransitDays));
+  const [codGateways, setCodGateways] = useState(data.codGateways);
   const [notificationEmail, setNotificationEmail] = useState(data.notificationEmail ?? "");
   const [slackWebhookUrl, setSlackWebhookUrl] = useState(data.slackWebhookUrl ?? "");
   const [whatsappNumber, setWhatsappNumber] = useState(data.whatsappNumber ?? "");
@@ -356,6 +368,38 @@ export default function Settings() {
 
           <div style={{ height: "1px", background: "var(--inv-divider)", margin: "18px 0" }} />
 
+          <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Cash on delivery</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "18px" }}>
+            <FormField
+              label="COD gateway names"
+              hint="Comma-separated, exactly as Shopify reports them (e.g. PostEx, Cash on Delivery). Leave blank to auto-detect."
+            >
+              <TextInput
+                value={codGateways}
+                placeholder="PostEx, Cash on Delivery"
+                onChange={(e) => setCodGateways(e.target.value)}
+              />
+            </FormField>
+            <FormField
+              label="RTO round-trip (days)"
+              hint="How long a returned parcel takes to come back and be re-shelved"
+            >
+              <TextInput type="number" min={0} value={rtoTransitDays} onChange={(e) => setRtoTransitDays(e.target.value)} />
+            </FormField>
+          </div>
+
+          <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Purchasing</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "18px" }}>
+            <FormField
+              label="Coverage target (days)"
+              hint="How many days of demand a suggested purchase order should cover"
+            >
+              <TextInput type="number" min={1} value={coverageDays} onChange={(e) => setCoverageDays(e.target.value)} />
+            </FormField>
+          </div>
+
+          <div style={{ height: "1px", background: "var(--inv-divider)", margin: "18px 0" }} />
+
           <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Notifications</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "8px" }}>
             <FormField label="Notification email">
@@ -387,6 +431,9 @@ export default function Settings() {
                   safetyStockDays,
                   deadStockDays,
                   deadStockMinUnits,
+                  coverageDays,
+                  rtoTransitDays,
+                  codGateways,
                   notificationEmail,
                   slackWebhookUrl,
                   whatsappNumber,

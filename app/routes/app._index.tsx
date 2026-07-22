@@ -4,6 +4,7 @@ import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
+import { formatCurrency } from "../lib/format";
 import prisma from "../db.server";
 import {
   getStockStatus,
@@ -17,7 +18,12 @@ import {
 } from "../lib/planning.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
-import { generateAlerts, getUnreadAlerts } from "../lib/alerts.server";
+import {
+  generateAlerts,
+  getUnreadAlerts,
+  markAlertRead,
+  snoozeAlert,
+} from "../lib/alerts.server";
 import {
   Card,
   DataTable,
@@ -35,7 +41,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const products = await prisma.product.findMany({ where: { shop } });
+  const products = await prisma.product.findMany({ where: { shop, isArchived: false } });
   const alerts = await getUnreadAlerts(shop);
   const pendingPOs = await prisma.purchaseOrder.count({
     where: { shop, status: { in: ["draft", "sent"] } },
@@ -49,7 +55,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const [settings, damageTally, writeOffTally] = await Promise.all([
     prisma.shopSettings.findUnique({
       where: { shop },
-      select: { courierifyApiKey: true, coverageDays: true },
+      select: {
+        courierifyApiKey: true,
+        coverageDays: true,
+        currency: true,
+        deadStockDays: true,
+        deadStockMinUnits: true,
+      },
     }),
     prisma.stockAdjustment.groupBy({
       by: ["productId"],
@@ -130,7 +142,51 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     .sort((a, b) => (a.daysRemaining ?? Infinity) - (b.daysRemaining ?? Infinity))
     .slice(0, 5);
 
+  // ---------- Capital tied up ----------
+  //
+  // COD ties up cash in two places at once: stock sitting in the warehouse, and stock
+  // already shipped but not yet collected/remitted. Neither was visible anywhere, and
+  // both are the actual constraint on how much can be reordered.
+  //
+  // Everything here is derived from unitCost, which many shops will not have populated,
+  // so coverage is reported alongside the totals — a value computed over 20% of the
+  // catalogue must not be presented as the inventory value.
+  const withCost = products.filter((p) => p.unitCost > 0);
+  const costCoverage = products.length > 0 ? withCost.length / products.length : 0;
+
+  const stockValue = products.reduce((sum, p) => sum + p.currentStock * p.unitCost, 0);
+
+  const deadStockSince = new Date(Date.now() - (settings?.deadStockDays ?? 60) * 86400000);
+  const soldRecently = await prisma.salesRecord.groupBy({
+    by: ["productId"],
+    where: { shop, date: { gte: deadStockSince } },
+    _sum: { quantity: true },
+    having: { quantity: { _sum: { gt: 0 } } },
+  });
+  const movedIds = new Set(soldRecently.map((r) => r.productId));
+  const deadStockValue = products
+    .filter((p) => !movedIds.has(p.id) && p.currentStock >= (settings?.deadStockMinUnits ?? 20))
+    .reduce((sum, p) => sum + p.currentStock * p.unitCost, 0);
+
+  // Cash sitting with the courier: units dispatched and not yet delivered, valued at
+  // estimated sale price rather than cost, since that is what is owed back.
+  const codFloat = products.reduce((sum, p) => {
+    const price =
+      p.unitCost > 0 && p.avgMargin > 0 && p.avgMargin < 0.95
+        ? p.unitCost / (1 - p.avgMargin)
+        : p.unitCost;
+    return sum + p.fulfilledInTransit * price;
+  }, 0);
+
   return {
+    currency: settings?.currency ?? "USD",
+    capital: {
+      stockValue,
+      deadStockValue,
+      codFloat,
+      costCoverage,
+      pricedSkus: withCost.length,
+    },
     totalSkus: products.length,
     lowStock,
     critical,
@@ -154,11 +210,55 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
+  const formData = await request.formData();
+  const intent = (formData.get("intent") as string) || "sync";
+
+  // Both alert actions are shop-scoped inside the lib; an alert id alone is never
+  // enough to touch another tenant's row.
+  if (intent === "dismiss_alert") {
+    const id = formData.get("alertId") as string;
+    if (id) await markAlertRead(id, shop);
+    return { intent: "dismiss_alert" as const, ok: true };
+  }
+
+  if (intent === "snooze_alert") {
+    const id = formData.get("alertId") as string;
+    const days = parseInt((formData.get("days") as string) ?? "7", 10);
+    if (id) {
+      await snoozeAlert(
+        id,
+        shop,
+        new Date(Date.now() + (isNaN(days) ? 7 : days) * 86400000),
+      );
+    }
+    return { intent: "snooze_alert" as const, ok: true };
+  }
+
   const { synced, errors, archived, completed, error: syncError } =
     await syncShopifyInventory(admin, shop);
   const { recordsSynced } = await syncOrderHistory(admin, shop);
   await generateAlerts(shop);
-  return { synced, errors, archived, completed, syncError, recordsSynced };
+  return {
+    intent: "sync" as const,
+    synced,
+    errors,
+    archived,
+    completed,
+    syncError,
+    recordsSynced,
+  };
+};
+
+/** Small ghost button used by the alert row actions. */
+const alertActionStyle: React.CSSProperties = {
+  fontSize: "11px",
+  padding: "3px 8px",
+  borderRadius: "7px",
+  border: "1px solid var(--inv-input-border-2)",
+  background: "transparent",
+  color: "var(--inv-text-2)",
+  cursor: "pointer",
+  whiteSpace: "nowrap",
 };
 
 export default function Dashboard() {
@@ -173,6 +273,8 @@ export default function Dashboard() {
   useEffect(() => {
     if (fetcher.data) {
       const d = fetcher.data;
+      // Alert actions revalidate on their own; only the sync run reports counts.
+      if (d.intent !== "sync") return;
       // Report an aborted catalogue walk as a failure. Showing only the counts made a
       // partial sync look identical to a complete one.
       const msg = d.completed
@@ -349,6 +451,44 @@ export default function Dashboard() {
             )}
           </div>
 
+          <Card padding="17px 18px" style={{ marginBottom: "14px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>Capital tied up</div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px" }}>
+              Cash locked in stock and with the courier
+            </div>
+            {data.capital.costCoverage === 0 ? (
+              <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>
+                Add unit costs (or connect Financify) to see inventory value.
+              </div>
+            ) : (
+              <>
+                <div style={{ display: "flex", flexDirection: "column", gap: "9px" }}>
+                  {[
+                    ["Stock at cost", data.capital.stockValue],
+                    ["Dead stock", data.capital.deadStockValue],
+                    ["With courier (COD float)", data.capital.codFloat],
+                  ].map(([label, value]) => (
+                    <div
+                      key={label as string}
+                      style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "12px" }}
+                    >
+                      <span style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>{label}</span>
+                      <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "13px", fontWeight: 600 }}>
+                        {formatCurrency(value as number, data.currency)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                {data.capital.costCoverage < 0.99 && (
+                  <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginTop: "10px", lineHeight: 1.5 }}>
+                    Based on {data.capital.pricedSkus} of {data.totalSkus} SKUs that have a unit
+                    cost ({Math.round(data.capital.costCoverage * 100)}%) — the real figures are higher.
+                  </div>
+                )}
+              </>
+            )}
+          </Card>
+
           <Card padding="17px 18px">
             <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>Alerts</div>
             <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px" }}>
@@ -357,12 +497,80 @@ export default function Dashboard() {
             {data.alerts.length === 0 ? (
               <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>No active alerts.</div>
             ) : (
-              <ul style={{ margin: 0, paddingLeft: "18px", fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.7 }}>
-                {data.alerts.slice(0, 5).map((a) => (
-                  <li key={a.id}>{a.message}</li>
+              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                {data.alerts.slice(0, 6).map((a) => (
+                  <div
+                    key={a.id}
+                    style={{
+                      display: "flex",
+                      alignItems: "flex-start",
+                      gap: "9px",
+                      padding: "9px 10px",
+                      borderRadius: "9px",
+                      background: "var(--inv-subtle)",
+                      border: "1px solid var(--inv-divider)",
+                    }}
+                  >
+                    <span
+                      title={a.severity}
+                      style={{
+                        marginTop: "5px",
+                        width: "7px",
+                        height: "7px",
+                        flex: "0 0 7px",
+                        borderRadius: "50%",
+                        background:
+                          a.severity === "critical"
+                            ? "var(--inv-status-critical-dot)"
+                            : a.severity === "warning"
+                              ? "var(--inv-status-low-dot)"
+                              : "var(--inv-divider-3)",
+                      }}
+                    />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.5 }}>
+                        {a.message}
+                      </div>
+                      {a.revenueAtRisk > 0 && (
+                        <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginTop: "2px" }}>
+                          ≈ {formatCurrency(a.revenueAtRisk, data.currency)} at risk
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
+                      <button
+                        title="Snooze for 7 days"
+                        onClick={() =>
+                          fetcher.submit(
+                            { intent: "snooze_alert", alertId: a.id, days: "7" },
+                            { method: "POST" },
+                          )
+                        }
+                        style={alertActionStyle}
+                      >
+                        Snooze
+                      </button>
+                      <button
+                        title="Dismiss this alert"
+                        onClick={() =>
+                          fetcher.submit(
+                            { intent: "dismiss_alert", alertId: a.id },
+                            { method: "POST" },
+                          )
+                        }
+                        style={alertActionStyle}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
                 ))}
-                {data.alerts.length > 5 && <li>…and {data.alerts.length - 5} more</li>}
-              </ul>
+                {data.alerts.length > 6 && (
+                  <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
+                    …and {data.alerts.length - 6} more
+                  </div>
+                )}
+              </div>
             )}
           </Card>
         </div>

@@ -16,9 +16,10 @@ interface MarginEntry {
 /**
  * Pull per-SKU margins — and unit cost where available — from Financify.
  *
- * Unit cost matters beyond reporting: it is what makes inventory value, capital tied up
- * in dead stock, and revenue-at-risk alert ranking possible. Without it those all
- * degrade to zero rather than to a guess.
+ * Unit cost is sourced primarily from Shopify's own "Cost per item"
+ * (InventoryItem.unitCost), which needs no integration at all. Financify only fills
+ * gaps: it writes unitCost solely where the product has none, so a nightly Shopify sync
+ * and an on-demand Financify sync cannot flap over the same field.
  */
 export async function syncFinancifyMargins(
   shop: string,
@@ -49,15 +50,21 @@ export async function syncFinancifyMargins(
 
     for (const entry of data) {
       if (!entry.sku) continue;
+
+      // Margin is Financify's own computation and always wins.
       const updated = await prisma.product.updateMany({
         where: { shop, sku: entry.sku },
-        data: {
-          avgMargin: entry.margin,
-          ...(entry.unitCost != null && entry.unitCost >= 0
-            ? { unitCost: entry.unitCost }
-            : {}),
-        },
+        data: { avgMargin: entry.margin },
       });
+
+      // Cost only fills a gap — Shopify's Cost per item is authoritative.
+      if (entry.unitCost != null && entry.unitCost > 0) {
+        await prisma.product.updateMany({
+          where: { shop, sku: entry.sku, unitCost: { lte: 0 } },
+          data: { unitCost: entry.unitCost },
+        });
+      }
+
       if (updated.count === 0) unmatched += 1;
       synced += updated.count;
     }

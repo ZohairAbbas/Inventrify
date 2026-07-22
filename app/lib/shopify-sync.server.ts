@@ -143,6 +143,11 @@ const PRODUCT_VARIANTS_QUERY = `
           product { id title featuredImage { url } }
           inventoryItem {
             id
+            # "Cost per item" as entered in the Shopify product admin. This is the
+            # merchant's own landed cost and needs no third-party integration; it is
+            # what makes inventory value, dead-stock capital and revenue-at-risk
+            # ranking work out of the box.
+            unitCost { amount }
             inventoryLevels(first: 50) {
               edges {
                 node {
@@ -195,6 +200,7 @@ interface ShopifyVariant {
   product: { id: string; title: string; featuredImage: { url: string } | null };
   inventoryItem: {
     id: string;
+    unitCost: { amount: string } | null;
     inventoryLevels?: Paged<ShopifyInventoryLevel>;
   } | null;
 }
@@ -246,6 +252,13 @@ export async function syncShopifyInventory(
           // Variant image when it has its own, else the product's featured image.
           const imageUrl =
             variant.image?.url ?? variant.product.featuredImage?.url ?? null;
+
+          // Shopify returns Money as a decimal string; treat unparseable or absent
+          // costs as "not set" rather than as zero.
+          const rawCost = variant.inventoryItem?.unitCost?.amount;
+          const parsedCost = rawCost != null ? Number.parseFloat(rawCost) : NaN;
+          const unitCost =
+            Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : null;
 
           // Build per-location stock from inventory levels; fall back to the
           // aggregate inventoryQuantity when no levels are returned.
@@ -300,6 +313,7 @@ export async function syncShopifyInventory(
               variantTitle,
               sku: variant.sku ?? null,
               imageUrl,
+              ...(unitCost != null ? { unitCost } : {}),
               currentStock,
               reorderPoint,
               leadTimeDays,
@@ -312,6 +326,10 @@ export async function syncShopifyInventory(
               variantTitle,
               sku: variant.sku ?? null,
               imageUrl,
+              // Shopify is the primary source for cost; only overwrite when it has one,
+              // so a cost supplied elsewhere is not wiped by a shop that left the field
+              // blank.
+              ...(unitCost != null ? { unitCost } : {}),
               currentStock,
               inventoryItemId,
               productGid: variant.product.id,

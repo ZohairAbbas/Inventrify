@@ -77,7 +77,7 @@ interface ReturnEventEntry {
  *
  * Courierify's shop-level /api/external/delivery RTS analysis has no SKU dimension and
  * is Growzar-gated, so this uses a dedicated per-SKU, ungated endpoint under the
- * inventrify/* namespace (see Plans/courierify-inventrify-contract.md §3).
+ * inventrify/* namespace (see docs/courierify-integration.md §3).
  * Best-effort; never throws.
  */
 export async function syncCourierifyReturnRates(
@@ -126,7 +126,7 @@ export async function syncCourierifyReturnRates(
  * Pull the per-SKU live fulfilment-status snapshot from Courierify and cache the
  * counts onto Product (fulfilledDelivered/InTransit/Returned). Damaged is never
  * synced here — it is derived from StockAdjustment(reason="damage"). Best-effort:
- * returns { synced, error? } and never throws. See Plans/courierify-inventrify-contract.md.
+ * returns { synced, error? } and never throws. See docs/courierify-integration.md.
  */
 export async function syncCourierifyFulfilmentStatus(
   shop: string,

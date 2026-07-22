@@ -30,6 +30,15 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * This retries with exponential backoff and *throws* when it finally gives up, so
  * callers must decide explicitly what a failed page means. Never returns partial data.
  */
+/**
+ * Signals a failure that retrying cannot fix (a 4xx other than 429). It has to be a
+ * distinct type because the fetch is wrapped in its own try/catch: a plain `throw` inside
+ * that block is caught by it and turned into another retry, which is exactly what used to
+ * happen — a 400 was retried five times with backoff, burning ~15s per failed page while
+ * the comment claimed it failed fast.
+ */
+class NonRetryableGraphqlError extends Error {}
+
 export async function graphqlWithRetry<T>(
   admin: AdminApiContext,
   query: string,
@@ -54,11 +63,14 @@ export async function graphqlWithRetry<T>(
       if (!response.ok) {
         lastError = `HTTP ${response.status}`;
         // 5xx is worth retrying; other 4xx will not fix themselves.
-        if (response.status < 500) throw new Error(lastError);
+        if (response.status < 500) throw new NonRetryableGraphqlError(lastError);
         continue;
       }
       json = await response.json();
     } catch (err) {
+      // A non-retryable failure must escape this loop rather than being folded back
+      // into it as another attempt.
+      if (err instanceof NonRetryableGraphqlError) throw err;
       lastError = err instanceof Error ? err.message : "request failed";
       continue;
     }

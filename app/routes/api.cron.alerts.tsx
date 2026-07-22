@@ -1,7 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import prisma from "../db.server";
-import { generateAlerts, getUnreadAlerts } from "../lib/alerts.server";
+import { generateAlerts, getAllUnreadAlerts } from "../lib/alerts.server";
 import { dispatchAlerts } from "../lib/alert-dispatch.server";
 
 /**
@@ -24,20 +24,29 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   });
 
   let totalAlerts = 0;
-  const results: { shop: string; alerts: number }[] = [];
+  let totalSent = 0;
+  const results: {
+    shop: string;
+    alerts: number;
+    sent: number;
+    suppressed: number;
+    cleared: number;
+  }[] = [];
 
   for (const { shop } of shops) {
     const count = await generateAlerts(shop);
     totalAlerts += count;
-    results.push({ shop, alerts: count });
 
-    if (count > 0) {
-      const newAlerts = await getUnreadAlerts(shop);
-      await dispatchAlerts(shop, newAlerts);
-    }
+    // Dispatch runs even when there are no active alerts: it reconciles the notification
+    // ledger, so conditions that have cleared will notify again if they recur.
+    const active = await getAllUnreadAlerts(shop);
+    const { sent, suppressed, cleared } = await dispatchAlerts(shop, active);
+    totalSent += sent;
+
+    results.push({ shop, alerts: count, sent, suppressed, cleared });
   }
 
-  return json({ shops: shops.length, totalAlerts, results });
+  return json({ shops: shops.length, totalAlerts, totalSent, results });
 };
 
 // GET: healthcheck — returns 200 so uptime monitors can ping it

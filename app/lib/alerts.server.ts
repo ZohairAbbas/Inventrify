@@ -113,6 +113,18 @@ export async function getUnreadAlerts(shop: string) {
   });
 }
 
+/**
+ * Every active alert for a shop, uncapped — for notification dispatch, which reconciles
+ * against the complete set. Do not swap this for getUnreadAlerts(): its `take` would make
+ * the alerts beyond the cap look like cleared conditions.
+ */
+export async function getAllUnreadAlerts(shop: string) {
+  return prisma.alert.findMany({
+    where: { shop, isRead: false },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
 export async function markAlertRead(id: string) {
   return prisma.alert.update({ where: { id }, data: { isRead: true } });
 }

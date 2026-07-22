@@ -292,6 +292,22 @@ model Alert {
   @@index([shop, type])
 }
 
+// Durable record of which alert conditions a shop has already been notified about.
+// Alert rows are ephemeral — generateAlerts() deletes and recreates them on every run —
+// so "already sent" cannot be stored there. Identity is the condition (shop+type+productId),
+// not the Alert row id. A row here is removed once the condition clears, so a recurrence
+// notifies again.
+model AlertNotification {
+  id         String   @id @default(cuid())
+  shop       String
+  type       String
+  productId  String
+  notifiedAt DateTime @default(now())
+
+  @@unique([shop, type, productId])
+  @@index([shop])
+}
+
 // Stock transfers between locations — draft → in-transit → received
 model StockTransfer {
   id             String    @id @default(cuid())

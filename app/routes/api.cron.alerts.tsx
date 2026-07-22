@@ -8,6 +8,7 @@ import {
 } from "../lib/alerts.server";
 import { dispatchAlerts } from "../lib/alert-dispatch.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
+import { describeError } from "../lib/shopify-graphql.server";
 
 /**
  * Cron endpoint — protected by CRON_SECRET header.
@@ -58,7 +59,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       results.push({ shop, total, opened, resolved, sent, failed });
     } catch (err) {
       // One bad shop must not abort the whole run.
-      const message = err instanceof Error ? err.message : "Unknown error";
+      const message = describeError(err);
       console.error(`[cron/alerts] ${shop} failed:`, message);
       results.push({ shop, total: 0, opened: 0, resolved: 0, sent: 0, failed: 0, error: message });
     }

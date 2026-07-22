@@ -39,6 +39,90 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  */
 class NonRetryableGraphqlError extends Error {}
 
+/** Raised when the shop's token lacks a scope the query needs. */
+export class MissingScopeError extends Error {}
+
+/**
+ * Classify a thrown value into a message and whether retrying could ever help.
+ *
+ * Getting this wrong is expensive in both directions. Observed in production:
+ *  - `admin.graphql` throws GraphqlQueryError for permission and query errors. These are
+ *    permanent, but they landed in the generic catch and were retried five times with
+ *    backoff — ~15s burned per shop to reach a conclusion already known on attempt one.
+ *  - shopify-app-remix throws a bare `Response` (not an Error) when a token is invalid
+ *    and the shop needs to re-authorise. It has no `.message`, so the operator-facing
+ *    error read "Unknown error" and said nothing about what to do.
+ */
+function classifyError(err: unknown): { message: string; retryable: boolean } {
+  if (err instanceof NonRetryableGraphqlError) {
+    return { message: err.message, retryable: false };
+  }
+
+  // A thrown Response means authentication failed; a background job cannot resolve it.
+  if (typeof Response !== "undefined" && err instanceof Response) {
+    return {
+      message:
+        `authentication failed (HTTP ${err.status}) — the shop's token is no longer ` +
+        `valid; it must reinstall or re-authorise the app`,
+      retryable: false,
+    };
+  }
+
+  const name = (err as { constructor?: { name?: string } })?.constructor?.name ?? "";
+  const message =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : `${name || "unknown"} thrown: ${safeStringify(err)}`;
+
+  // Throttling is the one library error worth waiting out.
+  if (/throttl/i.test(name) || /throttl/i.test(message)) {
+    return { message, retryable: true };
+  }
+  // Permission and malformed-query errors will never succeed on a retry.
+  if (name === "GraphqlQueryError") {
+    return { message, retryable: false };
+  }
+  // Anything else (network, timeouts) is worth another attempt.
+  return { message, retryable: true };
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value)?.slice(0, 200) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Operator-facing description of any thrown value.
+ *
+ * shopify-app-remix throws a bare `Response` for auth failures, which is not an Error and
+ * has no `.message`. Callers doing `err instanceof Error ? err.message : "Unknown error"`
+ * therefore reported "Unknown error" for the single most actionable failure there is —
+ * a shop whose token has stopped working and needs re-authorising.
+ */
+export function describeError(err: unknown): string {
+  if (typeof Response !== "undefined" && err instanceof Response) {
+    return (
+      `authentication failed (HTTP ${err.status}) — the shop's token is no longer valid; ` +
+      `it must reinstall or re-authorise the app`
+    );
+  }
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  const name = (err as { constructor?: { name?: string } })?.constructor?.name;
+  return `${name ?? "unknown"} thrown: ${safeStringify(err)}`;
+}
+
+/** True when a failure is a missing-scope problem, which callers may degrade around. */
+export function isMissingScope(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /access denied|access scope/i.test(msg);
+}
+
 export async function graphqlWithRetry<T>(
   admin: AdminApiContext,
   query: string,
@@ -68,10 +152,15 @@ export async function graphqlWithRetry<T>(
       }
       json = await response.json();
     } catch (err) {
-      // A non-retryable failure must escape this loop rather than being folded back
-      // into it as another attempt.
-      if (err instanceof NonRetryableGraphqlError) throw err;
-      lastError = err instanceof Error ? err.message : "request failed";
+      const { message, retryable } = classifyError(err);
+      lastError = message;
+      // A permanent failure must escape this loop rather than being folded back into
+      // it as another attempt.
+      if (!retryable) {
+        throw isMissingScope(err)
+          ? new MissingScopeError(message)
+          : new Error(message);
+      }
       continue;
     }
 

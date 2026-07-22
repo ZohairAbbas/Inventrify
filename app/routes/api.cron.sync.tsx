@@ -3,6 +3,7 @@ import { json } from "@remix-run/node";
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
+import { describeError } from "../lib/shopify-graphql.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
 
@@ -56,7 +57,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         error: inventory.error ?? orders.error,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
+      const message = describeError(err);
       console.error(`[cron/sync] ${shop} failed:`, message);
       results.push({
         shop,

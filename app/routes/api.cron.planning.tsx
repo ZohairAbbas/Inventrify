@@ -2,6 +2,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
 import prisma from "../db.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
+import { describeError } from "../lib/shopify-graphql.server";
 import {
   recomputeClassifications,
   refreshForecasts,
@@ -47,7 +48,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       results.push({ shop, scored, classified, refreshed, errors });
     } catch (err) {
       // One failing shop must not abort the sweep.
-      const message = err instanceof Error ? err.message : "Unknown error";
+      const message = describeError(err);
       console.error(`[cron/planning] ${shop} failed:`, message);
       results.push({ shop, scored: 0, classified: 0, refreshed: 0, errors: 0, error: message });
     }

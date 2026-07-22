@@ -1,7 +1,12 @@
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
 import { calculateReorderPoint } from "./forecast.server";
-import { graphqlWithRetry, mapPool, type Paged } from "./shopify-graphql.server";
+import {
+  graphqlWithRetry,
+  isMissingScope,
+  mapPool,
+  type Paged,
+} from "./shopify-graphql.server";
 
 const LOCATIONS_QUERY = `
   query getLocations($cursor: String) {
@@ -165,6 +170,33 @@ const PRODUCT_VARIANTS_QUERY = `
   }
 `;
 
+/**
+ * Fallback used when the shop's token lacks `read_locations`.
+ *
+ * Shops that installed before that scope was added still have valid tokens, but any field
+ * touching locations is rejected. Aborting the whole sync meant those shops got nothing at
+ * all — no products, no demand history, no forecasts. Dropping to the aggregate
+ * inventoryQuantity keeps everything except per-location detail working.
+ */
+const PRODUCT_VARIANTS_NO_LOCATION_QUERY = `
+  query getProductVariantsNoLocation($cursor: String) {
+    productVariants(first: 100, after: $cursor) {
+      edges {
+        node {
+          id
+          title
+          sku
+          inventoryQuantity
+          image { url }
+          product { id title featuredImage { url } }
+          inventoryItem { id unitCost { amount } }
+        }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
 /** Follow-up pagination for the rare variant stocked at more than 50 locations. */
 const INVENTORY_LEVELS_QUERY = `
   query getInventoryLevels($id: ID!, $cursor: String) {
@@ -216,8 +248,21 @@ export async function syncShopifyInventory(
   const settings = await prisma.shopSettings.findUnique({ where: { shop } });
   const defaultLeadTime = settings?.defaultLeadTime ?? 7;
 
-  // Sync locations first so per-location stock has stable FKs (shopifyLocationId → Location.id)
-  const locationMap = await syncLocations(admin, shop);
+  // Sync locations first so per-location stock has stable FKs (shopifyLocationId → Location.id).
+  // A shop whose token predates the read_locations scope still syncs, without per-location
+  // detail, rather than failing outright.
+  let locationMap = new Map<string, string>();
+  let locationsUnavailable = false;
+  try {
+    locationMap = await syncLocations(admin, shop);
+  } catch (err) {
+    if (!isMissingScope(err)) throw err;
+    locationsUnavailable = true;
+    console.warn(
+      `[inventorify] ${shop} lacks read_locations — syncing aggregate stock only. ` +
+        `Re-authorise the app to restore per-location inventory.`,
+    );
+  }
 
   // One read instead of a findUnique per variant.
   const existingRows = await prisma.product.findMany({
@@ -236,7 +281,7 @@ export async function syncShopifyInventory(
     while (hasNextPage) {
       const data: ProductVariantsResponse = await graphqlWithRetry<ProductVariantsResponse>(
         admin,
-        PRODUCT_VARIANTS_QUERY,
+        locationsUnavailable ? PRODUCT_VARIANTS_NO_LOCATION_QUERY : PRODUCT_VARIANTS_QUERY,
         { cursor },
       );
 

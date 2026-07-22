@@ -237,7 +237,9 @@ export async function syncShopifyInventory(
       const variants = data.productVariants.edges.map((e) => e.node);
       for (const v of variants) seenVariantIds.add(v.id);
 
-      await mapPool(variants, 8, async (variant) => {
+      // Per-page counters, folded into the totals after the batch resolves. Closing
+      // directly over the outer counters trips no-loop-func.
+      const pageResults = await mapPool(variants, 8, async (variant): Promise<boolean> => {
         try {
           const variantTitle = variant.title === "Default Title" ? null : variant.title;
           const inventoryItemId = variant.inventoryItem?.id ?? null;
@@ -327,11 +329,16 @@ export async function syncShopifyInventory(
             });
           }
 
-          synced++;
+          return true;
         } catch {
-          errors++;
+          return false;
         }
       });
+
+      for (const ok of pageResults) {
+        if (ok) synced++;
+        else errors++;
+      }
 
       hasNextPage = data.productVariants.pageInfo.hasNextPage;
       cursor = data.productVariants.pageInfo.endCursor;

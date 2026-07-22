@@ -12,8 +12,6 @@ import {
 } from "./demand.server";
 
 const DAY = 86400000;
-const day = (offsetFromEnd: number, end = Date.UTC(2026, 5, 30)) =>
-  new Date(end - offsetFromEnd * DAY);
 
 /** Build points for a dense series ending today: series[0] is the oldest day. */
 function pointsFrom(series: number[], end: Date): DailyPoint[] {

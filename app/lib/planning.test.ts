@@ -234,6 +234,23 @@ describe("ABC / XYZ classification", () => {
     expect(classes.get("tail")).toBe("C");
   });
 
+  it("classifies a dominant SKU as A, not C", () => {
+    // Regression: classifying on the cumulative share *after* adding each item put any
+    // product that alone exceeded 80% straight into C. The earlier test only used
+    // revenues that landed exactly on the thresholds, so it passed either way.
+    const classes = classifyAbc([
+      { productId: "dominant", revenue: 99_000 },
+      { productId: "small-1", revenue: 500 },
+      { productId: "small-2", revenue: 500 },
+    ]);
+    expect(classes.get("dominant")).toBe("A");
+    expect(classes.get("small-1")).toBe("C");
+  });
+
+  it("puts the single product in a one-product catalogue in A", () => {
+    expect(classifyAbc([{ productId: "only", revenue: 1000 }]).get("only")).toBe("A");
+  });
+
   it("treats a shop with no revenue data as all-C rather than all-A", () => {
     const classes = classifyAbc([
       { productId: "a", revenue: 0 },

@@ -266,9 +266,14 @@ export function classifyAbc(
   const sorted = [...items].sort((a, b) => b.revenue - a.revenue);
   let cumulative = 0;
   for (const item of sorted) {
+    // Classify on the cumulative share reached *before* this item, so the item that
+    // crosses a threshold belongs to the class it crosses out of. Testing the share
+    // after adding it puts a single dominant SKU straight past 80% and labels it C —
+    // exactly inverted, and it would then be given the thinnest safety buffer of the
+    // whole catalogue via serviceLevelZFor().
+    const shareBefore = cumulative / total;
+    out.set(item.productId, shareBefore < 0.8 ? "A" : shareBefore < 0.95 ? "B" : "C");
     cumulative += item.revenue;
-    const share = cumulative / total;
-    out.set(item.productId, share <= 0.8 ? "A" : share <= 0.95 ? "B" : "C");
   }
   return out;
 }

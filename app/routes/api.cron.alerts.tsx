@@ -61,7 +61,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const message = err instanceof Error ? err.message : "Unknown error";
       console.error(`[cron/alerts] ${shop} failed:`, message);
       results.push({ shop, total: 0, opened: 0, resolved: 0, sent: 0, failed: 0, error: message });
-    }  }
+    }
+  }
 
   return json({ shops: shops.length, totalAlerts, totalSent, results });
 };

@@ -290,3 +290,111 @@ export async function syncCourierifyReturns(
     };
   }
 }
+
+/**
+ * One shipment's outcome, keyed to a Shopify order rather than to a SKU.
+ *
+ * Contract for `GET /api/external/inventrify/order-outcomes` — NOT YET IMPLEMENTED on
+ * Courierify. Until it exists this pull is inert: the endpoint 404s (or is plan-gated) and
+ * syncCourierifyOrderOutcomes reports unavailable without touching any data.
+ *
+ * Expected shape, mirroring the sibling ungated endpoints:
+ *   { timestamp, rows: [{ shipmentId, shopifyOrderName, status, updatedAt, courier? }] }
+ *   Query: ?shop=<domain>[&updatedSince=<ISO>]
+ *   Scope: analytics:read - ungated - non-billable
+ *
+ * Every field already exists on Courierify's Shipment table, and shopifyOrderName is
+ * populated on 100% of rows sampled, so no backfill is required to serve this.
+ */
+export interface OrderOutcomeEntry {
+  shipmentId: string;
+  shopifyOrderName?: string | null;
+  status: string;
+  updatedAt?: string | null;
+  courier?: string | null;
+}
+
+/**
+ * Pull order-level delivery outcomes and store them for local per-SKU attribution.
+ *
+ * Why this exists: the per-SKU endpoints group on ShipmentLineItem.sku, which is unset on
+ * the overwhelming majority of real shipments, so they return nothing for shops with
+ * thousands of genuine returns. Order-level outcomes joined to OrderLineItem reconstruct
+ * the same per-SKU figure locally. See rto-attribution.server.ts.
+ *
+ * Degrades quietly: an absent endpoint is an expected state, not an error to alarm on.
+ */
+export async function syncCourierifyOrderOutcomes(
+  shop: string,
+  apiKey: string,
+): Promise<{ stored: number; available: boolean; error?: string }> {
+  try {
+    const settings = await prisma.shopSettings.findUnique({ where: { shop } });
+    const cursor = settings?.courierifyOutcomesCursor;
+
+    const params: Record<string, string> = { shop };
+    if (cursor) params.updatedSince = cursor.toISOString();
+
+    const result = await fetchExternal<OrderOutcomeEntry>(
+      "/inventrify/order-outcomes",
+      apiKey,
+      params,
+    );
+
+    if (result.error) {
+      // The endpoint not existing yet, or being gated, is not a failure worth surfacing
+      // to the merchant — it simply means this capability is not switched on.
+      const unavailable = /404|not found|plan|scope|denied/i.test(result.error);
+      return {
+        stored: 0,
+        available: !unavailable,
+        error: unavailable ? undefined : result.error,
+      };
+    }
+
+    const rows = result.rows ?? [];
+    let stored = 0;
+    let maxUpdatedAt: Date | null = null;
+
+    for (const row of rows) {
+      if (!row.shipmentId || !row.shopifyOrderName || !row.status) continue;
+      const updatedAt = row.updatedAt ? new Date(row.updatedAt) : new Date();
+      if (!maxUpdatedAt || updatedAt > maxUpdatedAt) maxUpdatedAt = updatedAt;
+
+      await prisma.orderOutcome.upsert({
+        where: { shop_shipmentId: { shop, shipmentId: row.shipmentId } },
+        create: {
+          shop,
+          shipmentId: row.shipmentId,
+          orderName: row.shopifyOrderName,
+          status: row.status,
+          courier: row.courier ?? null,
+          updatedAt,
+        },
+        // A shipment's status changes over its life; the latest wins.
+        update: { status: row.status, courier: row.courier ?? null, updatedAt },
+      });
+      stored += 1;
+    }
+
+    // Same cursor rules as the returns pull: advance only to what was actually seen,
+    // with an overlap buffer, never on an empty page, never backwards.
+    if (maxUpdatedAt) {
+      const OVERLAP_MS = 60_000;
+      const next = new Date(maxUpdatedAt.getTime() - OVERLAP_MS);
+      const advanced = cursor && next < cursor ? cursor : next;
+      await prisma.shopSettings.update({
+        where: { shop },
+        data: { courierifyOutcomesCursor: advanced },
+      });
+    }
+
+    return { stored, available: true };
+  } catch (err) {
+    return {
+      stored: 0,
+      available: true,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}

@@ -21,7 +21,7 @@ const ORDERS_QUERY = `
           lineItems(first: 100) {
             edges {
               node {
-                variant { id }
+                variant { id sku }
                 quantity
               }
             }
@@ -43,7 +43,10 @@ interface OrderNode {
   tags: string[] | null;
   displayFulfillmentStatus: string | null;
   shippingAddress: { city: string | null; province: string | null; country: string | null } | null;
-  lineItems: Paged<{ variant: { id: string } | null; quantity: number }>;
+  lineItems: Paged<{
+    variant: { id: string; sku: string | null } | null;
+    quantity: number;
+  }>;
 }
 
 interface OrdersResponse {
@@ -89,6 +92,15 @@ export async function syncOrderHistory(
     isConfirmed: boolean;
     isDispatched: boolean;
     isCancelled: boolean;
+    orderedAt: Date;
+  }[] = [];
+  // Per-order SKU breakdown — the join that turns an order-level courier outcome into a
+  // per-SKU return rate. See OrderOutcome / rto-attribution.server.ts.
+  const orderLines: {
+    orderName: string;
+    productId: string;
+    sku: string | null;
+    quantity: number;
     orderedAt: Date;
   }[] = [];
 
@@ -160,6 +172,16 @@ export async function syncOrderHistory(
             if (!codMap.has(variantId)) codMap.set(variantId, new Map());
             const weekMap = codMap.get(variantId)!;
             weekMap.set(weekKey, (weekMap.get(weekKey) ?? 0) + lineItem.quantity);
+          }
+
+          if (order.name) {
+            orderLines.push({
+              orderName: order.name,
+              productId: variantId,
+              sku: lineItem.variant?.sku ?? null,
+              quantity: lineItem.quantity,
+              orderedAt: placedAt,
+            });
           }
         }
 
@@ -274,6 +296,31 @@ export async function syncOrderHistory(
         });
       }
     }
+  }
+
+  // Persist the per-order SKU breakdown. Only variants we track, and summed per
+  // (order, product) so a repeated product across lines becomes one row.
+  const trackedIds = new Set(tracked.map((t) => t.id));
+  const byOrderProduct = new Map<string, (typeof orderLines)[number]>();
+  for (const line of orderLines) {
+    if (!trackedIds.has(line.productId)) continue;
+    const key = `${line.orderName}\u0000${line.productId}`;
+    const existing = byOrderProduct.get(key);
+    if (existing) existing.quantity += line.quantity;
+    else byOrderProduct.set(key, { ...line });
+  }
+  for (const line of byOrderProduct.values()) {
+    await prisma.orderLineItem.upsert({
+      where: {
+        shop_orderName_productId: {
+          shop,
+          orderName: line.orderName,
+          productId: line.productId,
+        },
+      },
+      create: { shop, ...line },
+      update: { sku: line.sku, quantity: line.quantity, orderedAt: line.orderedAt },
+    });
   }
 
   // Persist delivery regions. Upserted per order so a re-run is idempotent.

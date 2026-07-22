@@ -3,8 +3,10 @@ import { json } from "@remix-run/node";
 import prisma from "../db.server";
 import {
   syncCourierifyFulfilmentStatus,
+  syncCourierifyOrderOutcomes,
   syncCourierifyReturns,
 } from "../lib/courierify.server";
+import { recomputeDerivedRto } from "../lib/rto-attribution.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
 import { decryptSecret } from "../lib/crypto.server";
 
@@ -36,6 +38,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     fulfilmentError?: string;
     returns: number;
     returnsError?: string;
+    outcomes: number;
+    outcomesAvailable: boolean;
+    outcomesError?: string;
+    derivedRtoSkus: number;
   }[] = [];
 
   for (const { shop, courierifyApiKey } of connected) {
@@ -43,12 +49,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!apiKey) continue;
     const status = await syncCourierifyFulfilmentStatus(shop, apiKey);
     const returns = await syncCourierifyReturns(shop, apiKey);
+
+    // Order-level outcomes are the fallback path for per-SKU RTO, used where the
+    // courier's own per-SKU endpoints come back empty because shipment line items carry
+    // no SKU. Inert until that endpoint exists: `available` is false and nothing is
+    // written or recomputed.
+    const outcomes = await syncCourierifyOrderOutcomes(shop, apiKey);
+    const derived = outcomes.available && outcomes.stored > 0
+      ? await recomputeDerivedRto(shop)
+      : { attributed: 0 };
     results.push({
       shop,
       fulfilment: status.synced,
       fulfilmentError: status.error,
       returns: returns.queued,
       returnsError: returns.error,
+      outcomes: outcomes.stored,
+      outcomesAvailable: outcomes.available,
+      outcomesError: outcomes.error,
+      derivedRtoSkus: derived.attributed,
     });
   }
 

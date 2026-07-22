@@ -60,6 +60,8 @@ model ShopSettings {
   rtoTransitDays     Int      @default(14)
   // Incremental cursor for the Courierify returns pull (?updatedSince=). Null = never synced.
   courierifyReturnsCursor DateTime?
+  // Incremental cursor for the order-outcomes pull. Same rules as above.
+  courierifyOutcomesCursor DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 }
@@ -117,6 +119,10 @@ model Product {
   courierRtoRate  Float?
   // Locally inferred fallback when Courierify is not connected.
   estimatedRtoRate Float?
+  // RTO rate derived by attributing courier order outcomes to SKUs ourselves, via
+  // OrderOutcome -> OrderLineItem. Used when the courier cannot report per-SKU rates
+  // directly. Ranks below courierRtoRate but above estimatedRtoRate.
+  derivedRtoRate  Float?
   // "courierify" | "estimated" | "none" — provenance shown in the UI.
   returnRateSource String   @default("none")
   // Pre-dispatch cancellation rate. Economically distinct from RTO: the unit never
@@ -511,4 +517,47 @@ model OrderRegion {
   @@unique([shop, orderName])
   @@index([shop, city])
   @@index([shop, orderedAt])
+}
+
+// Per-order SKU breakdown, captured during the Shopify order sync.
+//
+// SalesRecord aggregates demand per product per day and OrderRegion holds one row per
+// order, so neither can answer "which SKUs were in order #2688". That question is exactly
+// what turns a courier's order-level outcome into a per-SKU return rate, so the mapping is
+// stored explicitly.
+model OrderLineItem {
+  id        String   @id @default(cuid())
+  shop      String
+  orderName String   // Shopify order name, e.g. "#2688" — the courier's join key
+  productId String   // Shopify variant GID
+  sku       String?
+  quantity  Int
+  orderedAt DateTime
+
+  @@unique([shop, orderName, productId])
+  @@index([shop, orderName])
+  @@index([shop, productId])
+  @@index([shop, orderedAt])
+}
+
+// Courier outcome for one shipment, keyed to a Shopify order.
+//
+// Populated from an order-level courier feed. This exists because the per-SKU courier
+// endpoints depend on shipment line items carrying a SKU, which in practice they very
+// often do not — leaving per-SKU RTO empty even for shops with thousands of returns.
+// Order-level outcomes plus OrderLineItem reconstruct the same figure locally.
+model OrderOutcome {
+  id         String   @id @default(cuid())
+  shop       String
+  shipmentId String
+  orderName  String
+  // delivered | returned | in_transit | booked | ... (courier vocabulary, passed through)
+  status     String
+  courier    String?
+  updatedAt  DateTime
+
+  @@unique([shop, shipmentId])
+  @@index([shop, orderName])
+  @@index([shop, status])
+  @@index([shop, updatedAt])
 }

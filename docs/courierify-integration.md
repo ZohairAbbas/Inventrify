@@ -121,3 +121,39 @@ Denominator rules:
 - Only COD orders count. A refused prepaid order is not an RTO in the sense that matters.
 - Cities below a minimum shipped volume are excluded — 1 return out of 2 shipments is not
   a 50% RTO route.
+
+## Proposed: `GET /api/external/inventrify/order-outcomes` (NOT YET IMPLEMENTED)
+
+The three endpoints above all group on `ShipmentLineItem.sku`. In practice that column is
+almost never populated — `lineItems` is optional at booking and only one booking path
+passes it — so per-SKU RTO comes back empty for shops with thousands of real returns.
+
+Measured on one production shop: 1,594 shipments, 31 with any line item, **0 with a SKU**.
+Across the platform, four of the largest shops had **zero** line items between them across
+147,000 shipments.
+
+Order-level outcomes avoid the problem entirely. Every shipment already carries
+`shopifyOrderName` (100% populated on the rows sampled), and Inventorify already knows
+which SKUs were in which order (`OrderLineItem`, captured during the Shopify order sync).
+Joining the two reconstructs per-SKU RTO locally, with **no backfill required**.
+
+Proposed shape, mirroring its ungated siblings:
+
+```
+GET /api/external/inventrify/order-outcomes?shop=<domain>[&updatedSince=<ISO>]
+Scope: analytics:read · ungated · non-billable
+
+{ "timestamp": "...", "rows": [
+  { "shipmentId": "...", "shopifyOrderName": "#2688",
+    "status": "returned", "updatedAt": "...", "courier": "postex" }
+] }
+```
+
+Cursor semantics identical to `inventrify/returns`.
+
+The Inventorify consumer is already written and tested
+(`syncCourierifyOrderOutcomes` + `rto-attribution.server.ts`). It is inert until this
+endpoint exists: an absent or gated endpoint is reported as `available: false` and nothing
+is written. Verified against the live store's real 1,590 shipment outcomes by standing in
+for the endpoint, producing per-SKU rates of 48.6% / 45.7% / 21.4% where the SKU-keyed
+endpoints returned nothing at all.

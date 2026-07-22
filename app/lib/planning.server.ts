@@ -59,10 +59,19 @@ export async function estimateRestockRate(
  */
 export function resolveReturnRate(product: {
   courierRtoRate: number | null;
+  derivedRtoRate?: number | null;
   estimatedRtoRate: number | null;
-}): { rate: number; source: "courierify" | "estimated" | "none" } {
+}): {
+  rate: number;
+  source: "courierify" | "courierify_orders" | "estimated" | "none";
+} {
   if (product.courierRtoRate != null) {
     return { rate: clamp01(product.courierRtoRate), source: "courierify" };
+  }
+  // Derived from order-level courier outcomes when the courier cannot report per-SKU
+  // rates itself — still the courier's measured outcomes, just attributed by us.
+  if (product.derivedRtoRate != null) {
+    return { rate: clamp01(product.derivedRtoRate), source: "courierify_orders" };
   }
   if (product.estimatedRtoRate != null) {
     return { rate: clamp01(product.estimatedRtoRate), source: "estimated" };

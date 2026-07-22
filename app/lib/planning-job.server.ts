@@ -1,5 +1,5 @@
 import prisma from "../db.server";
-import { classifyAbc, classifyXyz } from "./planning.server";
+import { abcRankingInputs, classifyAbc, classifyXyz } from "./planning.server";
 import { densify, stdDev } from "./demand.server";
 import { generateAndSaveForecast } from "./forecast.server";
 
@@ -35,19 +35,13 @@ export async function recomputeClassifications(
     byProduct.set(row.productId, arr);
   }
 
-  const revenueInputs = products.map((p) => {
-    const rows = byProduct.get(p.id) ?? [];
-    const units = rows.reduce((s, r) => s + r.quantity, 0);
-    // Unit revenue from cost and margin; falls back to units when cost is unknown so
-    // ABC still ranks by volume rather than collapsing to all-C.
-    const unitRevenue =
-      p.unitCost > 0 && p.avgMargin > 0 && p.avgMargin < 0.95
-        ? p.unitCost / (1 - p.avgMargin)
-        : p.unitCost > 0
-          ? p.unitCost
-          : 1;
-    return { productId: p.id, revenue: units * unitRevenue };
-  });
+  const unitsById = new Map(
+    products.map((p) => [
+      p.id,
+      (byProduct.get(p.id) ?? []).reduce((sum, r) => sum + r.quantity, 0),
+    ]),
+  );
+  const revenueInputs = abcRankingInputs(products, unitsById);
 
   const abc = classifyAbc(revenueInputs);
   const end = new Date();

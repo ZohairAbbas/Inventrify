@@ -278,6 +278,36 @@ export function classifyAbc(
   return out;
 }
 
+/**
+ * Build the ranking inputs for ABC, choosing ONE basis for the whole catalogue.
+ *
+ * Falling back to "units x 1" per product mixes two incompatible scales in a single
+ * ranking: priced SKUs contribute currency while unpriced ones contribute a unit count,
+ * so ABC degenerates into "does this product have a cost typed into Shopify". Seen on
+ * real data — every A-class product was one of the handful with a cost set, and the
+ * shop's second-best seller was classed C and handed the thinnest safety buffer.
+ *
+ * Revenue is the better basis when it is actually known; otherwise rank everything by
+ * volume. Never per-product.
+ */
+export function abcRankingInputs(
+  products: { id: string; unitCost: number; avgMargin: number }[],
+  unitsById: Map<string, number>,
+  pricedShareRequired = 0.8,
+): { productId: string; revenue: number }[] {
+  const priced = products.filter((p) => p.unitCost > 0).length;
+  const useRevenue =
+    products.length > 0 && priced / products.length >= pricedShareRequired;
+
+  return products.map((p) => {
+    const units = unitsById.get(p.id) ?? 0;
+    if (!useRevenue) return { productId: p.id, revenue: units };
+    const unitRevenue =
+      p.avgMargin > 0 && p.avgMargin < 0.95 ? p.unitCost / (1 - p.avgMargin) : p.unitCost;
+    return { productId: p.id, revenue: units * unitRevenue };
+  });
+}
+
 /** XYZ from the coefficient of variation of daily demand. */
 export function classifyXyz(cv: number): "X" | "Y" | "Z" {
   if (cv <= 0.5) return "X";

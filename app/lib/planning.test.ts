@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  abcRankingInputs,
   classifyAbc,
   classifyXyz,
   computeProcurementPlan,
@@ -232,6 +233,46 @@ describe("ABC / XYZ classification", () => {
     expect(classes.get("top")).toBe("A");
     expect(classes.get("mid")).toBe("B");
     expect(classes.get("tail")).toBe("C");
+  });
+
+  it("does not let 'has a unit cost' decide the ranking", () => {
+    // Regression from real shop data: with only a few SKUs priced, a per-product
+    // fallback of units x 1 put every priced SKU in A and everything else in C,
+    // regardless of volume. The best-selling unpriced SKU was classed C and would have
+    // been given the thinnest safety buffer in the catalogue.
+    const products = [
+      { id: "priced-slow", unitCost: 1000, avgMargin: 0.5 },
+      { id: "unpriced-fast", unitCost: 0, avgMargin: 0 },
+      { id: "unpriced-slow", unitCost: 0, avgMargin: 0 },
+    ];
+    const units = new Map([
+      ["priced-slow", 2],
+      ["unpriced-fast", 900],
+      ["unpriced-slow", 1],
+    ]);
+
+    // Only 1 of 3 priced, so the whole catalogue ranks by volume.
+    const classes = classifyAbc(abcRankingInputs(products, units));
+    expect(classes.get("unpriced-fast")).toBe("A");
+    expect(classes.get("priced-slow")).not.toBe("A");
+  });
+
+  it("ranks by revenue once the catalogue is mostly priced", () => {
+    const products = [
+      { id: "cheap-many", unitCost: 1, avgMargin: 0 },
+      { id: "pricey-few", unitCost: 1000, avgMargin: 0 },
+      { id: "mid", unitCost: 50, avgMargin: 0 },
+    ];
+    const units = new Map([
+      ["cheap-many", 100],
+      ["pricey-few", 50],
+      ["mid", 10],
+    ]);
+
+    // All priced, so value wins over volume: 50k beats 100 units of a 1-unit item.
+    const classes = classifyAbc(abcRankingInputs(products, units));
+    expect(classes.get("pricey-few")).toBe("A");
+    expect(classes.get("cheap-many")).not.toBe("A");
   });
 
   it("classifies a dominant SKU as A, not C", () => {

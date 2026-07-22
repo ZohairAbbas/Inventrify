@@ -67,16 +67,23 @@ interface ReturnEventEntry {
 }
 
 /**
- * Sync per-SKU COD return rates into Product.codReturnRate — the input to the
- * per-variant Net (COD-adjusted) demand forecast. Courierify's shop-level
- * /api/external/delivery RTS analysis has no SKU dimension and is Growzar-gated, so
- * this uses a dedicated per-SKU, ungated endpoint under the inventrify/* namespace
- * (see Plans/courierify-inventrify-contract.md §3). Best-effort; never throws.
+ * Sync per-SKU COD return rates from real delivery outcomes.
+ *
+ * Writes `courierRtoRate`, not `codReturnRate`. Two sources used to write the latter
+ * directly — this sync, and the orders/cancelled webhook — so whichever ran last won,
+ * non-deterministically, and cancellations (which are not RTOs) could overwrite measured
+ * delivery outcomes. `codReturnRate` is now a resolved value with Courierify taking
+ * precedence; see resolveReturnRate() in planning.server.ts.
+ *
+ * Courierify's shop-level /api/external/delivery RTS analysis has no SKU dimension and
+ * is Growzar-gated, so this uses a dedicated per-SKU, ungated endpoint under the
+ * inventrify/* namespace (see Plans/courierify-inventrify-contract.md §3).
+ * Best-effort; never throws.
  */
 export async function syncCourierifyReturnRates(
   shop: string,
   apiKey: string,
-): Promise<{ synced: number; error?: string }> {
+): Promise<{ synced: number; unmatched?: number; error?: string }> {
   try {
     const result = await fetchExternal<ReturnRateEntry>(
       "/inventrify/return-rates",
@@ -86,16 +93,27 @@ export async function syncCourierifyReturnRates(
     if (result.error) return { synced: 0, error: result.error };
 
     let synced = 0;
+    let unmatched = 0;
     for (const entry of result.rows ?? []) {
       if (!entry.sku) continue;
+      const rate = Math.min(1, Math.max(0, entry.returnRate));
       const updated = await prisma.product.updateMany({
         where: { shop, sku: entry.sku },
-        data: { codReturnRate: Math.min(1, Math.max(0, entry.returnRate)) },
+        data: {
+          courierRtoRate: rate,
+          // codReturnRate is the resolved value planning reads; Courierify wins, so
+          // it is safe to set both here.
+          codReturnRate: rate,
+          returnRateSource: "courierify",
+        },
       });
+      if (updated.count === 0) unmatched += 1;
       synced += updated.count;
     }
 
-    return { synced };
+    // SKUs Courierify knows about that we cannot match locally are silent gaps in the
+    // RTO data — surfaced so the merchant can see coverage rather than assuming 100%.
+    return { synced, unmatched };
   } catch (err) {
     return {
       synced: 0,

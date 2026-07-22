@@ -13,6 +13,7 @@ import {
   syncCourierifyReturns,
 } from "../lib/courierify.server";
 import { syncFinancifyMargins } from "../lib/financify.server";
+import { decryptSecret, encryptSecret } from "../lib/crypto.server";
 import { Button, Card, FilterChips, FormField, PageHead, TextInput } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -115,8 +116,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     // Persist the key first so the returns cursor has a ShopSettings row to update.
     await prisma.shopSettings.upsert({
       where: { shop },
-      create: { shop, courierifyApiKey: apiKey },
-      update: { courierifyApiKey: apiKey },
+      create: { shop, courierifyApiKey: encryptSecret(apiKey) },
+      update: { courierifyApiKey: encryptSecret(apiKey) },
     });
 
     // Broaden the sync: fulfilment-status snapshot + returns queue. Both best-effort —
@@ -133,7 +134,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       where: { shop },
       select: { courierifyApiKey: true },
     });
-    const apiKey = settings?.courierifyApiKey;
+    const apiKey = decryptSecret(settings?.courierifyApiKey);
     if (!apiKey) return { intent, error: "Courierify is not connected" };
 
     const result = await syncCourierifyReturnRates(shop, apiKey);
@@ -153,8 +154,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
     await prisma.shopSettings.upsert({
       where: { shop },
-      create: { shop, financifyApiKey: apiKey },
-      update: { financifyApiKey: apiKey },
+      create: { shop, financifyApiKey: encryptSecret(apiKey) },
+      update: { financifyApiKey: encryptSecret(apiKey) },
     });
     return { intent, synced: result.synced };
   }

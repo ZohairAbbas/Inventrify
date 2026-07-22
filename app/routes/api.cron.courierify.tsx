@@ -6,6 +6,7 @@ import {
   syncCourierifyReturns,
 } from "../lib/courierify.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
+import { decryptSecret } from "../lib/crypto.server";
 
 /**
  * Cron endpoint — protected by CRON_SECRET header.
@@ -38,9 +39,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }[] = [];
 
   for (const { shop, courierifyApiKey } of connected) {
-    if (!courierifyApiKey) continue;
-    const status = await syncCourierifyFulfilmentStatus(shop, courierifyApiKey);
-    const returns = await syncCourierifyReturns(shop, courierifyApiKey);
+    const apiKey = decryptSecret(courierifyApiKey);
+    if (!apiKey) continue;
+    const status = await syncCourierifyFulfilmentStatus(shop, apiKey);
+    const returns = await syncCourierifyReturns(shop, apiKey);
     results.push({
       shop,
       fulfilment: status.synced,

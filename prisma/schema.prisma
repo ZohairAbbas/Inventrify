@@ -378,6 +378,7 @@ model Alert {
   @@index([shop, resolvedAt])
 }
 
+
 // Stock transfers between locations — draft → in-transit → received
 model StockTransfer {
   id             String    @id @default(cuid())

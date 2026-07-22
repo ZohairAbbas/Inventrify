@@ -18,12 +18,13 @@
     "docker-start": "npm run setup && npm run start",
     "setup": "prisma generate && prisma migrate deploy",
     "lint": "eslint --cache --cache-location ./node_modules/.cache/eslint .",
+    "test": "vitest run --exclude \"**/*.db.test.ts\"",
     "shopify": "shopify",
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
     "vite": "vite",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:db": "vitest run --config vitest.db.config.ts"
   },
   "type": "module",
   "engines": {
@@ -41,6 +42,7 @@
     "@shopify/shopify-app-remix": "^4.1.0",
     "@shopify/shopify-app-session-storage-prisma": "^8.0.0",
     "isbot": "^5.1.0",
+    "node-cron": "^4.6.0",
     "papaparse": "^5.5.4",
     "prisma": "^6.2.1",
     "react": "^18.2.0",

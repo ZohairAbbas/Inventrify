@@ -1,0 +1,13 @@
+-- Drop AlertNotification.
+--
+-- It existed because Alert rows were deleted and recreated on every generateAlerts()
+-- run, so "this condition has already been notified" had nowhere stable to live and
+-- needed a separate ledger keyed on (shop, type, productId).
+--
+-- Alert rows are now durable: they are upserted on a stable dedupeKey and carry
+-- lastNotifiedAt, snoozedUntil and resolvedAt directly. The ledger is therefore a second
+-- source of truth for the same fact, which is worse than none.
+--
+-- Nothing is lost: a condition that was suppressed via the ledger is at most notified
+-- once more, on the next run, after which lastNotifiedAt takes over.
+DROP TABLE IF EXISTS "AlertNotification";

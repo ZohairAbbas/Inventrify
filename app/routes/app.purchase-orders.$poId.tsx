@@ -7,6 +7,8 @@ import { useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { Button, Card, DataTable, PageHead, POStatusPill, ProductThumb, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
+import { applyLocationDelta, resolveDefaultLocationId } from "../lib/stock.server";
+import { updateLeadTimeStats } from "../lib/lead-time.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -28,7 +30,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
   const formData = await request.formData();
   const intent = formData.get("intent") as string;
@@ -80,6 +82,10 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       where: { id: po.id },
       data: {
         status: "sent",
+        // Stamped so supplier lead time can be measured sent -> received. Measuring
+        // from createdAt counted however long the draft sat unsent, which inflated
+        // the supplier's average lead time and every safety stock derived from it.
+        sentAt: new Date(),
         expectedDeliveryDate: expectedDelivery ? new Date(expectedDelivery) : null,
       },
     });
@@ -90,6 +96,18 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     if (po.status === "received") return { ok: false as const, error: "Already received", action: "" };
     const actualDelivery = formData.get("actualDeliveryDate") as string;
 
+    // Receipts go through the per-location path.
+    //
+    // Incrementing Product.currentStock directly left ProductLocationStock untouched
+    // and never told Shopify. Since syncShopifyInventory recomputes currentStock as the
+    // sum of per-location on-hand, the received units silently disappeared at the next
+    // sync — and Shopify never knew the stock had arrived at all.
+    const receiptLocationId = await resolveDefaultLocationId(
+      shop,
+      (formData.get("locationId") as string) || null,
+    );
+    const receiveErrors: string[] = [];
+
     for (const item of po.items) {
       const receivedQty = parseInt(
         (formData.get(`received_${item.id}`) as string) ?? String(item.quantityOrdered),
@@ -97,10 +115,33 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       );
       if (isNaN(receivedQty) || receivedQty < 0) continue;
 
-      await prisma.product.update({
-        where: { id: item.productId },
-        data: { currentStock: { increment: receivedQty } },
-      });
+      // Only the not-yet-received remainder moves, so re-confirming a partially
+      // received PO cannot double-count stock.
+      const delta = receivedQty - item.quantityReceived;
+
+      if (delta !== 0) {
+        if (receiptLocationId) {
+          const res = await applyLocationDelta(
+            admin,
+            shop,
+            item.productId,
+            receiptLocationId,
+            delta,
+          );
+          if (!res.ok) {
+            receiveErrors.push(res.error ?? "stock update failed");
+            continue;
+          }
+          if (res.shopifyError) receiveErrors.push(res.shopifyError);
+        } else {
+          // No locations synced yet — fall back to the aggregate count.
+          await prisma.product.update({
+            where: { id: item.productId },
+            data: { currentStock: { increment: delta } },
+          });
+        }
+      }
+
       await prisma.purchaseOrderItem.update({
         where: { id: item.id },
         data: { quantityReceived: receivedQty },
@@ -115,37 +156,44 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       },
     });
 
-    if (po.supplierId && po.expectedDeliveryDate) {
+    // Lead time is measured from when the PO was actually sent.
+    if (po.supplierId && po.sentAt) {
       const receivedDate = actualDelivery ? new Date(actualDelivery) : new Date();
       const actualLeadDays = Math.max(
         1,
-        Math.round((receivedDate.getTime() - po.createdAt.getTime()) / 86400000),
+        Math.round((receivedDate.getTime() - po.sentAt.getTime()) / 86400000),
       );
 
-      const supplier = await prisma.supplier.findUnique({ where: { id: po.supplierId } });
+      const supplier = await prisma.supplier.findFirst({
+        where: { id: po.supplierId, shop },
+      });
       if (supplier) {
-        const totalPos = supplier.totalPosReceived + 1;
-        const currentAvg = supplier.avgActualLeadTime ?? actualLeadDays;
-        const newAvg = (currentAvg * supplier.totalPosReceived + actualLeadDays) / totalPos;
-
-        const diff = actualLeadDays - newAvg;
-        const currentVariance = supplier.leadTimeVariance ?? 0;
-        const newVariance = Math.sqrt(
-          (currentVariance * currentVariance * supplier.totalPosReceived + diff * diff) / totalPos,
+        const stats = updateLeadTimeStats(
+          {
+            count: supplier.totalPosReceived,
+            mean: supplier.avgActualLeadTime,
+            m2: supplier.leadTimeM2,
+          },
+          actualLeadDays,
         );
 
         await prisma.supplier.update({
           where: { id: po.supplierId },
           data: {
-            totalPosReceived: totalPos,
-            avgActualLeadTime: newAvg,
-            leadTimeVariance: newVariance,
+            totalPosReceived: stats.count,
+            avgActualLeadTime: stats.mean,
+            leadTimeM2: stats.m2,
+            leadTimeVariance: stats.stdDev,
           },
         });
       }
     }
 
-    return { ok: true as const, action: "received", error: "" };
+    return {
+      ok: true as const,
+      action: "received",
+      error: receiveErrors.length > 0 ? receiveErrors.join("; ") : "",
+    };
   }
 
   return { ok: true as const, action: "", error: "" };

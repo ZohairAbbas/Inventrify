@@ -15,6 +15,8 @@ const ORDERS_QUERY = `
           createdAt
           cancelledAt
           paymentGatewayNames
+          tags
+          displayFulfillmentStatus
           shippingAddress { city province country }
           lineItems(first: 100) {
             edges {
@@ -38,6 +40,8 @@ interface OrderNode {
   createdAt: string;
   cancelledAt: string | null;
   paymentGatewayNames: string[] | null;
+  tags: string[] | null;
+  displayFulfillmentStatus: string | null;
   shippingAddress: { city: string | null; province: string | null; country: string | null } | null;
   lineItems: Paged<{ variant: { id: string } | null; quantity: number }>;
 }
@@ -64,10 +68,11 @@ export async function syncOrderHistory(
 
   const settings = await prisma.shopSettings.findUnique({
     where: { shop },
-    select: { timezone: true, codGateways: true },
+    select: { timezone: true, codGateways: true, confirmedOrderTag: true },
   });
   const timezone = settings?.timezone ?? "UTC";
   const codGateways = parseCodGateways(settings?.codGateways);
+  const confirmedTag = (settings?.confirmedOrderTag ?? "").trim().toLowerCase();
 
   // variantGid -> (dateKey ISO -> qty)
   const salesMap = new Map<string, Map<string, number>>();
@@ -81,6 +86,9 @@ export async function syncOrderHistory(
     country: string | null;
     units: number;
     isCod: boolean;
+    isConfirmed: boolean;
+    isDispatched: boolean;
+    isCancelled: boolean;
     orderedAt: Date;
   }[] = [];
 
@@ -98,8 +106,29 @@ export async function syncOrderHistory(
       );
 
       for (const { node: order } of data.orders.edges) {
-        // Skip cancelled orders
-        if (order.cancelledAt) continue;
+        // Cancelled orders are excluded from demand but still recorded in the funnel,
+        // because "how many placed orders die before dispatch" is exactly the question
+        // the funnel exists to answer.
+        if (order.cancelledAt) {
+          if (order.name) {
+            regions.push({
+              orderName: order.name,
+              city: normaliseCity(order.shippingAddress?.city),
+              province: order.shippingAddress?.province ?? null,
+              country: order.shippingAddress?.country ?? null,
+              units: 0,
+              isCod: isCodOrder(
+                { payment_gateway_names: order.paymentGatewayNames },
+                codGateways,
+              ),
+              isConfirmed: false,
+              isDispatched: false,
+              isCancelled: true,
+              orderedAt: new Date(order.createdAt),
+            });
+          }
+          continue;
+        }
 
         const placedAt = new Date(order.createdAt);
         const dateKey = shopDateKey(placedAt, timezone).toISOString();
@@ -144,6 +173,15 @@ export async function syncOrderHistory(
             country: order.shippingAddress?.country ?? null,
             units: orderUnits,
             isCod,
+            // No configured tag means confirmation is not tracked; the funnel then
+            // reports it as untracked rather than as 0% confirmed.
+            isConfirmed: confirmedTag
+              ? (order.tags ?? []).some((t) => t.trim().toLowerCase() === confirmedTag)
+              : false,
+            isDispatched: ["FULFILLED", "PARTIALLY_FULFILLED"].includes(
+              order.displayFulfillmentStatus ?? "",
+            ),
+            isCancelled: false,
             orderedAt: placedAt,
           });
         }
@@ -249,6 +287,9 @@ export async function syncOrderHistory(
         country: region.country,
         units: region.units,
         isCod: region.isCod,
+        isConfirmed: region.isConfirmed,
+        isDispatched: region.isDispatched,
+        isCancelled: region.isCancelled,
       },
     });
   }

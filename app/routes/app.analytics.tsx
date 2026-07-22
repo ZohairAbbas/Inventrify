@@ -11,6 +11,7 @@ import {
   getStatusDistribution,
   getHighReturnRateProducts,
   getRtoByRegion,
+  getCodFunnel,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
 import { BarChart, Card, DataTable, KpiCard, Pill, type DataTableColumn } from "../design";
@@ -23,7 +24,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const deadStockDays = settings?.deadStockDays ?? 60;
   const deadStockMinUnits = settings?.deadStockMinUnits ?? 20;
 
-  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion] =
+  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel] =
     await Promise.all([
     getSalesTrend(shop, 30),
     getPeriodComparison(shop),
@@ -32,9 +33,10 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getStatusDistribution(shop),
     getHighReturnRateProducts(shop, 10),
     getRtoByRegion(shop),
+    getCodFunnel(shop),
   ]);
 
-  return { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion };
+  return { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel };
 };
 
 const SEGMENT_COLORS: Record<string, string> = {
@@ -45,7 +47,7 @@ const SEGMENT_COLORS: Record<string, string> = {
 };
 
 export default function Analytics() {
-  const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion } =
+  const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel } =
     useLoaderData<typeof loader>();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
@@ -198,6 +200,49 @@ export default function Analytics() {
               <Pill label="Review these products" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
             </div>
             <DataTable columns={returnColumns} rows={returnRows} />
+          </div>
+        )}
+
+        {codFunnel.placed > 0 && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>COD order funnel</div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "12px" }}>
+              Last 90 days. Demand is recorded when an order is placed, but only dispatched
+              orders consume stock — the gap is how much the demand signal is inflated.
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px" }}>
+              {[
+                ["Placed", codFunnel.placed, null],
+                [
+                  "Confirmed",
+                  codFunnel.confirmationTracked ? codFunnel.confirmed : null,
+                  codFunnel.confirmationTracked ? null : "Set a confirmed-order tag in Settings",
+                ],
+                ["Dispatched", codFunnel.dispatched, null],
+                ["Cancelled", codFunnel.cancelled, null],
+                ["Never dispatched", codFunnel.pending, null],
+              ].map(([label, value, note]) => (
+                <Card key={label as string} padding="13px 14px">
+                  <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "4px" }}>{label}</div>
+                  {value === null ? (
+                    <div style={{ fontSize: "11.5px", color: "var(--inv-faint)", lineHeight: 1.4 }}>{note}</div>
+                  ) : (
+                    <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "19px", fontWeight: 600 }}>
+                      {value as number}
+                    </div>
+                  )}
+                </Card>
+              ))}
+            </div>
+            {codFunnel.attritionRate > 0 && (
+              <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "10px" }}>
+                <strong style={{ color: codFunnel.attritionRate >= 0.3 ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)" }}>
+                  {(codFunnel.attritionRate * 100).toFixed(0)}%
+                </strong>{" "}
+                of placed COD orders never reached dispatch — forecasts built on placed
+                orders are overstated by roughly that much.
+              </div>
+            )}
           </div>
         )}
 

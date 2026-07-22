@@ -36,6 +36,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     coverageDays: settings?.coverageDays ?? 30,
     rtoTransitDays: settings?.rtoTransitDays ?? 14,
     codGateways: settings?.codGateways ?? "",
+    confirmedOrderTag: settings?.confirmedOrderTag ?? "",
     notificationEmail: settings?.notificationEmail ?? "",
     slackWebhookUrl: settings?.slackWebhookUrl ?? "",
     whatsappNumber: settings?.whatsappNumber ?? "",
@@ -81,6 +82,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const coverageDays = parseInt(formData.get("coverageDays") as string, 10);
     const rtoTransitDays = parseInt(formData.get("rtoTransitDays") as string, 10);
     const codGateways = (formData.get("codGateways") as string)?.trim() ?? "";
+    const confirmedOrderTag = (formData.get("confirmedOrderTag") as string)?.trim() ?? "";
     const notificationEmail = (formData.get("notificationEmail") as string)?.trim() || null;
     const slackWebhookUrl = (formData.get("slackWebhookUrl") as string)?.trim() || null;
     const whatsappNumber = (formData.get("whatsappNumber") as string)?.trim() || null;
@@ -97,6 +99,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (!isNaN(coverageDays) && coverageDays > 0) update.coverageDays = coverageDays;
     if (!isNaN(rtoTransitDays) && rtoTransitDays >= 0) update.rtoTransitDays = rtoTransitDays;
     update.codGateways = codGateways;
+    update.confirmedOrderTag = confirmedOrderTag;
     update.notificationEmail = notificationEmail;
     update.slackWebhookUrl = slackWebhookUrl;
     update.whatsappNumber = whatsappNumber;
@@ -285,6 +288,7 @@ export default function Settings() {
   const [coverageDays, setCoverageDays] = useState(String(data.coverageDays));
   const [rtoTransitDays, setRtoTransitDays] = useState(String(data.rtoTransitDays));
   const [codGateways, setCodGateways] = useState(data.codGateways);
+  const [confirmedOrderTag, setConfirmedOrderTag] = useState(data.confirmedOrderTag);
   const [notificationEmail, setNotificationEmail] = useState(data.notificationEmail ?? "");
   const [slackWebhookUrl, setSlackWebhookUrl] = useState(data.slackWebhookUrl ?? "");
   const [whatsappNumber, setWhatsappNumber] = useState(data.whatsappNumber ?? "");
@@ -386,6 +390,16 @@ export default function Settings() {
             >
               <TextInput type="number" min={0} value={rtoTransitDays} onChange={(e) => setRtoTransitDays(e.target.value)} />
             </FormField>
+            <FormField
+              label="Confirmed-order tag"
+              hint="The order tag your team applies once a COD order is verified. Leave blank if you don't track confirmation."
+            >
+              <TextInput
+                value={confirmedOrderTag}
+                placeholder="confirmed"
+                onChange={(e) => setConfirmedOrderTag(e.target.value)}
+              />
+            </FormField>
           </div>
 
           <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Purchasing</div>
@@ -434,6 +448,7 @@ export default function Settings() {
                   coverageDays,
                   rtoTransitDays,
                   codGateways,
+                  confirmedOrderTag,
                   notificationEmail,
                   slackWebhookUrl,
                   whatsappNumber,

@@ -223,3 +223,59 @@ export async function getRtoByRegion(
     .filter((r) => r.shippedUnits >= minShipped)
     .sort((a, b) => b.rtoRate - a.rtoRate);
 }
+
+export interface CodFunnel {
+  placed: number;
+  confirmed: number;
+  dispatched: number;
+  cancelled: number;
+  /** Placed but neither dispatched nor cancelled — still sitting in limbo. */
+  pending: number;
+  /** False when the merchant has not told us which tag marks an order confirmed. */
+  confirmationTracked: boolean;
+  /** Share of placed orders that never reached dispatch. */
+  attritionRate: number;
+}
+
+/**
+ * The COD order funnel: placed -> confirmed -> dispatched.
+ *
+ * This matters for inventory, not just reporting. Demand is recorded when an order is
+ * *placed*, but only *dispatched* units actually consume stock. In COD markets a
+ * meaningful share of placed orders never ship — call-centre confirmation fails, the
+ * number is unreachable, the order is fake. Every one of those inflates the demand signal
+ * that drives reorder points.
+ *
+ * Cancellations are already backed out of demand by the orders/cancelled webhook. What
+ * this exposes is the rest of the gap: orders that quietly never dispatch. Surfacing the
+ * attrition rate lets a merchant judge how much to trust the forecast, rather than the app
+ * silently changing the demand basis underneath them.
+ */
+export async function getCodFunnel(shop: string, days = 90): Promise<CodFunnel> {
+  const since = new Date(Date.now() - days * 86400000);
+  const settings = await prisma.shopSettings.findUnique({
+    where: { shop },
+    select: { confirmedOrderTag: true },
+  });
+  const confirmationTracked = !!settings?.confirmedOrderTag?.trim();
+
+  const scope = { shop, isCod: true, orderedAt: { gte: since } };
+  const [placed, confirmed, dispatched, cancelled] = await Promise.all([
+    prisma.orderRegion.count({ where: scope }),
+    prisma.orderRegion.count({ where: { ...scope, isConfirmed: true } }),
+    prisma.orderRegion.count({ where: { ...scope, isDispatched: true } }),
+    prisma.orderRegion.count({ where: { ...scope, isCancelled: true } }),
+  ]);
+
+  const pending = Math.max(0, placed - dispatched - cancelled);
+
+  return {
+    placed,
+    confirmed,
+    dispatched,
+    cancelled,
+    pending,
+    confirmationTracked,
+    attritionRate: placed > 0 ? (placed - dispatched) / placed : 0,
+  };
+}

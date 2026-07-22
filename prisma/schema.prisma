@@ -49,6 +49,10 @@ model ShopSettings {
   // Comma-separated Shopify gateway names the merchant treats as cash-on-delivery.
   // Empty = fall back to heuristic matching (see lib/cod.server.ts).
   codGateways        String   @default("")
+  // Order tag a merchant applies once a COD order has been verified (call centre /
+  // WhatsApp confirmation). Shopify has no native "confirmed" state, so the convention
+  // has to come from the merchant. Empty = confirmation is not tracked.
+  confirmedOrderTag  String   @default("")
   // Target days of cover used when suggesting purchase-order quantities.
   coverageDays       Int      @default(30)
   // Typical round-trip days for an RTO parcel to come back and be re-shelved.
@@ -492,6 +496,12 @@ model OrderRegion {
   country   String?
   units     Int      @default(0)
   isCod     Boolean  @default(false)
+  // COD funnel facts. Demand is recorded at placement, but only dispatched units
+  // actually consume stock — the gap between these is how much a placed-order demand
+  // signal is inflated.
+  isConfirmed  Boolean @default(false)
+  isDispatched Boolean @default(false)
+  isCancelled  Boolean @default(false)
   orderedAt DateTime
 
   @@unique([shop, orderName])

@@ -623,8 +623,23 @@ export default function Inventory() {
       >
         {p.daysRemaining === null ? "No demand" : `${p.daysRemaining}d`}
       </span>,
-      <span key="cod" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
-        {p.codReturnRate > 0 ? `${(p.codReturnRate * 100).toFixed(0)}%` : "—"}
+      <span
+        key="cod"
+        // "No courier data" and "0% returns" are very different facts and used to render
+        // identically as a dash. returnRateSource records which one it is.
+        title={
+          p.returnRateSource === "none"
+            ? "No courier data for this SKU yet"
+            : `Source: ${p.returnRateSource}`
+        }
+        style={{
+          fontFamily: "var(--inv-font-mono)",
+          color: p.returnRateSource === "none" ? "var(--inv-faint)" : "var(--inv-text-2)",
+        }}
+      >
+        {p.returnRateSource === "none"
+          ? "no data"
+          : `${(p.codReturnRate * 100).toFixed(0)}%`}
       </span>,
       <span key="margin" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
         {p.avgMargin > 0 ? `${(p.avgMargin * 100).toFixed(0)}%` : "—"}

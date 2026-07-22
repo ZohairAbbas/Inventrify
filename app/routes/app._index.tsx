@@ -396,7 +396,26 @@ export default function Dashboard() {
         </div>
 
         {data.courierifyConnected && (
-          <DeliveryPipeline pipeline={data.pipeline} onReviewReturns={() => navigate("/app/returns")} />
+          <>
+            <DeliveryPipeline
+              pipeline={data.pipeline}
+              onReviewReturns={() => navigate("/app/returns")}
+            />
+            {data.pipeline.delivered === 0 &&
+              data.pipeline.inTransit === 0 &&
+              data.pipeline.returned === 0 && (
+                /* An all-zero pipeline on a connected shop means the courier has no
+                   shipments for this store — not that nothing has been returned. The two
+                   are otherwise indistinguishable and read as a broken integration. */
+                <div
+                  style={{ fontSize: "12px", color: "var(--inv-muted)", margin: "-6px 0 16px" }}
+                >
+                  Courierify is connected but reports no shipments for this store yet, so
+                  delivery and RTO figures are empty. They will populate once shipments are
+                  booked through it.
+                </div>
+              )}
+          </>
         )}
 
         <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: "14px", marginBottom: "16px" }}>

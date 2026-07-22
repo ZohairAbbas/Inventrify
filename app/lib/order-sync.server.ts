@@ -11,9 +11,11 @@ const ORDERS_QUERY = `
       edges {
         node {
           id
+          name
           createdAt
           cancelledAt
           paymentGatewayNames
+          shippingAddress { city province country }
           lineItems(first: 100) {
             edges {
               node {
@@ -32,9 +34,11 @@ const ORDERS_QUERY = `
 
 interface OrderNode {
   id: string;
+  name: string;
   createdAt: string;
   cancelledAt: string | null;
   paymentGatewayNames: string[] | null;
+  shippingAddress: { city: string | null; province: string | null; country: string | null } | null;
   lineItems: Paged<{ variant: { id: string } | null; quantity: number }>;
 }
 
@@ -69,6 +73,16 @@ export async function syncOrderHistory(
   const salesMap = new Map<string, Map<string, number>>();
   // variantGid -> (weekStart ISO -> COD order units), the RTO denominator.
   const codMap = new Map<string, Map<string, number>>();
+  // Per-order delivery region — the denominator for regional RTO analysis.
+  const regions: {
+    orderName: string;
+    city: string | null;
+    province: string | null;
+    country: string | null;
+    units: number;
+    isCod: boolean;
+    orderedAt: Date;
+  }[] = [];
 
   let cursor: string | null = null;
   let hasNextPage = true;
@@ -103,7 +117,9 @@ export async function syncOrderHistory(
           );
         }
 
+        let orderUnits = 0;
         for (const { node: lineItem } of order.lineItems.edges) {
+          orderUnits += lineItem.quantity;
           const variantId = lineItem.variant?.id;
           if (!variantId) continue;
 
@@ -116,6 +132,20 @@ export async function syncOrderHistory(
             const weekMap = codMap.get(variantId)!;
             weekMap.set(weekKey, (weekMap.get(weekKey) ?? 0) + lineItem.quantity);
           }
+        }
+
+        if (order.name) {
+          regions.push({
+            orderName: order.name,
+            // Normalised so "karachi", "Karachi " and "KARACHI" do not become three
+            // separate cities in the breakdown.
+            city: normaliseCity(order.shippingAddress?.city),
+            province: order.shippingAddress?.province ?? null,
+            country: order.shippingAddress?.country ?? null,
+            units: orderUnits,
+            isCod,
+            orderedAt: placedAt,
+          });
         }
       }
 
@@ -208,5 +238,32 @@ export async function syncOrderHistory(
     }
   }
 
+  // Persist delivery regions. Upserted per order so a re-run is idempotent.
+  for (const region of regions) {
+    await prisma.orderRegion.upsert({
+      where: { shop_orderName: { shop, orderName: region.orderName } },
+      create: { shop, ...region },
+      update: {
+        city: region.city,
+        province: region.province,
+        country: region.country,
+        units: region.units,
+        isCod: region.isCod,
+      },
+    });
+  }
+
   return { recordsSynced, variantsSeen, completed };
+}
+
+/** Trim, collapse whitespace and title-case a city so it groups consistently. */
+function normaliseCity(city: string | null | undefined): string | null {
+  if (!city) return null;
+  const cleaned = city.trim().replace(/\s+/g, " ");
+  if (!cleaned) return null;
+  return cleaned
+    .toLowerCase()
+    .split(" ")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
 }

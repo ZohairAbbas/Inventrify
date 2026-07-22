@@ -64,6 +64,9 @@ interface ReturnEventEntry {
   updatedAt?: string | null; // the field Courierify filters on — drives the cursor
   isShopifyReturnClosed?: boolean;
   reasonCategory?: string | null;
+  // Optional by design — the contract does not guarantee a carrier, so this is read
+  // opportunistically and stays null when absent rather than being required.
+  courier?: string | null;
 }
 
 /**
@@ -247,6 +250,17 @@ export async function syncCourierifyReturns(
             quantity: Math.max(1, evt.quantity ?? 1),
             returnReceivedAt: receivedAt,
             reasonCategory: evt.reasonCategory ?? null,
+            // Attribute the return to a delivery region so RTO can be broken down by
+            // city. A shop-wide average hides which routes are losing money.
+            city: evt.shopifyOrderName
+              ? (
+                  await prisma.orderRegion.findUnique({
+                    where: { shop_orderName: { shop, orderName: evt.shopifyOrderName } },
+                    select: { city: true },
+                  })
+                )?.city ?? null
+              : null,
+            courier: evt.courier ?? null,
           },
         });
         queued += 1;

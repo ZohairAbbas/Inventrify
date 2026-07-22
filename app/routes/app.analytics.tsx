@@ -10,6 +10,7 @@ import {
   getDeadStock,
   getStatusDistribution,
   getHighReturnRateProducts,
+  getRtoByRegion,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
 import { BarChart, Card, DataTable, KpiCard, Pill, type DataTableColumn } from "../design";
@@ -22,16 +23,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const deadStockDays = settings?.deadStockDays ?? 60;
   const deadStockMinUnits = settings?.deadStockMinUnits ?? 20;
 
-  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate] = await Promise.all([
+  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion] =
+    await Promise.all([
     getSalesTrend(shop, 30),
     getPeriodComparison(shop),
     getTopMovers(shop, 30, 10),
     getDeadStock(shop, deadStockDays, deadStockMinUnits),
     getStatusDistribution(shop),
     getHighReturnRateProducts(shop, 10),
+    getRtoByRegion(shop),
   ]);
 
-  return { trend, comparison, topMovers, deadStock, statusDist, highReturnRate };
+  return { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion };
 };
 
 const SEGMENT_COLORS: Record<string, string> = {
@@ -42,7 +45,8 @@ const SEGMENT_COLORS: Record<string, string> = {
 };
 
 export default function Analytics() {
-  const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate } = useLoaderData<typeof loader>();
+  const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion } =
+    useLoaderData<typeof loader>();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const totalHealthy = statusDist.healthy + statusDist.low + statusDist.critical + statusDist.stockout;
@@ -194,6 +198,50 @@ export default function Analytics() {
               <Pill label="Review these products" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
             </div>
             <DataTable columns={returnColumns} rows={returnRows} />
+          </div>
+        )}
+
+        {rtoByRegion.length > 0 && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
+              <div style={{ fontSize: "14px", fontWeight: 600 }}>RTO by delivery city</div>
+              <Pill label="COD orders" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "10px" }}>
+              Last 90 days, cities with at least 10 units shipped. A shop-wide average hides
+              which routes are losing money.
+            </div>
+            <DataTable
+              columns={[
+                { header: "City", width: "2fr" },
+                { header: "Units shipped", width: "1fr", align: "right" },
+                { header: "Returned", width: "1fr", align: "right" },
+                { header: "RTO rate", width: "1fr", align: "right" },
+              ]}
+              rows={rtoByRegion.slice(0, 15).map((r) => ({
+                key: r.city,
+                cells: [
+                  <span key="city" style={{ fontWeight: 500 }}>{r.city}</span>,
+                  <span key="shipped" style={{ fontFamily: "var(--inv-font-mono)" }}>{r.shippedUnits}</span>,
+                  <span key="ret" style={{ fontFamily: "var(--inv-font-mono)" }}>{r.returnedUnits}</span>,
+                  <span
+                    key="rate"
+                    style={{
+                      fontFamily: "var(--inv-font-mono)",
+                      fontWeight: 600,
+                      color:
+                        r.rtoRate >= 0.4
+                          ? "var(--inv-status-stockout-fg)"
+                          : r.rtoRate >= 0.25
+                            ? "var(--inv-status-critical-fg)"
+                            : "var(--inv-text-2)",
+                    }}
+                  >
+                    {(r.rtoRate * 100).toFixed(0)}%
+                  </span>,
+                ],
+              }))}
+            />
           </div>
         )}
 

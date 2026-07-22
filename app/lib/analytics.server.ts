@@ -158,3 +158,68 @@ export async function getStockTrend(productId: string) {
     select: { date: true, stock: true },
   });
 }
+
+export interface RegionRto {
+  city: string;
+  shippedUnits: number;
+  returnedUnits: number;
+  /** 0..1 — returned / shipped. */
+  rtoRate: number;
+}
+
+/**
+ * RTO broken down by delivery city.
+ *
+ * A shop-wide return rate averages together routes that behave completely differently —
+ * in these markets the spread between a metro and an upcountry route is routinely
+ * 15-20 percentage points. Without the breakdown there is no way to see which
+ * destinations are unprofitable, or to act on them (COD-restrict, prepay-only, switch
+ * carrier).
+ *
+ * Only COD orders form the denominator: a prepaid order that is refused is not an RTO in
+ * the sense that matters here.
+ */
+export async function getRtoByRegion(
+  shop: string,
+  days = 90,
+  minShipped = 10,
+): Promise<RegionRto[]> {
+  const since = new Date(Date.now() - days * 86400000);
+
+  const [shipped, returned] = await Promise.all([
+    prisma.orderRegion.groupBy({
+      by: ["city"],
+      where: { shop, isCod: true, orderedAt: { gte: since }, city: { not: null } },
+      _sum: { units: true },
+    }),
+    prisma.returnItem.groupBy({
+      by: ["city"],
+      where: { shop, city: { not: null }, createdAt: { gte: since } },
+      _sum: { quantity: true },
+    }),
+  ]);
+
+  const returnedByCity = new Map(
+    returned
+      .filter((r) => r.city != null)
+      .map((r) => [r.city as string, r._sum.quantity ?? 0]),
+  );
+
+  return shipped
+    .filter((s) => s.city != null)
+    .map((s) => {
+      const city = s.city as string;
+      const shippedUnits = s._sum.units ?? 0;
+      const returnedUnits = returnedByCity.get(city) ?? 0;
+      return {
+        city,
+        shippedUnits,
+        returnedUnits,
+        rtoRate: shippedUnits > 0 ? returnedUnits / shippedUnits : 0,
+      };
+    })
+    // Small samples produce meaningless rates; a city with 2 shipments and 1 return is
+    // not a 50% RTO route.
+    .filter((r) => r.shippedUnits >= minShipped)
+    .sort((a, b) => b.rtoRate - a.rtoRate);
+}

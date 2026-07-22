@@ -75,6 +75,7 @@ Return-received events, feeding the returns-to-restock queue.
 | `updatedAt`            | ISO \| null     | **The field the `updatedSince` filter applies to** |
 | `isShopifyReturnClosed`| boolean         | Reconciliation only                              |
 | `reasonCategory`       | string \| null  | From Courierify `ReturnReason.category`          |
+| `courier`              | string \| null  | Optional. Read if present, never required — enables carrier-level RTO breakdown |
 
 Idempotency key is `(shipmentId, lineItemId)`, *not* `(shipmentId, sku)` — two SKU-less
 lines on one shipment must stay distinct.
@@ -103,3 +104,20 @@ still queued, with `productId = null`, so they are visible rather than silently 
 - Both syncs report `unmatched` — SKUs Courierify knows about that have no local product.
   A non-zero count means the RTO data has gaps, which otherwise looks identical to full
   coverage.
+
+## Regional attribution
+
+Returns are attributed to a delivery city so RTO can be broken down by route
+(`getRtoByRegion` in `app/lib/analytics.server.ts`). The city does **not** come from
+Courierify — it is resolved at ingest by joining `shopifyOrderName` against `OrderRegion`,
+which the Shopify order sync populates from the order's shipping address.
+
+That means regional analysis works with no additional Courierify surface. If Courierify
+later exposes a carrier per shipment, `courier` is already read opportunistically and the
+same breakdown extends to carriers.
+
+Denominator rules:
+
+- Only COD orders count. A refused prepaid order is not an RTO in the sense that matters.
+- Cities below a minimum shipped volume are excluded — 1 return out of 2 shipments is not
+  a 50% RTO route.

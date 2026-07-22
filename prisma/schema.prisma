@@ -430,6 +430,13 @@ model ReturnItem {
   returnReceivedAt DateTime?
   reasonCategory String?  // from Courierify ReturnReason.category
   status         String   @default("pending") // pending | restocked | written_off
+  // Delivery region, resolved from the Shopify order at ingest via OrderRegion.
+  // RTO rates differ enormously between cities in COD markets, and a shop-wide
+  // average hides which routes are actually losing money.
+  city           String?
+  // Carrier, when Courierify reports one. Optional by design: the returns contract
+  // does not guarantee it, so this reads it opportunistically rather than requiring it.
+  courier        String?
   locationId     String?  // where it was restocked (null until resolved)
   resolvedAt     DateTime?
   createdAt      DateTime @default(now())
@@ -469,4 +476,25 @@ model ForecastAccuracy {
   @@unique([productId, horizon, dueAt])
   @@index([shop, dueAt])
   @@index([shop, evaluatedAt])
+}
+
+// Delivery region per Shopify order, captured during order sync.
+//
+// This is the denominator for regional RTO analysis: returns can be attributed to a city
+// (via shopifyOrderName), but without knowing how much was *shipped* to that city a
+// return count says nothing. One row per order over the sync window.
+model OrderRegion {
+  id        String   @id @default(cuid())
+  shop      String
+  orderName String   // Shopify order name, e.g. "#1001" — the join key Courierify returns use
+  city      String?
+  province  String?
+  country   String?
+  units     Int      @default(0)
+  isCod     Boolean  @default(false)
+  orderedAt DateTime
+
+  @@unique([shop, orderName])
+  @@index([shop, city])
+  @@index([shop, orderedAt])
 }

@@ -4,6 +4,7 @@ import prisma from "../db.server";
 import {
   syncCourierifyFulfilmentStatus,
   syncCourierifyOrderOutcomes,
+  syncCourierifyReturnRates,
   syncCourierifyReturns,
 } from "../lib/courierify.server";
 import { recomputeDerivedRto } from "../lib/rto-attribution.server";
@@ -34,6 +35,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   const results: {
     shop: string;
+    rates: number;
+    ratesError?: string;
     fulfilment: number;
     fulfilmentError?: string;
     returns: number;
@@ -47,6 +50,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   for (const { shop, courierifyApiKey } of connected) {
     const apiKey = decryptSecret(courierifyApiKey);
     if (!apiKey) continue;
+    // The per-SKU RTO rate belongs on the same hourly cadence as everything else it is
+    // read alongside. It was previously only refreshed when a merchant saved settings,
+    // so a connected shop's rate could sit untouched for weeks — and now that precedence
+    // requires the courier feed to be *current*, a rate that never refreshes would
+    // eventually and silently hand priority to Shopify tracking.
+    const rates = await syncCourierifyReturnRates(shop, apiKey);
     const status = await syncCourierifyFulfilmentStatus(shop, apiKey);
     const returns = await syncCourierifyReturns(shop, apiKey);
 
@@ -60,6 +69,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       : { attributed: 0 };
     results.push({
       shop,
+      rates: rates.synced,
+      ratesError: rates.error,
       fulfilment: status.synced,
       fulfilmentError: status.error,
       returns: returns.queued,

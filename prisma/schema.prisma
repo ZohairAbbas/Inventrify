@@ -557,8 +557,12 @@ model OrderOutcome {
   shop       String
   shipmentId String
   orderName  String
-  // delivered | returned | in_transit | booked | ... (courier vocabulary, passed through)
+  // delivered | returned | in_transit | booked | ... (source vocabulary, passed through)
   status     String
+  // Where the outcome came from. Shopify's own fulfilment tracking covers every shop
+  // with no integration at all, so it is the base layer; a courier feed refines it.
+  // "shopify" | "courierify"
+  source     String   @default("courierify")
   courier    String?
   updatedAt  DateTime
 
@@ -566,4 +570,5 @@ model OrderOutcome {
   @@index([shop, orderName])
   @@index([shop, status])
   @@index([shop, updatedAt])
+  @@index([shop, source])
 }

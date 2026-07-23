@@ -7,6 +7,10 @@ import { describeError } from "../lib/shopify-graphql.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
 import { recomputeReorderPoints } from "../lib/planning-job.server";
+import {
+  recomputeDerivedRto,
+  recomputeFulfilmentFromOutcomes,
+} from "../lib/rto-attribution.server";
 
 /**
  * Scheduled reconciliation against Shopify.
@@ -46,6 +50,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
       const inventory = await syncShopifyInventory(admin, shop);
       const orders = await syncOrderHistory(admin, shop);
+
+      // Shopify's own carrier tracking now feeds the fulfilment pipeline and per-SKU
+      // RTO, so both work with no courier integration at all. A courier feed refines
+      // these later; it is not required for them to exist.
+      await recomputeFulfilmentFromOutcomes(shop);
+      await recomputeDerivedRto(shop);
 
       // The sync rewrites avgDailySales, so the reorder points derived from it must be
       // refreshed in the same breath or the two disagree until the nightly job runs.

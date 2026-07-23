@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   RTO_STALE_AFTER_DAYS,
   attributeRto,
+  classifyFulfilmentStage,
   isResolvedStatus,
   isReturnedStatus,
   type OrderLineRow,
@@ -172,5 +173,61 @@ describe("freshness thresholds", () => {
 
   it("does not flag data from yesterday", () => {
     expect(1 > RTO_STALE_AFTER_DAYS).toBe(false);
+  });
+});
+
+describe("classifyFulfilmentStage", () => {
+  it("maps Shopify's delivery outcomes", () => {
+    expect(classifyFulfilmentStage("DELIVERED")).toBe("delivered");
+    // The COD return signal: went out, came back undelivered.
+    expect(classifyFulfilmentStage("NOT_DELIVERED")).toBe("not_delivered");
+  });
+
+  it("separates the stages of a journey in progress", () => {
+    expect(classifyFulfilmentStage("IN_TRANSIT")).toBe("in_transit");
+    expect(classifyFulfilmentStage("OUT_FOR_DELIVERY")).toBe("out_for_delivery");
+    expect(classifyFulfilmentStage("ATTEMPTED_DELIVERY")).toBe("attempted");
+  });
+
+  it("treats handed-over-but-unscanned as dispatched, not in transit", () => {
+    // A large dispatched bucket usually means tracking is not flowing, which is a
+    // different problem from parcels genuinely sitting still.
+    for (const s of ["FULFILLED", "MARKED_AS_FULFILLED", "SUBMITTED", "LABEL_PRINTED"]) {
+      expect(classifyFulfilmentStage(s)).toBe("dispatched");
+    }
+  });
+
+  it("excludes journeys that never happened", () => {
+    expect(classifyFulfilmentStage("CANCELED")).toBeNull();
+    expect(classifyFulfilmentStage("LABEL_VOIDED")).toBeNull();
+  });
+
+  it("does not count FAILURE as a return", () => {
+    // Ambiguous between a carrier error and a genuine RTO; counting it would inflate the
+    // return rate and therefore safety stock.
+    expect(classifyFulfilmentStage("FAILURE")).toBeNull();
+  });
+
+  it("still understands the courier vocabulary", () => {
+    expect(classifyFulfilmentStage("returned")).toBe("not_delivered");
+    expect(classifyFulfilmentStage("delivered")).toBe("delivered");
+  });
+});
+
+describe("Shopify statuses feed the RTO rate", () => {
+  it("treats NOT_DELIVERED as a return and DELIVERED as kept", () => {
+    const lines = [...orders("d", 12, "SKU-A"), ...orders("n", 8, "SKU-A")];
+    const out = [...outcomes("d", 12, "DELIVERED"), ...outcomes("n", 8, "NOT_DELIVERED")];
+    const [r] = attributeRto(out, lines);
+    expect(r.shippedUnits).toBe(20);
+    expect(r.returnedUnits).toBe(8);
+    expect(r.rtoRate).toBeCloseTo(0.4, 10);
+  });
+
+  it("leaves in-flight stages out of the rate entirely", () => {
+    const lines = [...orders("d", 10, "SKU-A"), ...orders("t", 30, "SKU-A")];
+    const out = [...outcomes("d", 10, "DELIVERED"), ...outcomes("t", 30, "OUT_FOR_DELIVERY")];
+    const [r] = attributeRto(out, lines);
+    expect(r.shippedUnits).toBe(10);
   });
 });

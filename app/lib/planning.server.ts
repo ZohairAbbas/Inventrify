@@ -90,8 +90,20 @@ export interface InventoryPosition {
   reserved: number;
   /** Units on purchase orders that are sent but not yet received. */
   onOrder: number;
-  /** Units in RTO transit expected to return sellable. */
+  /** Units already back from RTO and awaiting resolution, expected to be sellable. */
   rtoInbound: number;
+  /** Units currently in forward transit — dispatched, not yet delivered or returned. */
+  inTransit: number;
+  /**
+   * Of those in-transit units, how many are expected to come back sellable.
+   *
+   * Deliberately NOT part of `position`. It is a probabilistic forecast, not committed
+   * supply like a purchase order, and folding it into the figure that drives stockout
+   * status would let an expected-returns estimate mask a real stockout. It is surfaced
+   * separately and credited in purchase suggestions, where being slightly conservative
+   * costs far less than under-shipping.
+   */
+  inTransitReturning: number;
   /**
    * What replenishment decisions must be made against:
    * onHand - reserved + onOrder + rtoInbound.
@@ -118,7 +130,14 @@ export async function getInventoryPositions(
   const [products, reservedRows, onOrderRows] = await Promise.all([
     prisma.product.findMany({
       where: { shop, id: { in: productIds } },
-      select: { id: true, currentStock: true },
+      select: {
+        id: true,
+        currentStock: true,
+        fulfilledInTransit: true,
+        courierRtoRate: true,
+        derivedRtoRate: true,
+        estimatedRtoRate: true,
+      },
     }),
     prisma.productLocationStock.groupBy({
       by: ["productId"],
@@ -167,11 +186,20 @@ export async function getInventoryPositions(
     const reserved = reservedById.get(p.id) ?? 0;
     const onOrder = onOrderById.get(p.id) ?? 0;
 
+    // Units in forward transit have already left stock. A share of them will be refused
+    // and come back, which is real future supply — but only a forecast, so it is reported
+    // rather than folded into the position that decides stockout status.
+    const inTransit = Math.max(0, p.fulfilledInTransit);
+    const { rate } = resolveReturnRate(p);
+    const inTransitReturning = Math.floor(inTransit * rate * restockRate);
+
     result.set(p.id, {
       onHand: p.currentStock,
       reserved,
       onOrder,
       rtoInbound,
+      inTransit,
+      inTransitReturning,
       position: p.currentStock - reserved + onOrder + rtoInbound,
     });
   }
@@ -190,6 +218,12 @@ export interface ProcurementInput {
   position: number;
   /** Safety stock to hold on top of demand. */
   safetyStock: number;
+  /**
+   * Units already in forward transit that are expected to be refused and come back
+   * sellable. Real supply for the horizon, so it reduces what needs buying — but it is
+   * kept out of `position` because it must not mask a stockout.
+   */
+  inTransitReturning?: number;
   moq: number;
   casePackSize: number;
 }
@@ -223,9 +257,17 @@ export function computeProcurementPlan(input: ProcurementInput): ProcurementPlan
     shipUnits * clamp01(input.returnRate) * clamp01(input.restockRate),
   );
 
+  const inTransitReturning = Math.max(0, input.inTransitReturning ?? 0);
+
   const rawNeed = Math.max(
     0,
-    Math.ceil(shipUnits + input.safetyStock - input.position - expectedReturnsSellable),
+    Math.ceil(
+      shipUnits +
+        input.safetyStock -
+        input.position -
+        expectedReturnsSellable -
+        inTransitReturning,
+    ),
   );
 
   if (rawNeed === 0) {

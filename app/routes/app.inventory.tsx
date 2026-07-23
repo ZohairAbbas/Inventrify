@@ -93,6 +93,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         ),
         onOrder: positions.get(p.id)?.onOrder ?? 0,
         rtoInbound: positions.get(p.id)?.rtoInbound ?? 0,
+        inTransit: positions.get(p.id)?.inTransit ?? 0,
+        inTransitReturning: positions.get(p.id)?.inTransitReturning ?? 0,
         daysRemaining: calculateDaysRemaining(effectiveStock, p.avgDailySales),
         displayName: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
       };
@@ -263,6 +265,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             returnRate: resolveReturnRate(product).rate,
             restockRate,
             position: poPositions.get(product.id)?.position ?? product.currentStock,
+            inTransitReturning: poPositions.get(product.id)?.inTransitReturning ?? 0,
             safetyStock: product.safetyStock,
             moq: product.moq,
             casePackSize: product.casePackSize,

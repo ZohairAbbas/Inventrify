@@ -40,12 +40,37 @@ export interface SkuRto {
 }
 
 /**
- * Courier statuses that represent a completed journey. Anything still moving is excluded
- * from both numerator and denominator: counting in-transit units as "not returned" would
+ * Statuses that represent a completed journey. Anything still moving is excluded from
+ * both numerator and denominator: counting in-transit units as "not returned" would
  * understate the rate, and counting them as returned would overstate it.
+ *
+ * Two vocabularies land here. Courierify uses its own lowercase statuses. Shopify uses
+ * FulfillmentDisplayStatus, where NOT_DELIVERED is the COD return signal — a parcel that
+ * went out and came back. That is distinct from Shopify's Returns API (an RMA the
+ * customer raised), which needs a read_returns scope and describes a different event.
  */
 const DELIVERED = new Set(["delivered"]);
-const RETURNED = new Set(["returned", "rto", "returned_to_shipper"]);
+const RETURNED = new Set([
+  "returned",
+  "rto",
+  "returned_to_shipper",
+  // Shopify: the carrier could not deliver and the parcel is coming back.
+  "not_delivered",
+]);
+
+/**
+ * Statuses that end a shipment without it being either delivered or returned. Excluded
+ * entirely rather than counted as a non-return, which would dilute the rate.
+ *
+ * FAILURE is deliberately here rather than in RETURNED: it can mean a carrier error or a
+ * voided label as easily as a genuine RTO, and inflating the return rate on an ambiguous
+ * status is the more damaging mistake — it would inflate safety stock.
+ */
+const TERMINAL_NON_JOURNEY = new Set(["canceled", "cancelled", "label_voided", "failure"]);
+
+export function isTerminalNonJourney(status: string): boolean {
+  return TERMINAL_NON_JOURNEY.has(status.trim().toLowerCase());
+}
 
 export function isResolvedStatus(status: string): boolean {
   const s = status.trim().toLowerCase();
@@ -127,7 +152,7 @@ export async function recomputeDerivedRto(
   const [outcomes, lines] = await Promise.all([
     prisma.orderOutcome.findMany({
       where: { shop, updatedAt: { gte: since } },
-      select: { orderName: true, status: true, updatedAt: true },
+      select: { orderName: true, status: true, source: true, updatedAt: true },
       orderBy: { updatedAt: "asc" },
     }),
     prisma.orderLineItem.findMany({
@@ -138,7 +163,13 @@ export async function recomputeDerivedRto(
 
   if (outcomes.length === 0) return { attributed: 0, skipped: 0, dataThrough: null };
 
-  const rates = attributeRto(outcomes, lines);
+  // Collapse to one status per order first, so a shop with both a courier feed and
+  // Shopify tracking does not count the same parcel twice.
+  const resolvedByOrder = resolveOutcomeByOrder(outcomes);
+  const rates = attributeRto(
+    [...resolvedByOrder].map(([orderName, status]) => ({ orderName, status })),
+    lines,
+  );
 
   for (const r of rates) {
     await prisma.product.update({
@@ -155,7 +186,9 @@ export async function recomputeDerivedRto(
   // than subtracting a SKU count from a shipment count — different units, meaningless
   // difference.
   const resolvedOrders = new Set(
-    outcomes.filter((o) => isResolvedStatus(o.status)).map((o) => o.orderName),
+    [...resolvedByOrder]
+      .filter(([, status]) => isResolvedStatus(status))
+      .map(([orderName]) => orderName),
   );
   const candidateSkus = new Set(
     lines.filter((l) => resolvedOrders.has(l.orderName)).map((l) => l.productId),
@@ -164,11 +197,9 @@ export async function recomputeDerivedRto(
   // Record how current the underlying courier data actually is. A feed can go quiet
   // without erroring — a shop that switches carrier simply stops appearing — and an RTO
   // rate computed from history but shown as today's number sizes safety stock wrongly.
-  const resolvedOutcomes = outcomes.filter((o) => isResolvedStatus(o.status));
-  const dataThrough = resolvedOutcomes.reduce<Date | null>(
-    (max, o) => (max === null || o.updatedAt > max ? o.updatedAt : max),
-    null,
-  );
+  const dataThrough = outcomes
+    .filter((o) => isResolvedStatus(o.status))
+    .reduce<Date | null>((max, o) => (max === null || o.updatedAt > max ? o.updatedAt : max), null);
 
   await prisma.shopSettings.update({
     where: { shop },
@@ -270,5 +301,206 @@ export async function getRtoFreshness(shop: string): Promise<RtoFreshness> {
         `(${ageDays} days ago). If shipments moved to another carrier, these rates describe ` +
         `the past and should not drive new purchase orders.`
       : null,
+  };
+}
+
+/**
+ * Per-SKU fulfilment pipeline counts, derived from whatever outcomes we hold.
+ *
+ * This is what fills the dashboard's delivery pipeline for shops with no courier
+ * integration at all. Shopify's own carrier tracking already knows how many units were
+ * delivered, are still moving, or came back undelivered; joining that to the per-order SKU
+ * breakdown turns it into per-product figures.
+ */
+export async function recomputeFulfilmentFromOutcomes(
+  shop: string,
+  windowDays = 90,
+): Promise<{ products: number }> {
+  const since = new Date(Date.now() - windowDays * 86400000);
+
+  const [outcomes, lines] = await Promise.all([
+    prisma.orderOutcome.findMany({
+      where: { shop, updatedAt: { gte: since } },
+      select: { orderName: true, status: true, source: true, updatedAt: true },
+      orderBy: { updatedAt: "asc" },
+    }),
+    prisma.orderLineItem.findMany({
+      where: { shop, orderedAt: { gte: since } },
+      select: { orderName: true, productId: true, quantity: true },
+    }),
+  ]);
+  if (outcomes.length === 0) return { products: 0 };
+
+  const statusByOrder = resolveOutcomeByOrder(outcomes);
+
+  const counts = new Map<string, { delivered: number; inTransit: number; returned: number }>();
+  for (const line of lines) {
+    const status = statusByOrder.get(line.orderName);
+    if (!status || isTerminalNonJourney(status)) continue;
+
+    const entry = counts.get(line.productId) ?? { delivered: 0, inTransit: 0, returned: 0 };
+    if (isReturnedStatus(status)) entry.returned += line.quantity;
+    else if (isResolvedStatus(status)) entry.delivered += line.quantity;
+    else entry.inTransit += line.quantity;
+    counts.set(line.productId, entry);
+  }
+
+  const now = new Date();
+  for (const [productId, c] of counts) {
+    await prisma.product.updateMany({
+      where: { id: productId, shop },
+      data: {
+        fulfilledDelivered: c.delivered,
+        fulfilledInTransit: c.inTransit,
+        fulfilledReturned: c.returned,
+        fulfilmentSyncedAt: now,
+      },
+    });
+  }
+  return { products: counts.size };
+}
+
+/**
+ * One status per order, preferring a courier's own report over Shopify's tracking.
+ *
+ * Both describe the same parcel. A courier integration knows more (it distinguishes a
+ * return in progress from one already back on the shelf), so it wins where both exist;
+ * Shopify covers everything else, which for most shops is everything.
+ */
+function resolveOutcomeByOrder(
+  outcomes: { orderName: string; status: string; source: string }[],
+): Map<string, string> {
+  const chosen = new Map<string, { status: string; source: string }>();
+  for (const o of outcomes) {
+    const existing = chosen.get(o.orderName);
+    if (existing && existing.source === "courierify" && o.source !== "courierify") continue;
+    chosen.set(o.orderName, { status: o.status, source: o.source });
+  }
+  return new Map([...chosen].map(([k, v]) => [k, v.status]));
+}
+
+/** Stages a dispatched unit passes through, in journey order. */
+export const FULFILMENT_STAGES = [
+  "dispatched",
+  "in_transit",
+  "out_for_delivery",
+  "attempted",
+  "delivered",
+  "not_delivered",
+] as const;
+export type FulfilmentStage = (typeof FULFILMENT_STAGES)[number];
+
+export const STAGE_LABELS: Record<FulfilmentStage, string> = {
+  dispatched: "Dispatched",
+  in_transit: "In transit",
+  out_for_delivery: "Out for delivery",
+  attempted: "Attempted",
+  delivered: "Delivered",
+  not_delivered: "Not delivered",
+};
+
+/**
+ * Map a carrier status onto a journey stage.
+ *
+ * "Dispatched" means the shop handed the parcel over but no carrier scan has come back
+ * yet — worth separating from in-transit, because a large dispatched bucket usually means
+ * tracking is not flowing rather than that parcels are sitting still.
+ *
+ * Returns null for statuses that end the journey without a delivery outcome (cancelled,
+ * voided labels), which must not appear in any stage total.
+ */
+export function classifyFulfilmentStage(status: string): FulfilmentStage | null {
+  const s = status.trim().toLowerCase();
+  if (isTerminalNonJourney(s)) return null;
+  if (RETURNED.has(s)) return "not_delivered";
+  if (DELIVERED.has(s)) return "delivered";
+  if (s === "out_for_delivery") return "out_for_delivery";
+  if (s === "attempted_delivery") return "attempted";
+  if (s === "in_transit" || s === "picked_up") return "in_transit";
+  // fulfilled, marked_as_fulfilled, submitted, confirmed, label_printed, label_purchased,
+  // ready_for_pickup — handed over, nothing back from the carrier yet.
+  return "dispatched";
+}
+
+export interface FulfilmentBreakdown {
+  /** Units per stage, in journey order. */
+  stages: { stage: FulfilmentStage; label: string; units: number }[];
+  /** Dispatched but not yet delivered or returned — stock that has left the building. */
+  inRouteUnits: number;
+  /** Journeys that finished, i.e. the denominator for a delivery rate. */
+  resolvedUnits: number;
+  deliveredUnits: number;
+  notDeliveredUnits: number;
+  /** notDelivered / resolved, or null when nothing has resolved yet. */
+  rtoRate: number | null;
+  source: "courierify" | "shopify" | "none";
+}
+
+/**
+ * Units by fulfilment stage for a shop, consolidated across every tracked SKU.
+ *
+ * Works from Shopify's own carrier tracking, so it needs no courier integration.
+ */
+export async function getFulfilmentBreakdown(
+  shop: string,
+  windowDays = 90,
+): Promise<FulfilmentBreakdown> {
+  const since = new Date(Date.now() - windowDays * 86400000);
+
+  const [outcomes, lines] = await Promise.all([
+    prisma.orderOutcome.findMany({
+      where: { shop, updatedAt: { gte: since } },
+      select: { orderName: true, status: true, source: true },
+    }),
+    prisma.orderLineItem.findMany({
+      where: { shop, orderedAt: { gte: since } },
+      select: { orderName: true, quantity: true },
+    }),
+  ]);
+
+  const empty: FulfilmentBreakdown = {
+    stages: FULFILMENT_STAGES.map((stage) => ({ stage, label: STAGE_LABELS[stage], units: 0 })),
+    inRouteUnits: 0,
+    resolvedUnits: 0,
+    deliveredUnits: 0,
+    notDeliveredUnits: 0,
+    rtoRate: null,
+    source: "none",
+  };
+  if (outcomes.length === 0 || lines.length === 0) return empty;
+
+  const statusByOrder = resolveOutcomeByOrder(outcomes);
+  const tally = new Map<FulfilmentStage, number>();
+
+  for (const line of lines) {
+    const status = statusByOrder.get(line.orderName);
+    if (!status) continue;
+    const stage = classifyFulfilmentStage(status);
+    if (!stage) continue;
+    tally.set(stage, (tally.get(stage) ?? 0) + line.quantity);
+  }
+
+  const stages = FULFILMENT_STAGES.map((stage) => ({
+    stage,
+    label: STAGE_LABELS[stage],
+    units: tally.get(stage) ?? 0,
+  }));
+  const delivered = tally.get("delivered") ?? 0;
+  const notDelivered = tally.get("not_delivered") ?? 0;
+  const resolved = delivered + notDelivered;
+  const inRoute =
+    (tally.get("dispatched") ?? 0) +
+    (tally.get("in_transit") ?? 0) +
+    (tally.get("out_for_delivery") ?? 0) +
+    (tally.get("attempted") ?? 0);
+
+  return {
+    stages,
+    inRouteUnits: inRoute,
+    resolvedUnits: resolved,
+    deliveredUnits: delivered,
+    notDeliveredUnits: notDelivered,
+    rtoRate: resolved > 0 ? notDelivered / resolved : null,
+    source: outcomes.some((o) => o.source === "courierify") ? "courierify" : "shopify",
   };
 }

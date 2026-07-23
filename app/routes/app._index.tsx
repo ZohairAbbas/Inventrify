@@ -10,7 +10,7 @@ import {
   getStockStatus,
   calculateDaysRemaining,
 } from "../lib/forecast.server";
-import { getRtoFreshness } from "../lib/rto-attribution.server";
+import { getFulfilmentBreakdown, getRtoFreshness } from "../lib/rto-attribution.server";
 import {
   computeProcurementPlan,
   estimateRestockRate,
@@ -115,6 +115,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       inventoryPosition: position,
       onOrder: pos?.onOrder ?? 0,
       rtoInbound: pos?.rtoInbound ?? 0,
+      inTransit: pos?.inTransit ?? 0,
+      inTransitReturning: pos?.inTransitReturning ?? 0,
       status: getStockStatus(position, p.reorderPoint),
       // No demand means no runway — not a fabricated 0.5 units/day.
       daysRemaining: calculateDaysRemaining(position, p.avgDailySales),
@@ -143,6 +145,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         returnRate: resolveReturnRate(p).rate,
         restockRate: shopRestockRate,
         position: p.inventoryPosition,
+        inTransitReturning: p.inTransitReturning,
         safetyStock: p.safetyStock,
         moq: p.moq,
         casePackSize: p.casePackSize,
@@ -197,6 +200,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }, 0);
 
   const rtoFreshness = await getRtoFreshness(shop);
+  const fulfilment = await getFulfilmentBreakdown(shop, rangeDays);
 
   // Genuinely windowed figures. Everything else on this page is current state — stock,
   // alerts, reorder suggestions — which is why the range only drives these.
@@ -219,7 +223,24 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const soldUnits = periodSold._sum.quantity ?? 0;
   const priorUnits = periodPrior._sum.quantity ?? 0;
 
+  // Where the delivery figures came from. Shopify's own carrier tracking covers every
+  // shop; a courier feed refines it where connected.
+  const outcomeSources = await prisma.orderOutcome.groupBy({
+    by: ["source"],
+    where: { shop },
+    _count: true,
+  });
+  const pipelineSource = outcomeSources.some((o) => o.source === "courierify")
+    ? "Courierify"
+    : outcomeSources.length > 0
+      ? "Shopify tracking"
+      : courierifyConnected
+        ? "Courierify"
+        : "Shopify tracking";
+
   return {
+    fulfilment,
+    pipelineSource,
     rangeDays,
     period: {
       soldUnits,
@@ -490,10 +511,59 @@ export default function Dashboard() {
           </Card>
         )}
 
-        {data.courierifyConnected && (
+        {data.fulfilment.stages.some((s) => s.units > 0) && (
+          <Card padding="18px 20px" style={{ marginBottom: "16px" }}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: "14px", flexWrap: "wrap", marginBottom: "4px" }}>
+              <div style={{ fontSize: "15px", fontWeight: 600 }}>Units by fulfilment stage</div>
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
+                {data.fulfilment.source === "courierify" ? "Courierify" : "Shopify carrier tracking"}
+                {" · last "}{data.rangeDays} days
+              </div>
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px", lineHeight: 1.5 }}>
+              <strong style={{ color: "var(--inv-text-2)" }}>{data.fulfilment.inRouteUnits.toLocaleString()}</strong> units
+              in route — dispatched and not yet resolved. These have already left stock, and a share will be
+              refused and come back.
+              {data.fulfilment.rtoRate != null && (
+                <> Of {data.fulfilment.resolvedUnits.toLocaleString()} resolved,{" "}
+                <strong style={{ color: data.fulfilment.rtoRate >= 0.3 ? "var(--inv-status-stockout-fg)" : "var(--inv-text-2)" }}>
+                  {(data.fulfilment.rtoRate * 100).toFixed(1)}%
+                </strong>{" "}were not delivered.</>
+              )}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: "10px" }}>
+              {data.fulfilment.stages.map((st) => {
+                const terminal = st.stage === "delivered" || st.stage === "not_delivered";
+                const bad = st.stage === "not_delivered";
+                return (
+                  <div
+                    key={st.stage}
+                    style={{
+                      padding: "12px 13px",
+                      borderRadius: "11px",
+                      border: "1px solid var(--inv-divider)",
+                      background: terminal ? (bad ? "#fdf5f3" : "#f4f9f6") : "var(--inv-subtle)",
+                    }}
+                  >
+                    <div style={{ fontSize: "11.5px", color: "var(--inv-text-2)", marginBottom: "6px" }}>{st.label}</div>
+                    <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "19px", fontWeight: 600, color: bad ? "var(--inv-status-stockout-fg)" : terminal ? "var(--inv-status-healthy-fg)" : "var(--inv-ink)" }}>
+                      {st.units.toLocaleString()}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        )}
+
+        {(data.pipeline.delivered > 0 ||
+          data.pipeline.inTransit > 0 ||
+          data.pipeline.returned > 0 ||
+          data.courierifyConnected) && (
           <>
             <DeliveryPipeline
               pipeline={data.pipeline}
+              source={data.pipelineSource}
               onReviewReturns={() => navigate("/app/returns")}
             />
             {data.pipeline.delivered === 0 &&
@@ -740,8 +810,10 @@ type PipelineData = {
 
 function DeliveryPipeline({
   pipeline,
+  source,
   onReviewReturns,
 }: {
+  source: string;
   pipeline: PipelineData;
   onReviewReturns: () => void;
 }) {
@@ -828,13 +900,13 @@ function DeliveryPipeline({
                   display: "inline-block",
                 }}
               />
-              {hasCourierData ? "Courierify live" : "No courier data"}
+              {hasCourierData ? source : "No delivery data"}
             </span>
           </div>
           <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "3px" }}>
             {hasCourierData
-              ? "Live fulfilment snapshot · in-transit, delivered, returned & damaged across tracked SKUs"
-              : "Courierify returned no per-SKU fulfilment data — the figures below are not a measurement"}
+              ? `In route ${inTransit.toLocaleString()} · delivered ${delivered.toLocaleString()} · not delivered ${returned.toLocaleString()} — units across tracked SKUs`
+              : "No delivery outcomes yet — the figures below are not a measurement"}
           </div>
         </div>
         <button
@@ -847,9 +919,11 @@ function DeliveryPipeline({
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
         {tile({
-          label: "Stuck in-transit",
+          label: "In route",
           value: hasCourierData ? inTransit : dash,
-          sub: hasCourierData ? "units moving now" : "no data",
+          // These units have already left stock. A share will be refused and come back,
+          // which is why they matter to buying rather than being a curiosity.
+          sub: hasCourierData ? "dispatched, not yet resolved" : "no data",
           bg: "var(--inv-transit-bg)",
           border: "var(--inv-transit-border)",
           fg: "var(--inv-transit-fg)",
@@ -865,7 +939,7 @@ function DeliveryPipeline({
           valueColor: "var(--inv-status-healthy-fg)",
         })}
         {tile({
-          label: "Returned",
+          label: "Not delivered",
           value: hasCourierData ? returned : dash,
           // A 0.0% return rate and an unmeasured one look identical; only claim the
           // former when there were resolved shipments to measure.

@@ -17,6 +17,10 @@ const ORDERS_QUERY = `
           paymentGatewayNames
           tags
           displayFulfillmentStatus
+          # Shopify's own carrier tracking. This is the delivery signal every shop has
+          # without any courier integration: DELIVERED / NOT_DELIVERED are what make a
+          # per-SKU RTO rate possible on their own.
+          fulfillments { id displayStatus updatedAt }
           shippingAddress { city province country }
           lineItems(first: 100) {
             edges {
@@ -42,6 +46,7 @@ interface OrderNode {
   paymentGatewayNames: string[] | null;
   tags: string[] | null;
   displayFulfillmentStatus: string | null;
+  fulfillments: { id: string; displayStatus: string | null; updatedAt: string | null }[];
   shippingAddress: { city: string | null; province: string | null; country: string | null } | null;
   lineItems: Paged<{
     variant: { id: string; sku: string | null } | null;
@@ -102,6 +107,13 @@ export async function syncOrderHistory(
     sku: string | null;
     quantity: number;
     orderedAt: Date;
+  }[] = [];
+  // One row per Shopify fulfilment, carrying its delivery outcome.
+  const outcomes: {
+    shipmentId: string;
+    orderName: string;
+    status: string;
+    updatedAt: Date;
   }[] = [];
 
   let cursor: string | null = null;
@@ -206,6 +218,16 @@ export async function syncOrderHistory(
             isCancelled: false,
             orderedAt: placedAt,
           });
+
+          for (const f of order.fulfillments ?? []) {
+            if (!f.displayStatus) continue;
+            outcomes.push({
+              shipmentId: f.id,
+              orderName: order.name,
+              status: f.displayStatus,
+              updatedAt: f.updatedAt ? new Date(f.updatedAt) : placedAt,
+            });
+          }
         }
       }
 
@@ -320,6 +342,16 @@ export async function syncOrderHistory(
       },
       create: { shop, ...line },
       update: { sku: line.sku, quantity: line.quantity, orderedAt: line.orderedAt },
+    });
+  }
+
+  // Persist Shopify's own delivery outcomes. Upserted on the fulfilment id, so a
+  // shipment that moves from IN_TRANSIT to DELIVERED updates in place.
+  for (const o of outcomes) {
+    await prisma.orderOutcome.upsert({
+      where: { shop_shipmentId: { shop, shipmentId: o.shipmentId } },
+      create: { shop, source: "shopify", ...o },
+      update: { status: o.status, updatedAt: o.updatedAt, orderName: o.orderName },
     });
   }
 

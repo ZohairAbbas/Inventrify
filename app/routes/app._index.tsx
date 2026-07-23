@@ -10,6 +10,7 @@ import {
   getStockStatus,
   calculateDaysRemaining,
 } from "../lib/forecast.server";
+import { getRtoFreshness } from "../lib/rto-attribution.server";
 import {
   computeProcurementPlan,
   estimateRestockRate,
@@ -178,8 +179,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     return sum + p.fulfilledInTransit * price;
   }, 0);
 
+  const rtoFreshness = await getRtoFreshness(shop);
+
   return {
     currency: settings?.currency ?? "USD",
+    rtoFreshness,
     capital: {
       stockValue,
       deadStockValue,
@@ -394,6 +398,14 @@ export default function Dashboard() {
           />
           <KpiCard label="Pending POs" value={data.pendingPOs} sub="draft + sent" />
         </div>
+
+        {data.rtoFreshness.warning && (
+          <Card padding="12px 14px" style={{ marginBottom: "14px", borderColor: "var(--inv-status-low-dot)" }}>
+            <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.5 }}>
+              {data.rtoFreshness.warning}
+            </div>
+          </Card>
+        )}
 
         {data.courierifyConnected && (
           <>

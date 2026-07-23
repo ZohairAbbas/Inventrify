@@ -62,6 +62,12 @@ model ShopSettings {
   courierifyReturnsCursor DateTime?
   // Incremental cursor for the order-outcomes pull. Same rules as above.
   courierifyOutcomesCursor DateTime?
+  // Newest courier outcome the derived RTO rates were actually computed from.
+  // A courier feed can go quiet — a shop that changes carrier simply stops appearing —
+  // and a stale RTO rate presented as current sizes safety stock off history.
+  rtoDataThrough     DateTime?
+  // Orders that contributed to the current derived RTO figures.
+  rtoOrdersAttributed Int      @default(0)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 }

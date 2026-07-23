@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  RTO_STALE_AFTER_DAYS,
   attributeRto,
   isResolvedStatus,
   isReturnedStatus,
@@ -149,5 +150,27 @@ describe("attributeRto", () => {
     const [r] = attributeRto(out, lines);
     expect(r.rtoRate).toBeGreaterThanOrEqual(0);
     expect(r.rtoRate).toBeLessThanOrEqual(1);
+  });
+});
+
+describe("freshness thresholds", () => {
+  // getRtoFreshness itself needs a database; the boundary it encodes does not, and the
+  // boundary is what matters — 14 days is the line between "current" and "describes a
+  // period that has ended".
+  it("treats a fortnight as the limit of currency", () => {
+    expect(RTO_STALE_AFTER_DAYS).toBe(14);
+  });
+
+  it("would flag the production case that motivated it", () => {
+    // Courier data ended 2026-07-06; the figures were still on screen on 2026-07-23.
+    const ageDays = Math.floor(
+      (Date.UTC(2026, 6, 23) - Date.UTC(2026, 6, 6)) / 86400000,
+    );
+    expect(ageDays).toBe(17);
+    expect(ageDays > RTO_STALE_AFTER_DAYS).toBe(true);
+  });
+
+  it("does not flag data from yesterday", () => {
+    expect(1 > RTO_STALE_AFTER_DAYS).toBe(false);
   });
 });

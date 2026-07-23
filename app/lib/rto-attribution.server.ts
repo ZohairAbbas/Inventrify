@@ -116,13 +116,18 @@ export function attributeRto(
 export async function recomputeDerivedRto(
   shop: string,
   windowDays = 90,
-): Promise<{ attributed: number; skipped: number }> {
+): Promise<{
+  attributed: number;
+  skipped: number;
+  /** Newest courier outcome the rates were computed from; null when there were none. */
+  dataThrough: Date | null;
+}> {
   const since = new Date(Date.now() - windowDays * 86400000);
 
   const [outcomes, lines] = await Promise.all([
     prisma.orderOutcome.findMany({
       where: { shop, updatedAt: { gte: since } },
-      select: { orderName: true, status: true },
+      select: { orderName: true, status: true, updatedAt: true },
       orderBy: { updatedAt: "asc" },
     }),
     prisma.orderLineItem.findMany({
@@ -131,7 +136,7 @@ export async function recomputeDerivedRto(
     }),
   ]);
 
-  if (outcomes.length === 0) return { attributed: 0, skipped: 0 };
+  if (outcomes.length === 0) return { attributed: 0, skipped: 0, dataThrough: null };
 
   const rates = attributeRto(outcomes, lines);
 
@@ -156,9 +161,24 @@ export async function recomputeDerivedRto(
     lines.filter((l) => resolvedOrders.has(l.orderName)).map((l) => l.productId),
   );
 
+  // Record how current the underlying courier data actually is. A feed can go quiet
+  // without erroring — a shop that switches carrier simply stops appearing — and an RTO
+  // rate computed from history but shown as today's number sizes safety stock wrongly.
+  const resolvedOutcomes = outcomes.filter((o) => isResolvedStatus(o.status));
+  const dataThrough = resolvedOutcomes.reduce<Date | null>(
+    (max, o) => (max === null || o.updatedAt > max ? o.updatedAt : max),
+    null,
+  );
+
+  await prisma.shopSettings.update({
+    where: { shop },
+    data: { rtoDataThrough: dataThrough, rtoOrdersAttributed: resolvedOrders.size },
+  });
+
   return {
     attributed: rates.length,
     skipped: Math.max(0, candidateSkus.size - rates.length),
+    dataThrough,
   };
 }
 
@@ -203,4 +223,52 @@ export async function refreshResolvedReturnRates(shop: string): Promise<number> 
     updated++;
   }
   return updated;
+}
+
+/** Days after which courier-derived RTO stops being treated as current. */
+export const RTO_STALE_AFTER_DAYS = 14;
+
+export interface RtoFreshness {
+  dataThrough: Date | null;
+  ordersAttributed: number;
+  ageDays: number | null;
+  isStale: boolean;
+  /** Merchant-facing explanation, or null when the data is current. */
+  warning: string | null;
+}
+
+/**
+ * How current the shop's derived RTO figures are.
+ *
+ * Seen in production: a shop's courier volume fell 786 -> 560 -> 99 shipments a month and
+ * then stopped entirely, because it moved to another carrier. The RTO rates stayed on
+ * screen looking authoritative while describing a period that had ended two and a half
+ * weeks earlier. Safety stock sized off that is sized off the past.
+ */
+export async function getRtoFreshness(shop: string): Promise<RtoFreshness> {
+  const settings = await prisma.shopSettings.findUnique({
+    where: { shop },
+    select: { rtoDataThrough: true, rtoOrdersAttributed: true },
+  });
+
+  const dataThrough = settings?.rtoDataThrough ?? null;
+  const ordersAttributed = settings?.rtoOrdersAttributed ?? 0;
+  if (!dataThrough) {
+    return { dataThrough: null, ordersAttributed, ageDays: null, isStale: false, warning: null };
+  }
+
+  const ageDays = Math.floor((Date.now() - dataThrough.getTime()) / 86400000);
+  const isStale = ageDays > RTO_STALE_AFTER_DAYS;
+
+  return {
+    dataThrough,
+    ordersAttributed,
+    ageDays,
+    isStale,
+    warning: isStale
+      ? `Return rates are based on courier data up to ${dataThrough.toISOString().slice(0, 10)} ` +
+        `(${ageDays} days ago). If shipments moved to another carrier, these rates describe ` +
+        `the past and should not drive new purchase orders.`
+      : null,
+  };
 }

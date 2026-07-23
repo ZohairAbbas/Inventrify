@@ -229,6 +229,7 @@ export async function refreshResolvedReturnRates(
     select: {
       id: true,
       courierRtoRate: true,
+      courierRtoSyncedAt: true,
       derivedRtoRate: true,
       estimatedRtoRate: true,
       codReturnRate: true,
@@ -238,9 +239,13 @@ export async function refreshResolvedReturnRates(
 
   let updated = 0;
   for (const p of products) {
+    // "Available" means currently reported, not reported once. A courier rate that has
+    // not refreshed within the precedence window steps aside for live Shopify tracking.
+    const courierIsCurrent = p.courierRtoRate != null && isFresh(p.courierRtoSyncedAt);
+
     const resolved =
-      p.courierRtoRate != null
-        ? { rate: p.courierRtoRate, source: "courierify" }
+      courierIsCurrent
+        ? { rate: p.courierRtoRate as number, source: "courierify" }
         : p.derivedRtoRate != null
           ? { rate: p.derivedRtoRate, source: derivedLabel }
           : p.estimatedRtoRate != null
@@ -261,6 +266,20 @@ export async function refreshResolvedReturnRates(
 
 /** Days after which courier-derived RTO stops being treated as current. */
 export const RTO_STALE_AFTER_DAYS = 14;
+
+/**
+ * How long a courier's own per-SKU report keeps precedence over Shopify tracking.
+ *
+ * The Courierify pull runs hourly, so anything older than this means that feed has gone
+ * quiet for the SKU — a shop that changed carrier, or a product it no longer ships. At
+ * that point the live Shopify signal is the better answer, and continuing to prefer the
+ * courier's last word would pin the shop to a number that stopped moving.
+ */
+export const COURIER_PRECEDENCE_HOURS = 48;
+
+function isFresh(at: Date | null | undefined, hours = COURIER_PRECEDENCE_HOURS): boolean {
+  return at != null && Date.now() - at.getTime() < hours * 3600_000;
+}
 
 export interface RtoFreshness {
   dataThrough: Date | null;
@@ -348,8 +367,29 @@ export async function recomputeFulfilmentFromOutcomes(
     counts.set(line.productId, entry);
   }
 
+  // Do not overwrite a SKU the courier is actively reporting. Both syncs write these
+  // fields, so without this the last cron to run won — and the courier's numbers are the
+  // better ones while they keep arriving.
+  const courierOwned = new Set(
+    (
+      await prisma.product.findMany({
+        where: {
+          shop,
+          id: { in: [...counts.keys()] },
+          fulfilmentSource: "courierify",
+          fulfilmentSyncedAt: {
+            gte: new Date(Date.now() - COURIER_PRECEDENCE_HOURS * 3600_000),
+          },
+        },
+        select: { id: true },
+      })
+    ).map((p) => p.id),
+  );
+
   const now = new Date();
+  let written = 0;
   for (const [productId, c] of counts) {
+    if (courierOwned.has(productId)) continue;
     await prisma.product.updateMany({
       where: { id: productId, shop },
       data: {
@@ -357,10 +397,12 @@ export async function recomputeFulfilmentFromOutcomes(
         fulfilledInTransit: c.inTransit,
         fulfilledReturned: c.returned,
         fulfilmentSyncedAt: now,
+        fulfilmentSource: "shopify",
       },
     });
+    written++;
   }
-  return { products: counts.size };
+  return { products: written };
 }
 
 /**

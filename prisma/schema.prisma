@@ -156,6 +156,13 @@ model Product {
   fulfilledInTransit Int    @default(0)
   fulfilledReturned  Int    @default(0)
   fulfilmentSyncedAt DateTime?
+  // Which feed produced the fulfilment counts above: "courierify" | "shopify" | "none".
+  // Two syncs write these fields, so without this the last cron to run simply won.
+  fulfilmentSource   String   @default("none")
+  // When Courierify last reported a per-SKU rate for this product. A courier feed that
+  // has gone quiet must stop outranking fresh Shopify tracking, so precedence is by
+  // "currently available", not merely "present".
+  courierRtoSyncedAt DateTime?
   // Safety stock — auto-computed on sync
   safetyStock     Int       @default(0)
   // Soft delete. Products missing from Shopify are archived, never hard-deleted, so

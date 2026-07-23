@@ -104,8 +104,9 @@ export async function syncCourierifyReturnRates(
         where: { shop, sku: entry.sku },
         data: {
           courierRtoRate: rate,
-          // codReturnRate is the resolved value planning reads; Courierify wins, so
-          // it is safe to set both here.
+          // Stamped so precedence can require the feed to be *current*, not merely to
+          // have reported once. A courier that goes quiet stops outranking live data.
+          courierRtoSyncedAt: new Date(),
           codReturnRate: rate,
           returnRateSource: "courierify",
         },
@@ -151,6 +152,7 @@ export async function syncCourierifyFulfilmentStatus(
       const updated = await prisma.product.updateMany({
         where: { shop, sku: entry.sku },
         data: {
+          fulfilmentSource: "courierify",
           fulfilledDelivered: Math.max(0, entry.delivered ?? 0),
           fulfilledInTransit: Math.max(0, entry.inTransit ?? 0),
           fulfilledReturned: Math.max(0, entry.returned ?? 0),

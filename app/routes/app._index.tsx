@@ -416,15 +416,18 @@ export default function Dashboard() {
             {data.pipeline.delivered === 0 &&
               data.pipeline.inTransit === 0 &&
               data.pipeline.returned === 0 && (
-                /* An all-zero pipeline on a connected shop means the courier has no
-                   shipments for this store — not that nothing has been returned. The two
-                   are otherwise indistinguishable and read as a broken integration. */
+                /* Do not claim the courier has no shipments — it may well have plenty.
+                   All this endpoint proves is that it returned no per-SKU breakdown, and
+                   the usual cause is shipments booked without SKU-level line items. On the
+                   shop that prompted this, Courierify held 1,594 shipments of which zero
+                   carried a SKU. Asserting "no shipments" would have been wrong. */
                 <div
-                  style={{ fontSize: "12px", color: "var(--inv-muted)", margin: "-6px 0 16px" }}
+                  style={{ fontSize: "12px", color: "var(--inv-muted)", margin: "-6px 0 16px", lineHeight: 1.5 }}
                 >
-                  Courierify is connected but reports no shipments for this store yet, so
-                  delivery and RTO figures are empty. They will populate once shipments are
-                  booked through it.
+                  Courierify is connected but returned no per-SKU fulfilment data. Shipments
+                  may still exist there — they usually cannot be broken down by product when
+                  they were booked without SKU-level line items. Nothing above is a
+                  measurement of your return rate.
                 </div>
               )}
           </>
@@ -707,6 +710,12 @@ function DeliveryPipeline({
     );
   };
 
+  // The three courier-sourced tiles are only meaningful when the courier actually
+  // reported something. All-zero is not "a perfect month" — it is an absent signal, and
+  // rendering it as 0 with a 0.0% rate presents no-data as a flawless result.
+  const hasCourierData = delivered + inTransit + returned > 0;
+  const dash = "—";
+
   const legend = (color: string, label: string) => (
     <span style={{ display: "flex", alignItems: "center", gap: "6px" }}>
       <span style={{ width: "9px", height: "9px", borderRadius: "3px", background: color }} />
@@ -720,13 +729,29 @@ function DeliveryPipeline({
         <div>
           <div style={{ fontSize: "15px", fontWeight: 600, display: "flex", alignItems: "center", gap: "9px" }}>
             Delivery pipeline
-            <span style={{ fontSize: "10px", fontWeight: 600, letterSpacing: ".3px", color: "var(--inv-status-healthy-fg)", background: "var(--inv-status-healthy-bg)", padding: "3px 9px", borderRadius: "20px", display: "inline-flex", alignItems: "center", gap: "5px" }}>
-              <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: "var(--inv-status-healthy-dot)", display: "inline-block" }} />
-              Courierify live
+            <span
+              style={{
+                fontSize: "10px", fontWeight: 600, letterSpacing: ".3px",
+                color: hasCourierData ? "var(--inv-status-healthy-fg)" : "var(--inv-text-2)",
+                background: hasCourierData ? "var(--inv-status-healthy-bg)" : "var(--inv-divider-3)",
+                padding: "3px 9px", borderRadius: "20px",
+                display: "inline-flex", alignItems: "center", gap: "5px",
+              }}
+            >
+              <span
+                style={{
+                  width: "6px", height: "6px", borderRadius: "50%",
+                  background: hasCourierData ? "var(--inv-status-healthy-dot)" : "var(--inv-muted)",
+                  display: "inline-block",
+                }}
+              />
+              {hasCourierData ? "Courierify live" : "No courier data"}
             </span>
           </div>
           <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "3px" }}>
-            Live fulfilment snapshot · in-transit, delivered, returned &amp; damaged across tracked SKUs
+            {hasCourierData
+              ? "Live fulfilment snapshot · in-transit, delivered, returned & damaged across tracked SKUs"
+              : "Courierify returned no per-SKU fulfilment data — the figures below are not a measurement"}
           </div>
         </div>
         <button
@@ -740,8 +765,8 @@ function DeliveryPipeline({
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
         {tile({
           label: "Stuck in-transit",
-          value: inTransit,
-          sub: "units moving now",
+          value: hasCourierData ? inTransit : dash,
+          sub: hasCourierData ? "units moving now" : "no data",
           bg: "var(--inv-transit-bg)",
           border: "var(--inv-transit-border)",
           fg: "var(--inv-transit-fg)",
@@ -749,8 +774,8 @@ function DeliveryPipeline({
         })}
         {tile({
           label: "Delivered",
-          value: delivered,
-          sub: "units reached customers",
+          value: hasCourierData ? delivered : dash,
+          sub: hasCourierData ? "units reached customers" : "no data",
           bg: "#f4f9f6",
           border: "#dcece4",
           fg: "var(--inv-status-healthy-dot)",
@@ -758,8 +783,10 @@ function DeliveryPipeline({
         })}
         {tile({
           label: "Returned",
-          value: returned,
-          sub: `${returnRate.toFixed(1)}% return rate`,
+          value: hasCourierData ? returned : dash,
+          // A 0.0% return rate and an unmeasured one look identical; only claim the
+          // former when there were resolved shipments to measure.
+          sub: hasCourierData ? `${returnRate.toFixed(1)}% return rate` : "no data",
           bg: "#fbf6ee",
           border: "#f0e2d0",
           fg: "var(--inv-status-critical-fg)",
@@ -768,8 +795,11 @@ function DeliveryPipeline({
         })}
         {tile({
           label: "Damaged",
+          // Damage is Inventorify's own tally from stock adjustments, so it is real even
+          // with no courier feed — but its rate is a share of courier-handled units and
+          // would read 100% against an empty denominator.
           value: damaged,
-          sub: `${damageRate.toFixed(1)}% of handled`,
+          sub: hasCourierData ? `${damageRate.toFixed(1)}% of handled` : `${damaged} unit${damaged === 1 ? "" : "s"} written off`,
           bg: "#fdf5f3",
           border: "#f2d9d5",
           fg: "var(--inv-status-stockout-fg)",

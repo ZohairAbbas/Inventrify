@@ -25,21 +25,21 @@ export async function getSalesTrend(shop: string, days = 30) {
   return result;
 }
 
-/** Period-over-period totals: last 30d vs prior 30d */
-export async function getPeriodComparison(shop: string) {
+/** Period-over-period totals: the last `days` against the equal window before it. */
+export async function getPeriodComparison(shop: string, days = 30) {
   const now = Date.now();
-  const thirtyDaysAgo = new Date(now - 30 * 86400000);
-  const sixtyDaysAgo = new Date(now - 60 * 86400000);
+  const windowStart = new Date(now - days * 86400000);
+  const priorStart = new Date(now - 2 * days * 86400000);
 
   const [current, prior] = await Promise.all([
     prisma.salesRecord.aggregate({
-      where: { shop, date: { gte: thirtyDaysAgo } },
+      where: { shop, date: { gte: windowStart } },
       _sum: { quantity: true },
     }),
     prisma.salesRecord.aggregate({
       where: {
         shop,
-        date: { gte: sixtyDaysAgo, lt: thirtyDaysAgo },
+        date: { gte: priorStart, lt: windowStart },
       },
       _sum: { quantity: true },
     }),

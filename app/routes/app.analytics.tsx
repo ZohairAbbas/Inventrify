@@ -1,5 +1,5 @@
 import type { LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useRouteLoaderData } from "@remix-run/react";
+import { useLoaderData, useRouteLoaderData, useSearchParams } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
@@ -14,11 +14,25 @@ import {
   getCodFunnel,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
-import { BarChart, Card, DataTable, KpiCard, Pill, type DataTableColumn } from "../design";
+import { BarChart, Card, DataTable, FilterChips, KpiCard, Pill, type DataTableColumn } from "../design";
+
+/** Selectable reporting windows. Anything outside this set falls back to 30 days. */
+const RANGES = [
+  { value: "7", label: "7 days" },
+  { value: "30", label: "30 days" },
+  { value: "90", label: "90 days" },
+];
+const DEFAULT_RANGE = 30;
+
+function parseRange(raw: string | null): number {
+  const days = Number(raw);
+  return RANGES.some((r) => Number(r.value) === days) ? days : DEFAULT_RANGE;
+}
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
+  const rangeDays = parseRange(new URL(request.url).searchParams.get("range"));
 
   const settings = await prisma.shopSettings.findUnique({ where: { shop } });
   const deadStockDays = settings?.deadStockDays ?? 60;
@@ -26,17 +40,23 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel] =
     await Promise.all([
-    getSalesTrend(shop, 30),
-    getPeriodComparison(shop),
-    getTopMovers(shop, 30, 10),
+    getSalesTrend(shop, rangeDays),
+    getPeriodComparison(shop, rangeDays),
+    getTopMovers(shop, rangeDays, 10),
+    // Dead stock is defined by the merchant's own no-sales threshold, not by whatever
+    // window is being viewed — a 7-day view must not relabel everything as dead stock.
     getDeadStock(shop, deadStockDays, deadStockMinUnits),
+    // Stock status is current state; it has no time dimension to filter.
     getStatusDistribution(shop),
     getHighReturnRateProducts(shop, 10),
-    getRtoByRegion(shop),
-    getCodFunnel(shop),
+    getRtoByRegion(shop, rangeDays),
+    getCodFunnel(shop, rangeDays),
   ]);
 
-  return { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel };
+  return {
+    trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
+    codFunnel, rangeDays, deadStockDays,
+  };
 };
 
 const SEGMENT_COLORS: Record<string, string> = {
@@ -47,8 +67,11 @@ const SEGMENT_COLORS: Record<string, string> = {
 };
 
 export default function Analytics() {
-  const { trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel } =
-    useLoaderData<typeof loader>();
+  const {
+    trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
+    codFunnel, rangeDays, deadStockDays,
+  } = useLoaderData<typeof loader>();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
   const totalHealthy = statusDist.healthy + statusDist.low + statusDist.critical + statusDist.stockout;
@@ -124,13 +147,23 @@ export default function Analytics() {
         <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "11px", letterSpacing: "1px", color: "var(--inv-muted)", textTransform: "uppercase", marginBottom: "6px" }}>
           Inventory intelligence
         </div>
-        <h1 style={{ margin: "0 0 18px", fontSize: "25px", fontWeight: 600, letterSpacing: "-.5px" }}>Analytics</h1>
+        <h1 style={{ margin: "0 0 14px", fontSize: "25px", fontWeight: 600, letterSpacing: "-.5px" }}>Analytics</h1>
+
+        <FilterChips
+          options={RANGES}
+          active={String(rangeDays)}
+          onChange={(value) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("range", value);
+            setSearchParams(next, { preventScrollReset: true });
+          }}
+        />
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: "12px", marginBottom: "14px" }}>
           <KpiCard
-            label="Units sold — 30d"
+            label={`Units sold — ${rangeDays}d`}
             value={comparison.currentTotal.toLocaleString()}
-            sub={comparison.changePct != null ? `${comparison.changePct >= 0 ? "+" : ""}${comparison.changePct.toFixed(1)}% vs prior 30d` : undefined}
+            sub={comparison.changePct != null ? `${comparison.changePct >= 0 ? "+" : ""}${comparison.changePct.toFixed(1)}% vs prior ${rangeDays}d` : undefined}
             valueColor={comparison.changePct != null ? changeColor : undefined}
           />
           <KpiCard
@@ -138,7 +171,14 @@ export default function Analytics() {
             value={statusDist.healthy}
             sub={`${statusDist.healthy} healthy · ${statusDist.low} low · ${statusDist.critical} crit · ${statusDist.stockout} out`}
           />
-          <KpiCard label="Dead stock items" value={deadStock.length} sub="products with no recent sales" valueColor="var(--inv-status-critical-fg)" />
+          <KpiCard
+            label="Dead stock items"
+            value={deadStock.length}
+            // Deliberately not tied to the selected range: dead stock is defined by the
+            // merchant's own threshold, so a 7-day view must not relabel the catalogue.
+            sub={`no sales in ${deadStockDays}d — set in Settings`}
+            valueColor="var(--inv-status-critical-fg)"
+          />
         </div>
 
         {totalHealthy > 0 && (
@@ -180,7 +220,7 @@ export default function Analytics() {
 
         <Card style={{ marginBottom: "14px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "14px" }}>
-            <div style={{ fontSize: "14px", fontWeight: 600 }}>Daily sales — last 30 days</div>
+            <div style={{ fontSize: "14px", fontWeight: 600 }}>Daily sales — last {rangeDays} days</div>
             <span style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>all products combined</span>
           </div>
           <BarChart values={trend.map((d) => d.quantity)} labels={[trend[0]?.date ?? "", trend[trend.length - 1]?.date ?? ""]} />
@@ -188,7 +228,7 @@ export default function Analytics() {
 
         {topMovers.length > 0 && (
           <div style={{ marginBottom: "14px" }}>
-            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Top movers — last 30 days</div>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Top movers — last {rangeDays} days</div>
             <DataTable columns={moverColumns} rows={moverRows} />
           </div>
         )}
@@ -207,7 +247,7 @@ export default function Analytics() {
           <div style={{ marginBottom: "22px" }}>
             <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>COD order funnel</div>
             <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "12px" }}>
-              Last 90 days. Demand is recorded when an order is placed, but only dispatched
+              Last {rangeDays} days. Demand is recorded when an order is placed, but only dispatched
               orders consume stock — the gap is how much the demand signal is inflated.
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px" }}>
@@ -253,7 +293,7 @@ export default function Analytics() {
               <Pill label="COD orders" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
             </div>
             <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "10px" }}>
-              Last 90 days, cities with at least 10 units shipped. A shop-wide average hides
+              Last {rangeDays} days, cities with at least 10 units shipped. A shop-wide average hides
               which routes are losing money.
             </div>
             <DataTable

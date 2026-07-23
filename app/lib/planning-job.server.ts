@@ -1,7 +1,8 @@
 import prisma from "../db.server";
 import { abcRankingInputs, classifyAbc, classifyXyz } from "./planning.server";
 import { densify, stdDev } from "./demand.server";
-import { generateAndSaveForecast } from "./forecast.server";
+import { calculateReorderPoint, generateAndSaveForecast } from "./forecast.server";
+import { getLeadTimeMultiplier, getLeadTimeStretch } from "./seasonality.server";
 
 const DAY_MS = 86400000;
 
@@ -164,4 +165,57 @@ export async function refreshForecasts(
     }
   }
   return { refreshed, errors };
+}
+
+/**
+ * Recompute reorder points from the currently-stored demand figures.
+ *
+ * reorderPoint and avgDailySales had two different owners: the order sync rewrites
+ * avgDailySales every run, while reorderPoint was only refreshed by the nightly forecast
+ * pass. Between the two the app showed a reorder point derived from a demand figure it
+ * was no longer displaying — on live data 13 products had a reorder point *below* their
+ * own formula, which no seasonal multiplier can produce, so they were simply stale.
+ *
+ * Cheap enough to run straight after a sync: no Shopify calls, and the seasonality
+ * lookups collapse to 1.0 for shops with no events.
+ */
+export async function recomputeReorderPoints(
+  shop: string,
+): Promise<{ updated: number }> {
+  const products = await prisma.product.findMany({
+    where: { shop, isArchived: false },
+    select: {
+      id: true,
+      avgDailySales: true,
+      leadTimeDays: true,
+      safetyStock: true,
+      reorderPoint: true,
+      supplier: { select: { avgActualLeadTime: true } },
+    },
+  });
+
+  let updated = 0;
+  for (const p of products) {
+    const leadTime = p.supplier?.avgActualLeadTime ?? p.leadTimeDays;
+    const [demandMultiplier, leadTimeMultiplier] = await Promise.all([
+      getLeadTimeMultiplier(shop, leadTime, p.id),
+      getLeadTimeStretch(shop, leadTime, p.id),
+    ]);
+
+    const next = calculateReorderPoint(
+      p.avgDailySales,
+      leadTime,
+      p.safetyStock,
+      demandMultiplier,
+      leadTimeMultiplier,
+    );
+    if (next === p.reorderPoint) continue;
+
+    await prisma.product.update({
+      where: { id: p.id },
+      data: { reorderPoint: next },
+    });
+    updated++;
+  }
+  return { updated };
 }

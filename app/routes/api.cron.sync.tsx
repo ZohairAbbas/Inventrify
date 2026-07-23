@@ -6,6 +6,7 @@ import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
 import { describeError } from "../lib/shopify-graphql.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
+import { recomputeReorderPoints } from "../lib/planning-job.server";
 
 /**
  * Scheduled reconciliation against Shopify.
@@ -45,6 +46,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
       const inventory = await syncShopifyInventory(admin, shop);
       const orders = await syncOrderHistory(admin, shop);
+
+      // The sync rewrites avgDailySales, so the reorder points derived from it must be
+      // refreshed in the same breath or the two disagree until the nightly job runs.
+      await recomputeReorderPoints(shop);
 
       results.push({
         shop,

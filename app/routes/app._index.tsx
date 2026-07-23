@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData, useSearchParams } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
@@ -28,6 +28,7 @@ import {
 import {
   Card,
   DataTable,
+  FilterChips,
   ProductThumb,
   HeroBand,
   KpiCard,
@@ -38,9 +39,18 @@ import {
   type StockStatus,
 } from "../design";
 
+/** Reporting windows for the time-ranged tiles. */
+const RANGES = [
+  { value: "7", label: "7 days" },
+  { value: "30", label: "30 days" },
+  { value: "90", label: "90 days" },
+];
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
+  const rawRange = Number(new URL(request.url).searchParams.get("range"));
+  const rangeDays = RANGES.some((r) => Number(r.value) === rawRange) ? rawRange : 30;
 
   const products = await prisma.product.findMany({ where: { shop, isArchived: false } });
   const alerts = await getUnreadAlerts(shop);
@@ -108,6 +118,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       status: getStockStatus(position, p.reorderPoint),
       // No demand means no runway — not a fabricated 0.5 units/day.
       daysRemaining: calculateDaysRemaining(position, p.avgDailySales),
+      isBackordered: p.currentStock < 0,
       displayName: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
     };
   });
@@ -155,7 +166,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const withCost = products.filter((p) => p.unitCost > 0);
   const costCoverage = products.length > 0 ? withCost.length / products.length : 0;
 
-  const stockValue = products.reduce((sum, p) => sum + p.currentStock * p.unitCost, 0);
+  // Negative stock is an oversell/backorder, not negative-value inventory. Multiplying
+  // it by cost subtracted real money from the total — on one live shop the inventory
+  // value read Rs 194,475 less than the stock actually on the shelves.
+  const stockValue = products.reduce(
+    (sum, p) => sum + Math.max(0, p.currentStock) * p.unitCost,
+    0,
+  );
 
   const deadStockSince = new Date(Date.now() - (settings?.deadStockDays ?? 60) * 86400000);
   const soldRecently = await prisma.salesRecord.groupBy({
@@ -181,7 +198,36 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const rtoFreshness = await getRtoFreshness(shop);
 
+  // Genuinely windowed figures. Everything else on this page is current state — stock,
+  // alerts, reorder suggestions — which is why the range only drives these.
+  const [periodSold, periodPrior] = await Promise.all([
+    prisma.salesRecord.aggregate({
+      where: { shop, date: { gte: new Date(Date.now() - rangeDays * 86400000) } },
+      _sum: { quantity: true },
+    }),
+    prisma.salesRecord.aggregate({
+      where: {
+        shop,
+        date: {
+          gte: new Date(Date.now() - 2 * rangeDays * 86400000),
+          lt: new Date(Date.now() - rangeDays * 86400000),
+        },
+      },
+      _sum: { quantity: true },
+    }),
+  ]);
+  const soldUnits = periodSold._sum.quantity ?? 0;
+  const priorUnits = periodPrior._sum.quantity ?? 0;
+
   return {
+    rangeDays,
+    period: {
+      soldUnits,
+      priorUnits,
+      // Null rather than 0% when there is no prior window to compare against — at 90
+      // days there is none, because only 90 days are retained.
+      changePct: priorUnits > 0 ? ((soldUnits - priorUnits) / priorUnits) * 100 : null,
+    },
     currency: settings?.currency ?? "USD",
     rtoFreshness,
     capital: {
@@ -273,6 +319,7 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const isSyncing = fetcher.state !== "idle";
   const [toast, setToast] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
 
   useEffect(() => {
     if (fetcher.data) {
@@ -377,7 +424,44 @@ export default function Dashboard() {
           />
         )}
 
+        <div
+          style={{
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            gap: "12px", flexWrap: "wrap", marginBottom: "4px",
+          }}
+        >
+          <div style={{ fontSize: "12px", color: "var(--inv-muted)" }}>
+            Sales figures below cover the selected window. Stock, alerts and reorder
+            suggestions are always current.
+          </div>
+          <FilterChips
+            options={RANGES}
+            active={String(data.rangeDays)}
+            onChange={(value) => {
+              const next = new URLSearchParams(searchParams);
+              next.set("range", value);
+              setSearchParams(next, { preventScrollReset: true });
+            }}
+          />
+        </div>
+
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
+          <KpiCard
+            label={`Units sold — ${data.rangeDays}d`}
+            value={data.period.soldUnits.toLocaleString()}
+            sub={
+              data.period.changePct != null
+                ? `${data.period.changePct >= 0 ? "+" : ""}${data.period.changePct.toFixed(1)}% vs prior ${data.rangeDays}d`
+                : "no prior period to compare"
+            }
+            valueColor={
+              data.period.changePct == null
+                ? undefined
+                : data.period.changePct >= 0
+                  ? "var(--inv-status-healthy-fg)"
+                  : "var(--inv-status-critical-fg)"
+            }
+          />
           <KpiCard
             label="Total SKUs tracked"
             value={data.totalSkus}
@@ -393,10 +477,9 @@ export default function Dashboard() {
             label="Critical / stockout"
             value={data.critical}
             valueColor="var(--inv-status-critical-fg)"
-            sub="Order now"
+            sub={`Order now · ${data.pendingPOs} PO${data.pendingPOs !== 1 ? "s" : ""} open`}
             accentBar="var(--inv-status-critical-dot)"
           />
-          <KpiCard label="Pending POs" value={data.pendingPOs} sub="draft + sent" />
         </div>
 
         {data.rtoFreshness.warning && (

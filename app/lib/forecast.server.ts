@@ -147,6 +147,10 @@ export function calculateDaysRemaining(
   avgDailySales: number,
 ): number | null {
   if (avgDailySales <= 0) return null;
+  // Negative stock means the shop has oversold and owes units; there is no runway left
+  // to count down. Dividing it through produced displays like "-136d", which reads as a
+  // measurement but means nothing to anyone.
+  if (currentStock <= 0) return 0;
   return Math.floor(currentStock / avgDailySales);
 }
 

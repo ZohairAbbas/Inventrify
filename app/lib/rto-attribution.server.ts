@@ -146,7 +146,20 @@ export async function recomputeDerivedRto(
   // maths reads reflects the new precedence.
   await refreshResolvedReturnRates(shop);
 
-  return { attributed: rates.length, skipped: outcomes.length - rates.length };
+  // Report what was attributed and how many SKUs fell below the volume floor, rather
+  // than subtracting a SKU count from a shipment count — different units, meaningless
+  // difference.
+  const resolvedOrders = new Set(
+    outcomes.filter((o) => isResolvedStatus(o.status)).map((o) => o.orderName),
+  );
+  const candidateSkus = new Set(
+    lines.filter((l) => resolvedOrders.has(l.orderName)).map((l) => l.productId),
+  );
+
+  return {
+    attributed: rates.length,
+    skipped: Math.max(0, candidateSkus.size - rates.length),
+  };
 }
 
 /**

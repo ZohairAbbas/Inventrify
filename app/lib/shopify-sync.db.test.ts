@@ -8,6 +8,11 @@
  *
  * Needs a scratch database; see the header of alert-dispatch.db.test.ts.
  *   npm run test:db
+ *
+ * Note the stub admin client: these tests never authenticate against Shopify. That is
+ * deliberate and load-bearing, not laziness. The app uses single-use refresh tokens, so
+ * running real credentials from a scratch database consumes the shop's refresh token and
+ * strands production with an unusable one. See docs/testing-against-production-data.md.
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";

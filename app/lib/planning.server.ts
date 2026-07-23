@@ -63,15 +63,16 @@ export function resolveReturnRate(product: {
   estimatedRtoRate: number | null;
 }): {
   rate: number;
-  source: "courierify" | "courierify_orders" | "estimated" | "none";
+  source: "courierify" | "shopify_tracking" | "courierify_orders" | "estimated" | "none";
 } {
   if (product.courierRtoRate != null) {
     return { rate: clamp01(product.courierRtoRate), source: "courierify" };
   }
-  // Derived from order-level courier outcomes when the courier cannot report per-SKU
-  // rates itself — still the courier's measured outcomes, just attributed by us.
+  // Derived by attributing order-level delivery outcomes to SKUs ourselves. The generic
+  // label is refined to name the actual origin (Shopify tracking or a courier feed) by
+  // refreshResolvedReturnRates, which is the only place that knows it.
   if (product.derivedRtoRate != null) {
-    return { rate: clamp01(product.derivedRtoRate), source: "courierify_orders" };
+    return { rate: clamp01(product.derivedRtoRate), source: "shopify_tracking" };
   }
   if (product.estimatedRtoRate != null) {
     return { rate: clamp01(product.estimatedRtoRate), source: "estimated" };

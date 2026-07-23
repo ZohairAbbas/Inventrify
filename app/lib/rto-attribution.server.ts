@@ -220,7 +220,10 @@ export async function recomputeDerivedRto(
  * local estimate. Keeping this in one place is what stopped two writers racing over the
  * same column.
  */
-export async function refreshResolvedReturnRates(shop: string): Promise<number> {
+export async function refreshResolvedReturnRates(
+  shop: string,
+  derivedLabel: "shopify_tracking" | "courierify_orders" = "shopify_tracking",
+): Promise<number> {
   const products = await prisma.product.findMany({
     where: { shop, isArchived: false },
     select: {
@@ -239,7 +242,7 @@ export async function refreshResolvedReturnRates(shop: string): Promise<number> 
       p.courierRtoRate != null
         ? { rate: p.courierRtoRate, source: "courierify" }
         : p.derivedRtoRate != null
-          ? { rate: p.derivedRtoRate, source: "courierify_orders" }
+          ? { rate: p.derivedRtoRate, source: derivedLabel }
           : p.estimatedRtoRate != null
             ? { rate: p.estimatedRtoRate, source: "estimated" }
             : { rate: 0, source: "none" };

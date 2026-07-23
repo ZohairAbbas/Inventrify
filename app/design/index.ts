@@ -11,6 +11,8 @@ export { HeroBand } from "./HeroBand";
 export { Drawer } from "./Drawer";
 export { Toast } from "./Toast";
 export { FilterChips, TogglePills } from "./FilterChips";
+export { DateRangePicker } from "./DateRangePicker";
+export type { DateRangeValue } from "./DateRangePicker";
 export type { ChipOption } from "./FilterChips";
 export { ReorderRow } from "./ReorderRow";
 export { ForecastBar } from "./ForecastBar";

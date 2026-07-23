@@ -11,6 +11,7 @@ import {
   calculateDaysRemaining,
 } from "../lib/forecast.server";
 import { getFulfilmentBreakdown, getRtoFreshness } from "../lib/rto-attribution.server";
+import { previousRange, resolveDateRange } from "../lib/date-range";
 import {
   computeProcurementPlan,
   estimateRestockRate,
@@ -28,7 +29,7 @@ import {
 import {
   Card,
   DataTable,
-  FilterChips,
+  DateRangePicker,
   ProductThumb,
   HeroBand,
   KpiCard,
@@ -39,18 +40,10 @@ import {
   type StockStatus,
 } from "../design";
 
-/** Reporting windows for the time-ranged tiles. */
-const RANGES = [
-  { value: "7", label: "7 days" },
-  { value: "30", label: "30 days" },
-  { value: "90", label: "90 days" },
-];
-
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-  const rawRange = Number(new URL(request.url).searchParams.get("range"));
-  const rangeDays = RANGES.some((r) => Number(r.value) === rawRange) ? rawRange : 30;
+  const range = resolveDateRange(new URL(request.url).searchParams);
 
   const products = await prisma.product.findMany({ where: { shop, isArchived: false } });
   const alerts = await getUnreadAlerts(shop);
@@ -82,7 +75,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       where: {
         shop,
         reason: "damage",
-        createdAt: { gte: new Date(Date.now() - rangeDays * 86400000) },
+        createdAt: { gte: range.from, lt: range.to },
       },
       _sum: { delta: true },
     }),
@@ -92,7 +85,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         shop,
         status: "written_off",
         productId: { not: null },
-        resolvedAt: { gte: new Date(Date.now() - rangeDays * 86400000) },
+        resolvedAt: { gte: range.from, lt: range.to },
       },
       _sum: { quantity: true },
     }),
@@ -212,23 +205,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   }, 0);
 
   const rtoFreshness = await getRtoFreshness(shop);
-  const fulfilment = await getFulfilmentBreakdown(shop, rangeDays);
+  const fulfilment = await getFulfilmentBreakdown(shop, range);
 
   // Genuinely windowed figures. Everything else on this page is current state — stock,
   // alerts, reorder suggestions — which is why the range only drives these.
+  const prior = previousRange(range);
   const [periodSold, periodPrior] = await Promise.all([
     prisma.salesRecord.aggregate({
-      where: { shop, date: { gte: new Date(Date.now() - rangeDays * 86400000) } },
+      where: { shop, date: { gte: range.from, lt: range.to } },
       _sum: { quantity: true },
     }),
     prisma.salesRecord.aggregate({
-      where: {
-        shop,
-        date: {
-          gte: new Date(Date.now() - 2 * rangeDays * 86400000),
-          lt: new Date(Date.now() - rangeDays * 86400000),
-        },
-      },
+      where: { shop, date: { gte: prior.from, lt: prior.to } },
       _sum: { quantity: true },
     }),
   ]);
@@ -237,7 +225,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   return {
     fulfilment,
-    rangeDays,
+    range,
     period: {
       soldUnits,
       priorUnits,
@@ -451,12 +439,20 @@ export default function Dashboard() {
             Sales figures below cover the selected window. Stock, alerts and reorder
             suggestions are always current.
           </div>
-          <FilterChips
-            options={RANGES}
-            active={String(data.rangeDays)}
-            onChange={(value) => {
+          <DateRangePicker
+            value={data.range}
+            onPreset={(days) => {
               const next = new URLSearchParams(searchParams);
-              next.set("range", value);
+              next.set("range", days);
+              next.delete("from");
+              next.delete("to");
+              setSearchParams(next, { preventScrollReset: true });
+            }}
+            onCustom={(from, to) => {
+              const next = new URLSearchParams(searchParams);
+              next.set("from", from);
+              next.set("to", to);
+              next.delete("range");
               setSearchParams(next, { preventScrollReset: true });
             }}
           />
@@ -464,11 +460,11 @@ export default function Dashboard() {
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
           <KpiCard
-            label={`Units sold — ${data.rangeDays}d`}
+            label={`Units sold — ${data.range.label}`}
             value={data.period.soldUnits.toLocaleString()}
             sub={
               data.period.changePct != null
-                ? `${data.period.changePct >= 0 ? "+" : ""}${data.period.changePct.toFixed(1)}% vs prior ${data.rangeDays}d`
+                ? `${data.period.changePct >= 0 ? "+" : ""}${data.period.changePct.toFixed(1)}% vs prior ${data.range.days}d`
                 : "no prior period to compare"
             }
             valueColor={
@@ -521,7 +517,7 @@ export default function Dashboard() {
               </div>
               <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
                 {data.fulfilment.source === "courierify" ? "Courierify" : "Shopify carrier tracking"}
-                {" · last "}{data.rangeDays} days
+                {" · "}{data.range.label}
               </div>
             </div>
             <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px", lineHeight: 1.5 }}>

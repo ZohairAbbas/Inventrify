@@ -3,6 +3,7 @@ import { useLoaderData, useRouteLoaderData, useSearchParams } from "@remix-run/r
 import type { loader as appLoader } from "./app";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
+import { resolveDateRange } from "../lib/date-range";
 import {
   getSalesTrend,
   getPeriodComparison,
@@ -14,25 +15,12 @@ import {
   getCodFunnel,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
-import { BarChart, Card, DataTable, FilterChips, KpiCard, Pill, type DataTableColumn } from "../design";
-
-/** Selectable reporting windows. Anything outside this set falls back to 30 days. */
-const RANGES = [
-  { value: "7", label: "7 days" },
-  { value: "30", label: "30 days" },
-  { value: "90", label: "90 days" },
-];
-const DEFAULT_RANGE = 30;
-
-function parseRange(raw: string | null): number {
-  const days = Number(raw);
-  return RANGES.some((r) => Number(r.value) === days) ? days : DEFAULT_RANGE;
-}
+import { BarChart, Card, DataTable, DateRangePicker, KpiCard, Pill, type DataTableColumn } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-  const rangeDays = parseRange(new URL(request.url).searchParams.get("range"));
+  const range = resolveDateRange(new URL(request.url).searchParams);
 
   const settings = await prisma.shopSettings.findUnique({ where: { shop } });
   const deadStockDays = settings?.deadStockDays ?? 60;
@@ -40,22 +28,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel] =
     await Promise.all([
-    getSalesTrend(shop, rangeDays),
-    getPeriodComparison(shop, rangeDays),
-    getTopMovers(shop, rangeDays, 10),
+    getSalesTrend(shop, range),
+    getPeriodComparison(shop, range),
+    getTopMovers(shop, range, 10),
     // Dead stock is defined by the merchant's own no-sales threshold, not by whatever
     // window is being viewed — a 7-day view must not relabel everything as dead stock.
     getDeadStock(shop, deadStockDays, deadStockMinUnits),
     // Stock status is current state; it has no time dimension to filter.
     getStatusDistribution(shop),
     getHighReturnRateProducts(shop, 10),
-    getRtoByRegion(shop, rangeDays),
-    getCodFunnel(shop, rangeDays),
+    getRtoByRegion(shop, range),
+    getCodFunnel(shop, range),
   ]);
 
   return {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, rangeDays, deadStockDays,
+    codFunnel, range, deadStockDays,
   };
 };
 
@@ -69,7 +57,7 @@ const SEGMENT_COLORS: Record<string, string> = {
 export default function Analytics() {
   const {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, rangeDays, deadStockDays,
+    codFunnel, range, deadStockDays,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -149,21 +137,29 @@ export default function Analytics() {
         </div>
         <h1 style={{ margin: "0 0 14px", fontSize: "25px", fontWeight: 600, letterSpacing: "-.5px" }}>Analytics</h1>
 
-        <FilterChips
-          options={RANGES}
-          active={String(rangeDays)}
-          onChange={(value) => {
+        <DateRangePicker
+          value={range}
+          onPreset={(days) => {
             const next = new URLSearchParams(searchParams);
-            next.set("range", value);
+            next.set("range", days);
+            next.delete("from");
+            next.delete("to");
+            setSearchParams(next, { preventScrollReset: true });
+          }}
+          onCustom={(from, to) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("from", from);
+            next.set("to", to);
+            next.delete("range");
             setSearchParams(next, { preventScrollReset: true });
           }}
         />
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: "12px", marginBottom: "14px" }}>
           <KpiCard
-            label={`Units sold — ${rangeDays}d`}
+            label={`Units sold — ${range.label}`}
             value={comparison.currentTotal.toLocaleString()}
-            sub={comparison.changePct != null ? `${comparison.changePct >= 0 ? "+" : ""}${comparison.changePct.toFixed(1)}% vs prior ${rangeDays}d` : undefined}
+            sub={comparison.changePct != null ? `${comparison.changePct >= 0 ? "+" : ""}${comparison.changePct.toFixed(1)}% vs prior ${range.days}d` : undefined}
             valueColor={comparison.changePct != null ? changeColor : undefined}
           />
           <KpiCard
@@ -220,7 +216,7 @@ export default function Analytics() {
 
         <Card style={{ marginBottom: "14px" }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "14px" }}>
-            <div style={{ fontSize: "14px", fontWeight: 600 }}>Daily sales — last {rangeDays} days</div>
+            <div style={{ fontSize: "14px", fontWeight: 600 }}>Daily sales — {range.label}</div>
             <span style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>all products combined</span>
           </div>
           <BarChart values={trend.map((d) => d.quantity)} labels={[trend[0]?.date ?? "", trend[trend.length - 1]?.date ?? ""]} />
@@ -228,7 +224,7 @@ export default function Analytics() {
 
         {topMovers.length > 0 && (
           <div style={{ marginBottom: "14px" }}>
-            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Top movers — last {rangeDays} days</div>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Top movers — {range.label}</div>
             <DataTable columns={moverColumns} rows={moverRows} />
           </div>
         )}
@@ -247,7 +243,7 @@ export default function Analytics() {
           <div style={{ marginBottom: "22px" }}>
             <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>COD order funnel</div>
             <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "12px" }}>
-              Last {rangeDays} days. Demand is recorded when an order is placed, but only dispatched
+              {range.label}. Demand is recorded when an order is placed, but only dispatched
               orders consume stock — the gap is how much the demand signal is inflated.
             </div>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px" }}>
@@ -293,7 +289,7 @@ export default function Analytics() {
               <Pill label="COD orders" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
             </div>
             <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "10px" }}>
-              Last {rangeDays} days, cities with at least 10 units shipped. A shop-wide average hides
+              {range.label}, cities with at least 10 units shipped. A shop-wide average hides
               which routes are losing money.
             </div>
             <DataTable

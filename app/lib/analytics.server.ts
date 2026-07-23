@@ -1,12 +1,12 @@
 import prisma from "../db.server";
+import { previousRange, type DateRange } from "./date-range";
 import { getStockStatus } from "./forecast.server";
 import { getInventoryPositions } from "./planning.server";
 
 /** Daily sales totals across all products for the last N days */
-export async function getSalesTrend(shop: string, days = 30) {
-  const since = new Date(Date.now() - days * 86400000);
+export async function getSalesTrend(shop: string, range: DateRange) {
   const records = await prisma.salesRecord.findMany({
-    where: { shop, date: { gte: since } },
+    where: { shop, date: { gte: range.from, lt: range.to } },
     select: { date: true, quantity: true },
     orderBy: { date: "asc" },
   });
@@ -17,36 +17,33 @@ export async function getSalesTrend(shop: string, days = 30) {
     byDate.set(d, (byDate.get(d) ?? 0) + r.quantity);
   }
 
+  // Walk the window itself rather than counting back from today, so a custom range
+  // that ends in the past plots its own days instead of a trailing block of zeros.
   const result: { date: string; quantity: number }[] = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+  for (let t = range.from.getTime(); t < range.to.getTime(); t += 86400000) {
+    const d = new Date(t).toISOString().slice(0, 10);
     result.push({ date: d, quantity: byDate.get(d) ?? 0 });
   }
   return result;
 }
 
 /** Period-over-period totals: the last `days` against the equal window before it. */
-export async function getPeriodComparison(shop: string, days = 30) {
-  const now = Date.now();
-  const windowStart = new Date(now - days * 86400000);
-  const priorStart = new Date(now - 2 * days * 86400000);
+export async function getPeriodComparison(shop: string, range: DateRange) {
+  const prior = previousRange(range);
 
-  const [current, prior] = await Promise.all([
+  const [current, priorAgg] = await Promise.all([
     prisma.salesRecord.aggregate({
-      where: { shop, date: { gte: windowStart } },
+      where: { shop, date: { gte: range.from, lt: range.to } },
       _sum: { quantity: true },
     }),
     prisma.salesRecord.aggregate({
-      where: {
-        shop,
-        date: { gte: priorStart, lt: windowStart },
-      },
+      where: { shop, date: { gte: prior.from, lt: prior.to } },
       _sum: { quantity: true },
     }),
   ]);
 
   const currentTotal = current._sum.quantity ?? 0;
-  const priorTotal = prior._sum.quantity ?? 0;
+  const priorTotal = priorAgg._sum.quantity ?? 0;
   const change =
     priorTotal > 0 ? ((currentTotal - priorTotal) / priorTotal) * 100 : null;
 
@@ -54,11 +51,10 @@ export async function getPeriodComparison(shop: string, days = 30) {
 }
 
 /** Top N products by units sold in last N days */
-export async function getTopMovers(shop: string, days = 30, limit = 10) {
-  const since = new Date(Date.now() - days * 86400000);
+export async function getTopMovers(shop: string, range: DateRange, limit = 10) {
   const sums = await prisma.salesRecord.groupBy({
     by: ["productId"],
-    where: { shop, date: { gte: since } },
+    where: { shop, date: { gte: range.from, lt: range.to } },
     _sum: { quantity: true },
     orderBy: { _sum: { quantity: "desc" } },
     take: limit,
@@ -181,20 +177,27 @@ export interface RegionRto {
  */
 export async function getRtoByRegion(
   shop: string,
-  days = 90,
+  range: DateRange,
   minShipped = 10,
 ): Promise<RegionRto[]> {
-  const since = new Date(Date.now() - days * 86400000);
-
   const [shipped, returned] = await Promise.all([
     prisma.orderRegion.groupBy({
       by: ["city"],
-      where: { shop, isCod: true, orderedAt: { gte: since }, city: { not: null } },
+      where: {
+        shop,
+        isCod: true,
+        orderedAt: { gte: range.from, lt: range.to },
+        city: { not: null },
+      },
       _sum: { units: true },
     }),
     prisma.returnItem.groupBy({
       by: ["city"],
-      where: { shop, city: { not: null }, createdAt: { gte: since } },
+      where: {
+        shop,
+        city: { not: null },
+        createdAt: { gte: range.from, lt: range.to },
+      },
       _sum: { quantity: true },
     }),
   ]);
@@ -251,15 +254,14 @@ export interface CodFunnel {
  * attrition rate lets a merchant judge how much to trust the forecast, rather than the app
  * silently changing the demand basis underneath them.
  */
-export async function getCodFunnel(shop: string, days = 90): Promise<CodFunnel> {
-  const since = new Date(Date.now() - days * 86400000);
+export async function getCodFunnel(shop: string, range: DateRange): Promise<CodFunnel> {
   const settings = await prisma.shopSettings.findUnique({
     where: { shop },
     select: { confirmedOrderTag: true },
   });
   const confirmationTracked = !!settings?.confirmedOrderTag?.trim();
 
-  const scope = { shop, isCod: true, orderedAt: { gte: since } };
+  const scope = { shop, isCod: true, orderedAt: { gte: range.from, lt: range.to } };
   const [placed, confirmed, dispatched, cancelled] = await Promise.all([
     prisma.orderRegion.count({ where: scope }),
     prisma.orderRegion.count({ where: { ...scope, isConfirmed: true } }),

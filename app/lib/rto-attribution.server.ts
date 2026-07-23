@@ -488,17 +488,15 @@ export interface FulfilmentBreakdown {
  */
 export async function getFulfilmentBreakdown(
   shop: string,
-  windowDays = 90,
+  range: { from: Date; to: Date },
 ): Promise<FulfilmentBreakdown> {
-  const since = new Date(Date.now() - windowDays * 86400000);
-
   const [outcomes, lines] = await Promise.all([
     prisma.orderOutcome.findMany({
-      where: { shop, updatedAt: { gte: since } },
+      where: { shop, updatedAt: { gte: range.from, lt: range.to } },
       select: { orderName: true, status: true, source: true },
     }),
     prisma.orderLineItem.findMany({
-      where: { shop, orderedAt: { gte: since } },
+      where: { shop, orderedAt: { gte: range.from, lt: range.to } },
       select: { orderName: true, quantity: true },
     }),
   ]);

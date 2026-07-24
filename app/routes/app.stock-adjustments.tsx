@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { applyStockDelta } from "../lib/stock.server";
-import { Button, Card, DataTable, FilterChips, PageHead, Pill, ProductCombobox, SelectInput, TextArea, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, FilterChips, PageHead, Pill, ProductCombobox, ScanInput, SelectInput, TextArea, type DataTableColumn } from "../design";
 
 const REASONS = [
   { label: "Damage / Loss", value: "damage" },
@@ -294,6 +294,14 @@ export default function StockAdjustments() {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
             <div>
               <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>Product / variant</label>
+              <div style={{ marginBottom: "8px" }}>
+                <ScanInput
+                  hint="Scan to select the product. A handheld scanner types the code and presses Enter for you."
+                  onScan={(p) =>
+                    setProduct({ id: p.id, label: p.label, currentStock: p.currentStock })
+                  }
+                />
+              </div>
               <ProductCombobox
                 value={product?.id ?? ""}
                 valueLabel={product?.label ?? null}

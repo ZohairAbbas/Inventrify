@@ -8,6 +8,19 @@ import {
   type Paged,
 } from "./shopify-graphql.server";
 
+/**
+ * Trim a barcode to a storable value.
+ *
+ * Shopify returns "" for a variant with no barcode, and merchants paste values with
+ * stray whitespace. Both must land as NULL so "no barcode" is a single state — otherwise
+ * an exact-match scan lookup silently matches nothing for half the catalogue, and
+ * `barcode: ""` would match every blank row at once.
+ */
+function normaliseBarcode(raw: string | null | undefined): string | null {
+  const trimmed = (raw ?? "").trim();
+  return trimmed === "" ? null : trimmed;
+}
+
 const LOCATIONS_QUERY = `
   query getLocations($cursor: String) {
     locations(first: 50, after: $cursor) {
@@ -143,6 +156,9 @@ const PRODUCT_VARIANTS_QUERY = `
           id
           title
           sku
+          # Scannable code as the merchant entered it in Shopify. Drives scan lookups in
+          # receiving, counting and adjustments; blank for most catalogues.
+          barcode
           inventoryQuantity
           image { url }
           product { id title featuredImage { url } }
@@ -186,6 +202,9 @@ const PRODUCT_VARIANTS_NO_LOCATION_QUERY = `
           id
           title
           sku
+          # Scannable code as the merchant entered it in Shopify. Drives scan lookups in
+          # receiving, counting and adjustments; blank for most catalogues.
+          barcode
           inventoryQuantity
           image { url }
           product { id title featuredImage { url } }
@@ -227,6 +246,7 @@ interface ShopifyVariant {
   id: string;
   title: string;
   sku: string | null;
+  barcode: string | null;
   inventoryQuantity: number | null;
   image: { url: string } | null;
   product: { id: string; title: string; featuredImage: { url: string } | null };
@@ -357,6 +377,7 @@ export async function syncShopifyInventory(
               title: variant.product.title,
               variantTitle,
               sku: variant.sku ?? null,
+              barcode: normaliseBarcode(variant.barcode),
               imageUrl,
               ...(unitCost != null ? { unitCost } : {}),
               currentStock,
@@ -370,6 +391,7 @@ export async function syncShopifyInventory(
               title: variant.product.title,
               variantTitle,
               sku: variant.sku ?? null,
+              barcode: normaliseBarcode(variant.barcode),
               imageUrl,
               // Shopify is the primary source for cost; only overwrite when it has one,
               // so a cost supplied elsewhere is not wiped by a shop that left the field

@@ -110,6 +110,12 @@ model Product {
   title           String
   variantTitle    String?
   sku             String?
+  // Scannable code from Shopify (EAN/UPC/Code128 as the merchant entered it). Stored so
+  // receiving, counting and adjusting can be driven by a scanner rather than by typing:
+  // a USB/Bluetooth scanner is a keyboard, so the whole feature is a focused input plus
+  // an exact-match lookup. Nullable and frequently blank — plenty of catalogues have no
+  // barcodes at all, which is why lookups fall back to SKU.
+  barcode         String?
   // Variant image, falling back to the parent product's featured image. Stored so the
   // inventory, PO and returns tables can identify a SKU visually — SKU codes alone are
   // hard to tell apart across size/colour variants.
@@ -190,6 +196,8 @@ model Product {
   @@index([productGid])
   @@index([inventoryItemId])
   @@index([shop, sku])
+  // Exact-match lookup path for scans.
+  @@index([shop, barcode])
   @@index([shop, isArchived])
 }
 

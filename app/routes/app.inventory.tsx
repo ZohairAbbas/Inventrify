@@ -58,6 +58,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
             { title: { contains: search, mode: "insensitive" as const } },
             { sku: { contains: search, mode: "insensitive" as const } },
             { variantTitle: { contains: search, mode: "insensitive" as const } },
+            // Typing or scanning a barcode into the search box finds the SKU.
+            { barcode: { contains: search, mode: "insensitive" as const } },
           ],
         }
       : {}),
@@ -461,6 +463,7 @@ export default function Inventory() {
   const exportCsv = () => {
     const rows = products.map((p) => ({
       SKU: p.sku ?? "",
+      Barcode: p.barcode ?? "",
       Product: p.title,
       Variant: p.variantTitle ?? "",
       Stock: p.currentStock,
@@ -815,7 +818,7 @@ export default function Inventory() {
             <span style={{ color: "var(--inv-muted)" }}>⌕</span>
             <input
               value={searchInput}
-              placeholder="Search product, variant or SKU"
+              placeholder="Search or scan — product, variant, SKU or barcode"
               onChange={(e) => setSearchInput(e.target.value)}
               style={{ border: "none", outline: "none", flex: 1, fontSize: "13px", background: "transparent", color: "var(--inv-ink)" }}
             />
@@ -890,6 +893,15 @@ export default function Inventory() {
               <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "11.5px", color: "var(--inv-muted)" }}>
                 {drawerProduct.sku ?? "—"}
               </span>
+              {drawerProduct.barcode && (
+                <span
+                  title="Barcode"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontFamily: "var(--inv-font-mono)", fontSize: "11.5px", color: "var(--inv-muted)" }}
+                >
+                  <span aria-hidden>▮▯▮</span>
+                  {drawerProduct.barcode}
+                </span>
+              )}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "18px" }}>
               <ProductThumb src={drawerProduct.imageUrl} name={drawerProduct.displayName} size={56} />

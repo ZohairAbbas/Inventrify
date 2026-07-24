@@ -34,11 +34,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
               { title: { contains: search, mode: "insensitive" as const } },
               { sku: { contains: search, mode: "insensitive" as const } },
               { variantTitle: { contains: search, mode: "insensitive" as const } },
+              { barcode: { contains: search, mode: "insensitive" as const } },
             ],
           }
         : {}),
     },
-    select: { id: true, title: true, variantTitle: true, sku: true, currentStock: true, unitCost: true },
+    select: { id: true, title: true, variantTitle: true, sku: true, barcode: true, currentStock: true, unitCost: true },
     orderBy: [{ title: "asc" }, { id: "asc" }],
     take: LIMIT,
   });

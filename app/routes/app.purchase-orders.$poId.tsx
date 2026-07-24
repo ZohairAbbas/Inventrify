@@ -6,7 +6,7 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, PageHead, POStatusPill, ProductCombobox, ProductThumb, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, PageHead, POStatusPill, ProductCombobox, ProductThumb, ScanInput, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
 import {
   markPurchaseOrderSent,
   parseReceivedQuantities,
@@ -460,6 +460,40 @@ export default function PODetail() {
             <div>
               <div style={{ marginBottom: "14px" }}>
                 <EmailSupplierButton po={po} isBusy={isBusy} fetcher={fetcher} />
+              </div>
+              <div style={{ marginBottom: "14px" }}>
+                <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: "10px", marginBottom: "6px" }}>
+                  <label style={{ fontSize: "12px", color: "var(--inv-text-2)" }}>Scan to count receipts</label>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setReceivedQtys(Object.fromEntries(po.items.map((i) => [i.id, "0"])))
+                    }
+                    style={{ fontSize: "11px", border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-text-2)", padding: "3px 9px", borderRadius: "7px", cursor: "pointer" }}
+                  >
+                    Zero the counts to scan
+                  </button>
+                </div>
+                <ScanInput
+                  placeholder="Scan each item as you unpack, then press Enter"
+                  hint="Each scan adds 1 to that line's received quantity. Zero the counts first, scan a run of boxes, then confirm below."
+                  onScan={(scanned) => {
+                    // Match the scanned product to a line on this PO and tick it up. A
+                    // scanned code that is a real product but not on this PO is a wrong
+                    // delivery, so it is refused rather than silently ignored.
+                    const line = po.items.find((i) => i.productId === scanned.id);
+                    if (!line) {
+                      shopify.toast.show(`${scanned.label} is not on this purchase order`, { isError: true });
+                      return;
+                    }
+                    setReceivedQtys((prev) => {
+                      const current = parseInt(prev[line.id] ?? "0", 10);
+                      const next = (Number.isFinite(current) ? current : 0) + 1;
+                      return { ...prev, [line.id]: String(next) };
+                    });
+                    shopify.toast.show(`${scanned.label} — counted`);
+                  }}
+                />
               </div>
               <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>
                 Actual delivery date

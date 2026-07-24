@@ -525,6 +525,34 @@ export default function Settings() {
         </Card>
 
         <Card style={{ marginBottom: "14px" }}>
+          <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "10px" }}>Barcode scanning</div>
+          <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.6, marginBottom: "10px" }}>
+            Wherever you see the scan field <span style={{ fontFamily: "var(--inv-font-mono)" }}>▮▯▮</span> — on
+            stock adjustments, purchase-order receiving, and the inventory search box — you can scan a barcode
+            instead of typing. The barcode comes from each variant&apos;s <b>Barcode</b> field in Shopify and
+            syncs automatically; a scan matches it exactly, falling back to SKU. A USB or Bluetooth scanner needs
+            no setup: it types the code and presses Enter, which is all the field listens for.
+          </div>
+          <div
+            style={{
+              fontSize: "12px",
+              color: "var(--inv-text-2)",
+              background: "var(--inv-subtle)",
+              border: "1px solid var(--inv-divider-3)",
+              borderRadius: "10px",
+              padding: "12px 14px",
+              lineHeight: 1.6,
+            }}
+          >
+            <b>No scanner? Use your phone.</b> Install <b>Barcode to PC: Wi-Fi scanner</b> from the Google Play
+            Store (also on the App Store) and its free companion on your computer. Keep the phone and computer on
+            the <b>same Wi-Fi network</b> — that is what lets them pair — then scan with the phone&apos;s camera
+            straight into any scan field. An <b>Android phone with a Windows PC on one Wi-Fi</b> is the most
+            reliable combination to start with.
+          </div>
+        </Card>
+
+        <Card style={{ marginBottom: "14px" }}>
           <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "16px" }}>Appearance</div>
           <FilterChips
             options={[

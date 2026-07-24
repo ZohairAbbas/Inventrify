@@ -27,3 +27,5 @@ export type { PickerProduct } from "./ProductPicker";
 export { Pagination } from "./Pagination";
 export { ProductCombobox } from "./ProductCombobox";
 export type { ComboboxProduct } from "./ProductCombobox";
+export { ScanInput } from "./ScanInput";
+export type { ScannedProduct } from "./ScanInput";

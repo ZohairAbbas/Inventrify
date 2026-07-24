@@ -59,12 +59,13 @@ const locationsBody = {
   },
 };
 
-function variant(id: string, opts: { sku?: string; qty?: number; cost?: string | null; image?: string | null } = {}) {
+function variant(id: string, opts: { sku?: string; qty?: number; cost?: string | null; image?: string | null; barcode?: string | null } = {}) {
   return {
     node: {
       id: `gid://shopify/ProductVariant/${id}`,
       title: opts.sku ?? id,
       sku: opts.sku ?? `SKU-${id}`,
+      barcode: opts.barcode === undefined ? `BC-${id}` : opts.barcode,
       inventoryQuantity: opts.qty ?? 5,
       image: opts.image === undefined ? null : { url: opts.image },
       product: {
@@ -132,6 +133,8 @@ describe("syncShopifyInventory", () => {
     const p = await prisma.product.findFirst({ where: { shop: SHOP } });
     expect(p?.sku).toBe("SKU-1");
     expect(p?.currentStock).toBe(5);
+    // Barcode is captured from Shopify so scans can resolve to this variant.
+    expect(p?.barcode).toBe("BC-1");
     // Cost comes from Shopify's own "Cost per item", no integration needed.
     expect(p?.unitCost).toBe(250);
     // Falls back to the product's featured image when the variant has none.
@@ -139,6 +142,22 @@ describe("syncShopifyInventory", () => {
 
     const levels = await prisma.productLocationStock.count({ where: { shop: SHOP } });
     expect(levels).toBe(1);
+  });
+
+  it("stores an empty or missing barcode as null, not an empty string", async () => {
+    // A blank must land as NULL so "no barcode" is one value — otherwise an exact-match
+    // scan for "" would match every blank row at once.
+    const { admin } = mockAdmin((q) =>
+      isLocations(q)
+        ? { body: locationsBody }
+        : { body: variantsBody([variant("1", { barcode: "" }), variant("2", { barcode: "  8964\n" })]) },
+    );
+    await syncShopifyInventory(admin, SHOP);
+    const blank = await prisma.product.findUnique({ where: { id: "gid://shopify/ProductVariant/1" } });
+    const padded = await prisma.product.findUnique({ where: { id: "gid://shopify/ProductVariant/2" } });
+    expect(blank?.barcode).toBeNull();
+    // And surrounding whitespace from a scanner-entered value is trimmed on the way in.
+    expect(padded?.barcode).toBe("8964");
   });
 
   it("treats a missing unit cost as unset rather than zero", async () => {

@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useSearchParams, useFetcher, useRevalidator, useRouteLoaderData, Link } from "@remix-run/react";
+import { useLoaderData, useFetcher, useRevalidator, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
@@ -7,22 +7,56 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { generateAndSaveForecast } from "../lib/forecast.server";
 import { getUpcomingEvents } from "../lib/seasonality.server";
-import { Button, Card, ForecastBar, PageHead, Stat, TogglePills } from "../design";
+import { Button, Card, ForecastBar, PageHead, Pagination, Stat, TogglePills } from "../design";
+import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
+import { useListParams } from "../lib/use-list-params";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const url = new URL(request.url);
   const selectedProductId = url.searchParams.get("product");
 
+  const search = parseSearch(url.searchParams);
+  const pageRequest = parsePageRequest(url.searchParams);
+
+  const where = {
+    shop: session.shop,
+    isArchived: false,
+    ...(search
+      ? {
+          OR: [
+            { title: { contains: search, mode: "insensitive" as const } },
+            { sku: { contains: search, mode: "insensitive" as const } },
+            { variantTitle: { contains: search, mode: "insensitive" as const } },
+          ],
+        }
+      : {}),
+  };
+
+  // The sidebar is a paged, searchable list rather than the whole catalogue rendered into
+  // a scroll box. At a few thousand variants that box was both a slow response and an
+  // unusable control.
+  const page = resolvePage(pageRequest, await prisma.product.count({ where }));
+
   const products = await prisma.product.findMany({
-    where: { shop: session.shop },
-    orderBy: { title: "asc" },
+    where,
+    orderBy: [{ title: "asc" }, { id: "asc" }],
+    skip: page.skip,
+    take: page.take,
   });
 
-  if (products.length === 0)
-    return { products: [], selected: null, forecasts: null, upcomingEvents: [], recentSales: null, locationAvailability: [] };
+  // The selected SKU is resolved independently of the page: following a link from the
+  // inventory drawer must work even when that product is not on page 1 of this list.
+  const selectedProduct = selectedProductId
+    ? await prisma.product.findFirst({ where: { id: selectedProductId, shop: session.shop } })
+    : null;
+  const product = selectedProduct ?? products[0] ?? null;
 
-  const product = products.find((p) => p.id === selectedProductId) ?? products[0];
+  if (!product)
+    return {
+      products: [], page, selected: null, forecasts: null,
+      upcomingEvents: [], recentSales: null, locationAvailability: [],
+    };
 
   const savedForecasts = await prisma.forecast.findMany({
     where: { productId: product.id },
@@ -53,6 +87,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   return {
     products,
+    page,
     selected: product,
     forecasts: f30 && f60 && f90 ? { f30, f60, f90 } : null,
     recentSales: {
@@ -87,7 +122,7 @@ const HORIZONS = [
 export default function Forecast() {
   const data = useLoaderData<typeof loader>();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
-  const [, setSearchParams] = useSearchParams();
+  const { searchInput, setSearchInput, setFilter, setPage } = useListParams();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const revalidator = useRevalidator();
@@ -153,17 +188,34 @@ export default function Forecast() {
 
         <div style={{ display: "grid", gridTemplateColumns: "290px 1fr", gap: "14px", alignItems: "start" }}>
           <Card padding="0">
-            <div style={{ padding: "13px 15px", borderBottom: "1px solid var(--inv-divider-3)", fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)" }}>
-              Select SKU
+            <div style={{ padding: "13px 15px", borderBottom: "1px solid var(--inv-divider-3)" }}>
+              <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "8px" }}>
+                Select SKU
+              </div>
+              <input
+                value={searchInput}
+                placeholder="Search…"
+                onChange={(e) => setSearchInput(e.target.value)}
+                style={{
+                  width: "100%", height: "32px", padding: "0 10px", fontSize: "12.5px",
+                  border: "1px solid var(--inv-input-border)", borderRadius: "8px",
+                  outline: "none", background: "#fff", color: "var(--inv-ink)",
+                }}
+              />
             </div>
             <div style={{ maxHeight: "560px", overflowY: "auto" }}>
+              {products.length === 0 && (
+                <div style={{ padding: "14px 15px", fontSize: "12.5px", color: "var(--inv-muted)" }}>
+                  No products match that search.
+                </div>
+              )}
               {products.map((p) => {
                 const on = p.id === selected?.id;
                 const name = p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title;
                 return (
                   <div
                     key={p.id}
-                    onClick={() => setSearchParams({ product: p.id })}
+                    onClick={() => setFilter("product", p.id)}
                     style={{
                       padding: "10px 15px",
                       cursor: "pointer",
@@ -181,6 +233,11 @@ export default function Forecast() {
                 );
               })}
             </div>
+            {data.page.totalPages > 1 && (
+              <div style={{ padding: "8px 12px", borderTop: "1px solid var(--inv-divider-3)" }}>
+                <Pagination page={data.page} onPageChange={setPage} itemLabel="SKUs" />
+              </div>
+            )}
           </Card>
 
           {selected && (

@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData, useSearchParams } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData, useSearchParams, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
@@ -11,6 +11,7 @@ import {
   calculateDaysRemaining,
 } from "../lib/forecast.server";
 import { getFulfilmentBreakdown, getRtoFreshness } from "../lib/rto-attribution.server";
+import { getDamagedUnitsTotal } from "../lib/damage.server";
 import { previousRange, resolveDateRange } from "../lib/date-range";
 import {
   computeProcurementPlan,
@@ -40,12 +41,27 @@ import {
   type StockStatus,
 } from "../design";
 
+/** Worst-first, for the dashboard's stock-status preview. */
+const STATUS_ORDER = ["stockout", "critical", "low", "healthy"];
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
   const range = resolveDateRange(new URL(request.url).searchParams);
 
-  const products = await prisma.product.findMany({ where: { shop, isArchived: false } });
+  // Narrowed to the columns the aggregates below actually read. This used to select every
+  // column of every product — image URLs, the whole RTO provenance chain — purely to sum
+  // four of them.
+  const products = await prisma.product.findMany({
+    where: { shop, isArchived: false },
+    select: {
+      id: true, title: true, variantTitle: true, sku: true, imageUrl: true,
+      currentStock: true, reorderPoint: true, avgDailySales: true, safetyStock: true,
+      unitCost: true, avgMargin: true, moq: true, casePackSize: true,
+      fulfilledDelivered: true, fulfilledInTransit: true, fulfilledReturned: true,
+      courierRtoRate: true, derivedRtoRate: true, estimatedRtoRate: true,
+    },
+  });
   const alerts = await getUnreadAlerts(shop);
   const pendingPOs = await prisma.purchaseOrder.count({
     where: { shop, status: { in: ["draft", "sent"] } },
@@ -56,7 +72,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Delivered/In-transit/Returned are the live per-variant snapshot Courierify syncs onto
   // Product.fulfilled*. Damaged mirrors the inventory page's tally: damage stock-adjustments
   // plus returned units written off from the queue (§7.8 of the integration contract).
-  const [settings, damageTally, writeOffTally] = await Promise.all([
+  const [settings, pipeDamaged] = await Promise.all([
     prisma.shopSettings.findUnique({
       where: { shop },
       select: {
@@ -70,34 +86,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     // Windowed to match the fulfilment stages this is displayed beside. An all-time
     // damage tally under a "last N days" heading is the same mistake as the delivery
     // pipeline showing 90-day figures next to a 30-day breakdown.
-    prisma.stockAdjustment.groupBy({
-      by: ["productId"],
-      where: {
-        shop,
-        reason: "damage",
-        createdAt: { gte: range.from, lt: range.to },
-      },
-      _sum: { delta: true },
-    }),
-    prisma.returnItem.groupBy({
-      by: ["productId"],
-      where: {
-        shop,
-        status: "written_off",
-        productId: { not: null },
-        resolvedAt: { gte: range.from, lt: range.to },
-      },
-      _sum: { quantity: true },
-    }),
+    getDamagedUnitsTotal(shop, { from: range.from, to: range.to }),
   ]);
 
   const courierifyConnected = !!settings?.courierifyApiKey;
   const pipeDelivered = products.reduce((sum, p) => sum + (p.fulfilledDelivered || 0), 0);
   const pipeInTransit = products.reduce((sum, p) => sum + (p.fulfilledInTransit || 0), 0);
   const pipeReturned = products.reduce((sum, p) => sum + (p.fulfilledReturned || 0), 0);
-  let pipeDamaged = 0;
-  for (const d of damageTally) pipeDamaged += Math.abs(d._sum.delta ?? 0);
-  for (const w of writeOffTally) pipeDamaged += w._sum.quantity ?? 0;
 
   // Return rate over resolved shipments (delivered + returned); damage rate over all handled.
   const retDenom = pipeDelivered + pipeReturned;
@@ -108,7 +103,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Replenishment decisions are made against inventory position, not on-hand: stock
   // already on an open PO, or coming back through RTO, is supply that has been paid
   // for. Judging on currentStock alone re-flags SKUs that were ordered yesterday.
-  const positions = await getInventoryPositions(shop, products.map((p) => p.id));
+  const positions = await getInventoryPositions(shop);
   const shopRestockRate = await estimateRestockRate(shop);
   const coverageDays = settings?.coverageDays ?? 30;
 
@@ -223,8 +218,22 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const soldUnits = periodSold._sum.quantity ?? 0;
   const priorUnits = periodPrior._sum.quantity ?? 0;
 
+  // Only a preview crosses the wire. The aggregates above are computed over the whole
+  // catalogue server-side, but serialising every product into the page payload is what
+  // actually made this unusable at scale — and nobody scrolls ten thousand rows on a
+  // dashboard.
+  const PREVIEW = 25;
+  const stockStatusPage = {
+    rows: [...stockStatuses]
+      .sort((a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status))
+      .slice(0, PREVIEW),
+    total: stockStatuses.length,
+    preview: PREVIEW,
+  };
+
   return {
     fulfilment,
+    stockStatusPage,
     range,
     period: {
       soldUnits,
@@ -247,7 +256,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     critical,
     pendingPOs,
     locationCount,
-    stockStatuses,
+    stockStatuses: stockStatusPage.rows,
     alerts,
     reorderItems,
     courierifyConnected,
@@ -765,8 +774,27 @@ export default function Dashboard() {
           </Card>
         ) : (
           <Card padding="0">
-            <div style={{ padding: "16px 18px 12px", fontSize: "15px", fontWeight: 600 }}>Stock Status</div>
+            <div
+              style={{
+                padding: "16px 18px 12px", display: "flex", alignItems: "baseline",
+                justifyContent: "space-between", gap: "12px", flexWrap: "wrap",
+              }}
+            >
+              <div style={{ fontSize: "15px", fontWeight: 600 }}>Stock Status</div>
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
+                {data.stockStatusPage.total > data.stockStatusPage.preview
+                  ? `Showing the ${data.stockStatusPage.preview} most urgent of ${data.stockStatusPage.total.toLocaleString()}`
+                  : `${data.stockStatusPage.total} SKU${data.stockStatusPage.total === 1 ? "" : "s"}`}
+              </div>
+            </div>
             <DataTable columns={columns} rows={rows} />
+            {data.stockStatusPage.total > data.stockStatusPage.preview && (
+              <div style={{ padding: "12px 18px", borderTop: "1px solid var(--inv-divider-3)" }}>
+                <Link to="/app/inventory" style={{ fontSize: "12.5px", color: "var(--inv-accent)" }}>
+                  View all inventory →
+                </Link>
+              </div>
+            )}
           </Card>
         )}
       </div>

@@ -14,6 +14,7 @@ import {
 } from "../lib/courierify.server";
 import { syncFinancifyMargins } from "../lib/financify.server";
 import { decryptSecret, encryptSecret } from "../lib/crypto.server";
+import { recomputeReorderPoints } from "../lib/planning-job.server";
 import { Button, Card, FilterChips, FormField, PageHead, TextInput } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -22,7 +23,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const [settings, productCount] = await Promise.all([
     prisma.shopSettings.findUnique({ where: { shop } }),
-    prisma.product.count({ where: { shop } }),
+    // Archived products are excluded: they are not "tracked" in any sense the merchant
+    // would recognise, and this same figure labels the bulk lead-time checkbox, whose
+    // update also skips them. A count that overstates what the button will touch is the
+    // kind of small dishonesty the data audit exists to catch.
+    prisma.product.count({ where: { shop, isArchived: false } }),
   ]);
 
   return {
@@ -87,10 +92,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const slackWebhookUrl = (formData.get("slackWebhookUrl") as string)?.trim() || null;
     const whatsappNumber = (formData.get("whatsappNumber") as string)?.trim() || null;
 
+    // Applying the default to every existing product is opt-in, and deliberately so.
+    // It used to happen implicitly on every save of this form — so changing a
+    // notification email overwrote every per-SKU lead time the merchant had set, and
+    // with it every reorder point and safety stock derived from them.
+    const applyLeadTimeToExisting = formData.get("applyLeadTimeToExisting") === "true";
+    let leadTimeApplied = 0;
+
     const update: Record<string, unknown> = {};
     if (!isNaN(leadTimeDays) && leadTimeDays > 0) {
       update.defaultLeadTime = leadTimeDays;
-      await prisma.product.updateMany({ where: { shop }, data: { leadTimeDays } });
+      if (applyLeadTimeToExisting) {
+        const { count } = await prisma.product.updateMany({
+          where: { shop, isArchived: false },
+          data: { leadTimeDays },
+        });
+        leadTimeApplied = count;
+      }
     }
     if (!isNaN(serviceLevel) && serviceLevel > 0) update.serviceLevel = serviceLevel;
     if (!isNaN(safetyStockDays) && safetyStockDays > 0) update.safetyStockDays = safetyStockDays;
@@ -105,7 +123,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     update.whatsappNumber = whatsappNumber;
 
     await prisma.shopSettings.upsert({ where: { shop }, create: { shop, ...update }, update });
-    return { intent, updated: true };
+
+    // Lead time is an input to the reorder point, so a bulk change has to be followed
+    // through — otherwise the app shows reorder points derived from a lead time it is
+    // no longer using, which is the same class of drift the sync fix addressed.
+    if (leadTimeApplied > 0) {
+      await recomputeReorderPoints(shop);
+    }
+
+    return { intent, updated: true, leadTimeApplied };
   }
 
   if (intent === "update_theme") {
@@ -281,6 +307,9 @@ export default function Settings() {
   const [courierifyKey, setCourierifyKey] = useState("");
   const [financifyKey, setFinancifyKey] = useState("");
   const [leadTime, setLeadTime] = useState(String(data.defaultLeadTime));
+  // Opt-in, and reset after every save so a destructive bulk overwrite can never ride
+  // along with an unrelated settings change on the next submit.
+  const [applyLeadTimeToExisting, setApplyLeadTimeToExisting] = useState(false);
   const [serviceLevel, setServiceLevel] = useState(String(data.serviceLevel));
   const [safetyStockDays, setSafetyStockDays] = useState(String(data.safetyStockDays));
   const [deadStockDays, setDeadStockDays] = useState(String(data.deadStockDays));
@@ -308,7 +337,13 @@ export default function Settings() {
         shopify.toast.show(`Synced ${result.synced} variants · ${result.recordsSynced} sales records`);
       }
     } else if (result.intent === "update_thresholds") {
-      shopify.toast.show("Settings saved");
+      const applied = Number(result.leadTimeApplied ?? 0);
+      shopify.toast.show(
+        applied > 0
+          ? `Settings saved — lead time applied to ${applied} product${applied === 1 ? "" : "s"}`
+          : "Settings saved",
+      );
+      setApplyLeadTimeToExisting(false);
     } else if (result.intent === "save_courierify") {
       if (result.error) shopify.toast.show(String(result.error), { isError: true });
       else shopify.toast.show(`Courierify connected — ${result.synced} SKUs updated`);
@@ -344,14 +379,41 @@ export default function Settings() {
         <Card style={{ marginBottom: "14px" }}>
           <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "16px" }}>Inventory intelligence</div>
           <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Reorder & lead times</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "18px" }}>
-            <FormField label="Default lead time (days)" hint="Applied to new products">
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px", marginBottom: "10px" }}>
+            <FormField
+              label="Default lead time (days)"
+              hint="Used for newly synced products. Existing per-product lead times are left alone."
+            >
               <TextInput type="number" min={1} value={leadTime} onChange={(e) => setLeadTime(e.target.value)} />
             </FormField>
             <FormField label="Safety stock fallback (days)" hint="When variance data unavailable">
               <TextInput type="number" min={1} value={safetyStockDays} onChange={(e) => setSafetyStockDays(e.target.value)} />
             </FormField>
           </div>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "flex-start",
+              gap: "8px",
+              fontSize: "12px",
+              color: "var(--inv-text-2)",
+              marginBottom: "18px",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={applyLeadTimeToExisting}
+              onChange={(e) => setApplyLeadTimeToExisting(e.target.checked)}
+              style={{ marginTop: "2px" }}
+            />
+            <span>
+              Also overwrite the lead time on all {data.productCount} existing products
+              <span style={{ display: "block", color: "var(--inv-muted)", fontSize: "11.5px", marginTop: "2px" }}>
+                Replaces every per-product lead time you have set, and recalculates reorder points. Off by default.
+              </span>
+            </span>
+          </label>
 
           <div style={{ fontSize: "12px", fontWeight: 600, color: "var(--inv-text-2)", marginBottom: "10px" }}>Safety stock service level</div>
           <div style={{ marginBottom: "18px", maxWidth: "260px" }}>
@@ -441,6 +503,7 @@ export default function Settings() {
                 {
                   intent: "update_thresholds",
                   leadTimeDays: leadTime,
+                  applyLeadTimeToExisting: String(applyLeadTimeToExisting),
                   serviceLevel,
                   safetyStockDays,
                   deadStockDays,

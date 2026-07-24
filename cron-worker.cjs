@@ -7,6 +7,8 @@ const TIMEZONE = 'Asia/Karachi';
 // In-memory lock to prevent overlapping runs of the same job on this instance
 const locks = {
   courierifySync: false,
+  shopifySync: false,
+  planning: false,
   alertsDispatch: false,
 };
 
@@ -64,6 +66,29 @@ cron.schedule('0 * * * *', () => {
   timezone: TIMEZONE,
 });
 
+// Shopify reconciliation - hourly at :15.
+// Pulls the catalogue, the 90-day order window, and Shopify's own carrier tracking
+// (DELIVERED / NOT_DELIVERED / IN_TRANSIT ...), which is what feeds the fulfilment
+// pipeline and per-SKU RTO for shops with no courier integration. Also refreshes reorder
+// points, which are derived from the demand this job rewrites.
+// Offset from :00 so it does not contend with the Courierify pull.
+cron.schedule('15 * * * *', () => {
+  runJob('shopifySync', '/api/cron/sync');
+}, {
+  scheduled: true,
+  timezone: TIMEZONE,
+});
+
+// Planning refresh - daily at 05:45 PKT, before the alert run at 06:30 so alerts are
+// raised against fresh forecasts. Scores elapsed forecasts, recomputes ABC/XYZ, then
+// regenerates forecasts and safety stock.
+cron.schedule('45 5 * * *', () => {
+  runJob('planning', '/api/cron/planning');
+}, {
+  scheduled: true,
+  timezone: TIMEZONE,
+});
+
 // Stock alerts - daily at 06:30 PKT.
 // dispatchAlerts notifies at most once per condition (shop+type+productId) and clears its
 // ledger when a condition resolves, so this does not re-send the same alerts daily.
@@ -92,6 +117,8 @@ console.log(`Base URL: ${BASE_URL}`);
 console.log(`Timezone: ${TIMEZONE}`);
 console.log('Jobs:');
 console.log('  - Courierify sync: Hourly (:00)');
+console.log('  - Shopify sync:    Hourly (:15)');
+console.log('  - Planning:        Daily at 05:45');
 console.log('  - Stock alerts: Daily at 06:30');
 console.log('========================================');
 

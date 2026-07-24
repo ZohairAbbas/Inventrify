@@ -5,19 +5,18 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, FormField, PageHead, ProductPicker, TextArea, TextInput, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, FormField, PageHead, ProductPicker, TextArea, TextInput, type DataTableColumn, type PickerProduct } from "../design";
+import { parseFormDate } from "../lib/date-range";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const [events, products] = await Promise.all([
-    prisma.seasonalEvent.findMany({ where: { shop: session.shop }, orderBy: { startDate: "asc" } }),
-    prisma.product.findMany({
-      where: { shop: session.shop },
-      orderBy: { title: "asc" },
-      select: { id: true, title: true, variantTitle: true, sku: true },
-    }),
-  ]);
-  return { events, products };
+  // The catalogue is no longer shipped to populate the scoping picker; it searches on
+  // demand via /api/products/search.
+  const events = await prisma.seasonalEvent.findMany({
+    where: { shop: session.shop },
+    orderBy: { startDate: "asc" },
+  });
+  return { events };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -31,7 +30,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const startDate = formData.get("startDate") as string;
     const endDate = formData.get("endDate") as string;
     const impactMultiplier = parseFloat(formData.get("impactMultiplier") as string);
-    const productIds = (formData.getAll("productIds") as string[]).join(",");
+    const requestedProductIds = formData.getAll("productIds") as string[];
     const notes = (formData.get("notes") as string)?.trim() ?? "";
 
     if (!name || !startDate || !endDate || isNaN(impactMultiplier)) {
@@ -40,12 +39,30 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     if (impactMultiplier <= 0) {
       return { error: "Impact multiplier must be positive" };
     }
-    if (new Date(startDate) > new Date(endDate)) {
-      return { error: "Start date must be before end date" };
+
+    // Parsed strictly: `new Date("2026-02-31")` silently becomes 3 March, so a typo would
+    // have produced a real event window nobody chose.
+    const start = parseFormDate(startDate);
+    const end = parseFormDate(endDate);
+    if (!start || !end) return { error: "Start and end must be valid dates" };
+    if (start > end) return { error: "Start date must be before end date" };
+
+    // Ids come from the form, so they are checked against this shop before being stored —
+    // an event scoped to another tenant's variants would silently apply to nothing.
+    let productIds = "";
+    if (requestedProductIds.length > 0) {
+      const owned = await prisma.product.findMany({
+        where: { shop, id: { in: requestedProductIds } },
+        select: { id: true },
+      });
+      if (owned.length !== requestedProductIds.length) {
+        return { error: "One of the selected products is not in this shop" };
+      }
+      productIds = owned.map((p) => p.id).join(",");
     }
 
     await prisma.seasonalEvent.create({
-      data: { shop, name, startDate: new Date(startDate), endDate: new Date(endDate), impactMultiplier, productIds, notes: notes || null },
+      data: { shop, name, startDate: start, endDate: end, impactMultiplier, productIds, notes: notes || null },
     });
     return { ok: true };
   }
@@ -80,7 +97,7 @@ const PRESETS = [
 ];
 
 export default function SeasonalEvents() {
-  const { events, products } = useLoaderData<typeof loader>();
+  const { events } = useLoaderData<typeof loader>();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
@@ -89,7 +106,7 @@ export default function SeasonalEvents() {
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
   const [multiplier, setMultiplier] = useState("1.5");
-  const [productIds, setProductIds] = useState<string[]>([]);
+  const [pickedProducts, setPickedProducts] = useState<PickerProduct[]>([]);
   const [notes, setNotes] = useState("");
 
   const isBusy = fetcher.state !== "idle";
@@ -102,7 +119,7 @@ export default function SeasonalEvents() {
       setStartDate("");
       setEndDate("");
       setMultiplier("1.5");
-      setProductIds([]);
+      setPickedProducts([]);
       setNotes("");
     }
     if (result?.error) {
@@ -111,12 +128,6 @@ export default function SeasonalEvents() {
   }, [result, shopify]);
 
   const activeEvent = events.find((e) => eventStatus(e) === "active");
-
-  const pickerProducts = products.map((p) => ({
-    id: p.id,
-    label: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
-    sku: p.sku,
-  }));
 
   const applyPreset = (preset: (typeof PRESETS)[number]) => {
     setName(preset.name);
@@ -251,7 +262,7 @@ export default function SeasonalEvents() {
               </FormField>
             </div>
             <FormField label="Products (optional)" hint="Leave empty to apply to all products">
-              <ProductPicker products={pickerProducts} selected={productIds} onChange={setProductIds} />
+              <ProductPicker selected={pickedProducts} onChange={setPickedProducts} />
             </FormField>
             <FormField label="Notes (optional)">
               <TextArea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
@@ -268,7 +279,7 @@ export default function SeasonalEvents() {
                   fd.append("endDate", endDate);
                   fd.append("impactMultiplier", multiplier);
                   fd.append("notes", notes);
-                  productIds.forEach((id) => fd.append("productIds", id));
+                  pickedProducts.forEach((p) => fd.append("productIds", p.id));
                   fetcher.submit(fd, { method: "POST" });
                 }}
               >

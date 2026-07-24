@@ -4,6 +4,8 @@ import type { loader as appLoader } from "./app";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { resolveDateRange } from "../lib/date-range";
+import { getRtoByCarrier } from "../lib/rto-attribution.server";
+import { formatCurrency } from "../lib/format";
 import {
   getSalesTrend,
   getPeriodComparison,
@@ -13,9 +15,11 @@ import {
   getHighReturnRateProducts,
   getRtoByRegion,
   getCodFunnel,
+  getClassBreakdown,
+  getForecastAccuracy,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
-import { BarChart, Card, DataTable, DateRangePicker, KpiCard, Pill, type DataTableColumn } from "../design";
+import { BarChart, Card, ClassBadge, DataTable, DateRangePicker, KpiCard, Pill, type DataTableColumn } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -26,7 +30,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const deadStockDays = settings?.deadStockDays ?? 60;
   const deadStockMinUnits = settings?.deadStockMinUnits ?? 20;
 
-  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel] =
+  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, rtoByCarrier, codFunnel, classes, accuracy] =
     await Promise.all([
     getSalesTrend(shop, range),
     getPeriodComparison(shop, range),
@@ -38,12 +42,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getStatusDistribution(shop),
     getHighReturnRateProducts(shop, 10),
     getRtoByRegion(shop, range),
+    getRtoByCarrier(shop, range),
     getCodFunnel(shop, range),
+    getClassBreakdown(shop, range, settings?.serviceLevel ?? 1.65),
+    getForecastAccuracy(shop),
   ]);
 
   return {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, range, deadStockDays,
+    codFunnel, rtoByCarrier, classes, accuracy, range, deadStockDays,
+    currency: settings?.currency ?? "USD",
   };
 };
 
@@ -57,7 +65,7 @@ const SEGMENT_COLORS: Record<string, string> = {
 export default function Analytics() {
   const {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, range, deadStockDays,
+    codFunnel, rtoByCarrier, classes, accuracy, range, deadStockDays, currency,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -271,12 +279,216 @@ export default function Analytics() {
               ))}
             </div>
             {codFunnel.attritionRate > 0 && (
-              <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "10px" }}>
+              <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "10px", lineHeight: 1.5 }}>
                 <strong style={{ color: codFunnel.attritionRate >= 0.3 ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)" }}>
-                  {(codFunnel.attritionRate * 100).toFixed(0)}%
+                  {(codFunnel.attritionRate * 100).toFixed(1)}%
                 </strong>{" "}
-                of placed COD orders never reached dispatch — forecasts built on placed
-                orders are overstated by roughly that much.
+                of COD orders that were not cancelled ({codFunnel.pending} of{" "}
+                {codFunnel.placed - codFunnel.cancelled}) quietly never reached dispatch, so
+                demand is overstated by roughly that much.
+                {codFunnel.cancelled > 0 && (
+                  <>
+                    {" "}
+                    The {codFunnel.cancelled} cancelled order
+                    {codFunnel.cancelled === 1 ? "" : "s"} {codFunnel.cancelled === 1 ? "is" : "are"}{" "}
+                    excluded — those units were already removed from demand when the
+                    cancellation came in.
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {(accuracy.scoredTotal > 0 || accuracy.pendingTotal > 0) && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>
+              Forecast accuracy
+            </div>
+            {accuracy.scoredTotal === 0 ? (
+              <div style={{ fontSize: "12px", color: "var(--inv-muted)", lineHeight: 1.5 }}>
+                {accuracy.pendingTotal.toLocaleString()} forecasts are recorded and waiting for
+                their horizon to elapse
+                {accuracy.nextDueAt
+                  ? `; the first can be scored on ${new Date(accuracy.nextDueAt).toISOString().slice(0, 10)}`
+                  : ""}
+                . Nothing is shown until then — an accuracy figure computed before the period
+                it covers has finished would be measuring an incomplete month.
+              </div>
+            ) : (
+              <>
+                <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "12px", lineHeight: 1.5 }}>
+                  Every forecast is kept and compared against what actually sold.{" "}
+                  <strong style={{ color: "var(--inv-text-2)" }}>Bias</strong> is the one to watch:
+                  a persistently negative figure means the app has been buying under demand, which
+                  a percentage error alone cannot show — it counts over- and under-forecasting as
+                  equally wrong.
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: "10px", marginBottom: "14px" }}>
+                  <KpiCard
+                    label="Forecasts scored"
+                    value={accuracy.scoredTotal.toLocaleString()}
+                    sub={`${accuracy.pendingTotal.toLocaleString()} still pending`}
+                  />
+                  <KpiCard
+                    label="Average error"
+                    value={accuracy.overallMape != null ? `${(accuracy.overallMape * 100).toFixed(1)}%` : "—"}
+                    sub="lower is better"
+                  />
+                  <KpiCard
+                    label="Bias"
+                    value={
+                      accuracy.overallBias != null
+                        ? `${accuracy.overallBias >= 0 ? "+" : ""}${accuracy.overallBias.toFixed(1)}`
+                        : "—"
+                    }
+                    sub={
+                      accuracy.overallBias == null
+                        ? "units per forecast"
+                        : accuracy.overallBias < 0
+                          ? "units under actual demand"
+                          : "units over actual demand"
+                    }
+                    valueColor={
+                      accuracy.overallBias != null && accuracy.overallBias < 0
+                        ? "var(--inv-status-critical-fg)"
+                        : undefined
+                    }
+                  />
+                </div>
+                <DataTable
+                  columns={[
+                    { header: "Product", width: "2.4fr" },
+                    { header: "Horizon", width: ".9fr", align: "right" },
+                    { header: "Scored", width: ".8fr", align: "right" },
+                    { header: "Avg error", width: "1fr", align: "right" },
+                    { header: "Bias", width: "1.2fr", align: "right" },
+                  ]}
+                  rows={accuracy.rows.map((r) => ({
+                    key: `${r.productId}:${r.horizon}`,
+                    cells: [
+                      <span key="t" style={{ fontWeight: 500 }}>{r.title}</span>,
+                      <span key="h" style={{ fontFamily: "var(--inv-font-mono)" }}>{r.horizon}d</span>,
+                      <span key="n" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>{r.scored}</span>,
+                      <span key="m" style={{ fontFamily: "var(--inv-font-mono)" }}>
+                        {r.mape != null ? `${(r.mape * 100).toFixed(0)}%` : "—"}
+                      </span>,
+                      <span
+                        key="b"
+                        title={r.bias < 0 ? "Forecast below actual demand — risks under-buying" : "Forecast above actual demand"}
+                        style={{
+                          fontFamily: "var(--inv-font-mono)",
+                          fontWeight: 600,
+                          color: r.bias < 0 ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)",
+                        }}
+                      >
+                        {r.bias >= 0 ? "+" : ""}{r.bias.toFixed(1)}
+                      </span>,
+                    ],
+                  }))}
+                />
+              </>
+            )}
+          </div>
+        )}
+
+        {classes.rows.length > 0 && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>
+              How stock is prioritised
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "10px", lineHeight: 1.5 }}>
+              Products are ranked by demand value into A, B and C. The class is not a label —
+              it sets the service level each SKU is bought to, which is why the buffer differs.
+              A steady 98% target on the tail would tie up cash in products that barely move.
+            </div>
+            <DataTable
+              columns={[
+                { header: "Class", width: ".8fr" },
+                { header: "SKUs", width: ".8fr", align: "right" },
+                { header: `Units (${range.label})`, width: "1.2fr", align: "right" },
+                { header: "Share of demand", width: "1.2fr", align: "right" },
+                { header: "Service level", width: "1.1fr", align: "right" },
+                { header: "Avg buffer", width: "1fr", align: "right" },
+                { header: "Stock at cost", width: "1.2fr", align: "right" },
+              ]}
+              rows={classes.rows.map((c) => ({
+                key: c.abcClass,
+                cells: [
+                  <ClassBadge key="c" abc={c.abcClass} />,
+                  <span key="s" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.skus}</span>,
+                  <span key="u" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.units.toLocaleString()}</span>,
+                  <span key="sh" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+                    {(c.unitShare * 100).toFixed(1)}%
+                  </span>,
+                  <span key="z" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+                    {serviceLevelLabel(c.serviceZ)}
+                  </span>,
+                  <span key="b" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.avgSafetyStock.toFixed(1)}</span>,
+                  <span key="v" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+                    {formatCurrency(c.stockValue, currency)}
+                  </span>,
+                ],
+              }))}
+            />
+            {classes.unclassified > 0 && (
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginTop: "8px" }}>
+                {classes.unclassified} product{classes.unclassified === 1 ? "" : "s"} not yet
+                classified — they are ranked on the next planning run.
+              </div>
+            )}
+          </div>
+        )}
+
+        {rtoByCarrier.length > 0 && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
+              <div style={{ fontSize: "14px", fontWeight: 600 }}>RTO by carrier</div>
+              <Pill label="Shopify tracking" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "10px" }}>
+              {range.label}, carriers with at least 10 resolved units. The spread between
+              couriers on the same lane is often wider than the spread between products,
+              and unlike a product mix it can be changed next week.
+            </div>
+            <DataTable
+              columns={[
+                { header: "Carrier", width: "2fr" },
+                { header: "Delivered", width: "1fr", align: "right" },
+                { header: "Not delivered", width: "1fr", align: "right" },
+                { header: "In route", width: "1fr", align: "right" },
+                { header: "RTO rate", width: "1fr", align: "right" },
+              ]}
+              rows={rtoByCarrier.map((c) => ({
+                key: c.carrier,
+                cells: [
+                  <span key="c" style={{ fontWeight: 500 }}>{c.carrier}</span>,
+                  <span key="d" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.deliveredUnits}</span>,
+                  <span key="n" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.notDeliveredUnits}</span>,
+                  <span key="t" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>{c.inRouteUnits}</span>,
+                  <span
+                    key="r"
+                    style={{
+                      fontFamily: "var(--inv-font-mono)",
+                      fontWeight: 600,
+                      color:
+                        c.rtoRate >= 0.4
+                          ? "var(--inv-status-stockout-fg)"
+                          : c.rtoRate >= 0.25
+                            ? "var(--inv-status-critical-fg)"
+                            : "var(--inv-status-healthy-fg)",
+                    }}
+                  >
+                    {(c.rtoRate * 100).toFixed(1)}%
+                  </span>,
+                ],
+              }))}
+            />
+            {rtoByCarrier.length > 1 && (
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginTop: "8px" }}>
+                {rtoByCarrier[0].carrier} returns{" "}
+                {((rtoByCarrier[0].rtoRate - rtoByCarrier[rtoByCarrier.length - 1].rtoRate) * 100).toFixed(1)}
+                {" "}points more often than {rtoByCarrier[rtoByCarrier.length - 1].carrier} on this period's volume.
               </div>
             )}
           </div>
@@ -338,4 +550,16 @@ export default function Analytics() {
       </div>
     </div>
   );
+}
+
+/**
+ * Turn a service-level Z into the fill rate it targets, which is the number a merchant
+ * can actually reason about. Z is the input the maths needs; nobody buys stock in
+ * standard deviations.
+ */
+function serviceLevelLabel(z: number): string {
+  if (z >= 2.05) return "98%";
+  if (z >= 1.64) return "95%";
+  if (z >= 1.28) return "90%";
+  return `${Math.round(z * 100) / 100}z`;
 }

@@ -1,20 +1,44 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData, Link } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigate, useNavigation, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, PageHead, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, PageHead, Pagination, type DataTableColumn } from "../design";
+import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
+import { useListParams } from "../lib/use-list-params";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
+  const url = new URL(request.url);
+  const search = parseSearch(url.searchParams);
+  const pageRequest = parsePageRequest(url.searchParams);
+
+  const where = {
+    shop: session.shop,
+    ...(search
+      ? {
+          OR: [
+            { name: { contains: search, mode: "insensitive" as const } },
+            { contactName: { contains: search, mode: "insensitive" as const } },
+            { email: { contains: search, mode: "insensitive" as const } },
+          ],
+        }
+      : {}),
+  };
+
+  const page = resolvePage(pageRequest, await prisma.supplier.count({ where }));
+
   const suppliers = await prisma.supplier.findMany({
-    where: { shop: session.shop },
+    where,
     include: { _count: { select: { products: true, purchaseOrders: true } } },
-    orderBy: { name: "asc" },
+    orderBy: [{ name: "asc" }, { id: "asc" }],
+    skip: page.skip,
+    take: page.take,
   });
-  return { suppliers };
+
+  return { suppliers, page };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -22,30 +46,49 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const formData = await request.formData();
   const supplierId = formData.get("supplierId") as string;
 
-  if (supplierId) {
-    await prisma.product.updateMany({
-      where: { shop: session.shop, supplierId },
-      data: { supplierId: null },
-    });
-    await prisma.purchaseOrder.updateMany({
-      where: { shop: session.shop, supplierId },
-      data: { supplierId: null },
-    });
-    await prisma.supplier.delete({ where: { id: supplierId } });
-  }
+  if (!supplierId) return { ok: false as const, error: "No supplier selected" };
 
-  return { ok: true };
+  // Scoped before anything is touched. `supplier.delete({ where: { id } })` took the id
+  // straight from the form with no shop check, so a crafted POST could delete another
+  // tenant's supplier — the updateMany calls beside it were already scoped, which is
+  // what makes the gap easy to miss on a read.
+  const supplier = await prisma.supplier.findFirst({
+    where: { id: supplierId, shop: session.shop },
+    select: { id: true },
+  });
+  if (!supplier) return { ok: false as const, error: "Supplier not found" };
+
+  // Unlink first: products and POs reference the supplier, and the FK would otherwise
+  // reject the delete. Wrapped so a failure part-way cannot leave products orphaned from
+  // a supplier that still exists.
+  await prisma.$transaction([
+    prisma.product.updateMany({
+      where: { shop: session.shop, supplierId: supplier.id },
+      data: { supplierId: null },
+    }),
+    prisma.purchaseOrder.updateMany({
+      where: { shop: session.shop, supplierId: supplier.id },
+      data: { supplierId: null },
+    }),
+    prisma.supplier.delete({ where: { id: supplier.id } }),
+  ]);
+
+  return { ok: true as const, error: "" };
 };
 
 export default function Suppliers() {
-  const { suppliers } = useLoaderData<typeof loader>();
+  const { suppliers, page } = useLoaderData<typeof loader>();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const navigate = useNavigate();
+  const navigation = useNavigation();
+  const { searchInput, setSearchInput, setPage, setPageSize } = useListParams();
 
   useEffect(() => {
-    if (fetcher.data?.ok) shopify.toast.show("Supplier deleted");
+    if (!fetcher.data) return;
+    if (fetcher.data.ok) shopify.toast.show("Supplier deleted");
+    else shopify.toast.show(fetcher.data.error || "Could not delete supplier", { isError: true });
   }, [fetcher.data, shopify]);
 
   const columns: DataTableColumn[] = [
@@ -114,10 +157,30 @@ export default function Suppliers() {
           right={<Button variant="primary" onClick={() => navigate("/app/suppliers/new")}>+ Add supplier</Button>}
         />
 
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              flex: 1, minWidth: "220px", display: "flex", alignItems: "center", gap: "9px",
+              background: "#fff", border: "1px solid var(--inv-input-border)",
+              borderRadius: "10px", padding: "0 12px", height: "38px",
+            }}
+          >
+            <span style={{ color: "var(--inv-muted)" }}>⌕</span>
+            <input
+              value={searchInput}
+              placeholder="Search name, contact or email"
+              onChange={(e) => setSearchInput(e.target.value)}
+              style={{ border: "none", outline: "none", flex: 1, fontSize: "13px", background: "transparent", color: "var(--inv-ink)" }}
+            />
+          </div>
+        </div>
+
         {suppliers.length === 0 ? (
           <Card padding="40px 24px">
             <div style={{ textAlign: "center" }}>
-              <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>No suppliers yet</div>
+              <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>
+                {page.totalItems === 0 && !searchInput ? "No suppliers yet" : "No suppliers match that search"}
+              </div>
               <div style={{ fontSize: "13px", color: "var(--inv-muted)", marginBottom: "16px" }}>
                 Add your suppliers to link them to products and purchase orders.
               </div>
@@ -125,7 +188,16 @@ export default function Suppliers() {
             </div>
           </Card>
         ) : (
-          <DataTable columns={columns} rows={rows} />
+          <>
+            <DataTable columns={columns} rows={rows} />
+            <Pagination
+              page={page}
+              onPageChange={setPage}
+              onPageSizeChange={setPageSize}
+              itemLabel="suppliers"
+              busy={navigation.state === "loading"}
+            />
+          </>
         )}
       </div>
     </div>

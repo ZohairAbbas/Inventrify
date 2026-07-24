@@ -5,7 +5,8 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { useState, useCallback, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, PageHead, SelectInput, TextArea, TextInput } from "../design";
+import { Button, Card, PageHead, ProductCombobox, SelectInput, TextArea, TextInput } from "../design";
+import { validateDraftLines } from "../lib/purchase-order.server";
 
 function generateTransferNumber(): string {
   const d = new Date();
@@ -16,15 +17,13 @@ function generateTransferNumber(): string {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
-  const [products, locations] = await Promise.all([
-    prisma.product.findMany({ where: { shop: session.shop }, orderBy: { title: "asc" } }),
-    prisma.location.findMany({
-      where: { shop: session.shop, isActive: true },
-      orderBy: { createdAt: "asc" },
-      select: { id: true, name: true },
-    }),
-  ]);
-  return { products, locations };
+  // Products are searched on demand rather than shipped in full; see api.products.search.
+  const locations = await prisma.location.findMany({
+    where: { shop: session.shop, isActive: true },
+    orderBy: { createdAt: "asc" },
+    select: { id: true, name: true },
+  });
+  return { locations };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -39,13 +38,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (!fromLocationId || !toLocationId) return { error: "Pick both a source and destination location" };
   if (fromLocationId === toLocationId) return { error: "Source and destination must be different locations" };
-  if (productIds.length === 0) return { error: "Add at least one product" };
 
-  const items = productIds
-    .map((id, i) => ({ productId: id, quantitySent: parseInt(quantities[i] ?? "0", 10) }))
-    .filter((it) => it.quantitySent > 0);
+  // Locations and products both arrive from the form. Without this check a crafted POST
+  // could move another tenant's stock, or move this shop's stock into their warehouse.
+  const locations = await prisma.location.findMany({
+    where: { shop: session.shop, id: { in: [fromLocationId, toLocationId] } },
+    select: { id: true },
+  });
+  if (locations.length !== 2) return { error: "Pick two locations from this shop" };
 
-  if (items.length === 0) return { error: "Each line must have a quantity greater than zero" };
+  const { items: validated, error: lineError } = await validateDraftLines(
+    session.shop,
+    productIds.map((id, i) => ({ productId: id, quantity: quantities[i] ?? null })),
+  );
+  if (lineError) return { error: lineError };
+
+  const items = validated.map((line) => ({
+    productId: line.productId,
+    quantitySent: line.quantityOrdered,
+  }));
 
   await prisma.stockTransfer.create({
     data: {
@@ -64,11 +75,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 interface LineItem {
   productId: string;
+  label: string;
   quantity: number;
 }
 
 export default function NewStockTransfer() {
-  const { products, locations } = useLoaderData<typeof loader>();
+  const { locations } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -76,7 +88,7 @@ export default function NewStockTransfer() {
   const [fromLocationId, setFromLocationId] = useState(locations[0]?.id ?? "");
   const [toLocationId, setToLocationId] = useState(locations[1]?.id ?? "");
   const [notes, setNotes] = useState("");
-  const [lines, setLines] = useState<LineItem[]>([{ productId: products[0]?.id ?? "", quantity: 1 }]);
+  const [lines, setLines] = useState<LineItem[]>([{ productId: "", label: "", quantity: 1 }]);
 
   const isBusy = fetcher.state !== "idle";
   const error = (fetcher.data as { error?: string } | undefined)?.error;
@@ -88,19 +100,19 @@ export default function NewStockTransfer() {
   }, [fetcher.data, error, navigate]);
 
   const addLine = useCallback(() => {
-    setLines((l) => [...l, { productId: products[0]?.id ?? "", quantity: 1 }]);
-  }, [products]);
+    setLines((l) => [...l, { productId: "", label: "", quantity: 1 }]);
+  }, []);
 
   const removeLine = useCallback((idx: number) => {
     setLines((l) => l.filter((_, i) => i !== idx));
   }, []);
 
-  const updateLine = useCallback((idx: number, field: keyof LineItem, value: string) => {
-    setLines((l) =>
-      l.map((line, i) =>
-        i === idx ? { ...line, [field]: field === "productId" ? value : parseInt(value, 10) || 0 } : line,
-      ),
-    );
+  const updateLine = useCallback((idx: number, value: string) => {
+    setLines((l) => l.map((line, i) => (i === idx ? { ...line, quantity: parseInt(value, 10) || 0 } : line)));
+  }, []);
+
+  const setLineProduct = useCallback((idx: number, id: string, label: string) => {
+    setLines((l) => l.map((line, i) => (i === idx ? { ...line, productId: id, label } : line)));
   }, []);
 
   const sameLocation = !!fromLocationId && fromLocationId === toLocationId;
@@ -192,16 +204,16 @@ export default function NewStockTransfer() {
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {lines.map((line, idx) => (
               <div key={idx} style={{ display: "grid", gridTemplateColumns: "3fr 1fr auto", gap: "10px", alignItems: "center" }}>
-                <SelectInput value={line.productId} onChange={(e) => updateLine(idx, "productId", e.target.value)}>
-                  {products.map((p) => (
-                    <option key={p.id} value={p.id}>{p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title}</option>
-                  ))}
-                </SelectInput>
+                <ProductCombobox
+                  value={line.productId}
+                  valueLabel={line.label || null}
+                  onChange={(id, product) => setLineProduct(idx, id, product?.label ?? "")}
+                />
                 <TextInput
                   type="number"
                   min={1}
                   value={line.quantity}
-                  onChange={(e) => updateLine(idx, "quantity", e.target.value)}
+                  onChange={(e) => updateLine(idx, e.target.value)}
                 />
                 <button
                   onClick={() => removeLine(idx)}
@@ -223,7 +235,11 @@ export default function NewStockTransfer() {
           <Link to="/app/transfers">
             <Button variant="ghost">Cancel</Button>
           </Link>
-          <Button variant="primary" disabled={isBusy || lines.length === 0 || sameLocation} onClick={handleSubmit}>
+          <Button
+            variant="primary"
+            disabled={isBusy || lines.length === 0 || sameLocation || lines.some((l) => !l.productId)}
+            onClick={handleSubmit}
+          >
             Create transfer
           </Button>
         </div>

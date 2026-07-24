@@ -6,9 +6,16 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, PageHead, POStatusPill, ProductThumb, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
-import { applyLocationDelta, resolveDefaultLocationId } from "../lib/stock.server";
-import { updateLeadTimeStats } from "../lib/lead-time.server";
+import { Button, Card, DataTable, PageHead, POStatusPill, ProductCombobox, ProductThumb, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
+import {
+  markPurchaseOrderSent,
+  parseReceivedQuantities,
+  receivePurchaseOrder,
+  validateDraftLines,
+  validateSupplierId,
+} from "../lib/purchase-order.server";
+import { parseFormDate } from "../lib/date-range";
+import { emailPurchaseOrderToSupplier } from "../lib/purchase-order-email.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -21,12 +28,14 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   });
   if (!po) throw new Response("Not found", { status: 404 });
 
-  const [products, suppliers] = await Promise.all([
-    prisma.product.findMany({ where: { shop: session.shop }, orderBy: { title: "asc" } }),
-    prisma.supplier.findMany({ where: { shop: session.shop }, orderBy: { name: "asc" } }),
-  ]);
+  // The catalogue is not loaded: the draft editor's line picker searches on demand via
+  // /api/products/search. Existing lines already carry their product through `po.items`.
+  const suppliers = await prisma.supplier.findMany({
+    where: { shop: session.shop },
+    orderBy: { name: "asc" },
+  });
 
-  return { po, products, suppliers };
+  return { po, suppliers };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
@@ -50,13 +59,24 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const quantities = formData.getAll("quantity") as string[];
     const unitCosts = formData.getAll("unitCost") as string[];
 
-    if (productIds.length === 0) return { ok: false as const, error: "Add at least one product", action: "" };
+    // Product and supplier ids come from the form, so they are attacker-controlled and
+    // must be checked against this shop before anything is linked to the PO.
+    const { items, error: lineError } = await validateDraftLines(
+      shop,
+      productIds.map((id, i) => ({
+        productId: id,
+        quantity: quantities[i] ?? null,
+        unitCost: unitCosts[i] ?? null,
+      })),
+    );
+    if (lineError) return { ok: false as const, error: lineError, action: "" };
 
-    const items = productIds.map((id, i) => ({
-      productId: id,
-      quantityOrdered: parseInt(quantities[i] ?? "0", 10),
-      unitCost: parseFloat(unitCosts[i] ?? "0"),
-    }));
+    const { supplierId: ownedSupplierId, error: supplierError } = await validateSupplierId(
+      shop,
+      supplierId,
+    );
+    if (supplierError) return { ok: false as const, error: supplierError, action: "" };
+
     const totalCost = items.reduce((s, item) => s + item.quantityOrdered * item.unitCost, 0);
 
     await prisma.$transaction([
@@ -64,7 +84,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       prisma.purchaseOrder.update({
         where: { id: po.id },
         data: {
-          supplierId,
+          supplierId: ownedSupplierId,
           notes,
           totalCost,
           items: { create: items },
@@ -76,123 +96,55 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   if (intent === "mark_sent") {
-    if (po.status !== "draft") return { ok: false as const, error: "Only draft POs can be marked sent", action: "" };
     const expectedDelivery = formData.get("expectedDeliveryDate") as string;
-    await prisma.purchaseOrder.update({
-      where: { id: po.id },
-      data: {
-        status: "sent",
-        // Stamped so supplier lead time can be measured sent -> received. Measuring
-        // from createdAt counted however long the draft sat unsent, which inflated
-        // the supplier's average lead time and every safety stock derived from it.
-        sentAt: new Date(),
-        expectedDeliveryDate: expectedDelivery ? new Date(expectedDelivery) : null,
-      },
-    });
+    const parsedExpected = parseFormDate(expectedDelivery);
+    if (expectedDelivery && !parsedExpected) {
+      return { ok: false as const, error: "Expected delivery date is not a valid date", action: "" };
+    }
+
+    const result = await markPurchaseOrderSent(shop, po.id, parsedExpected);
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not mark sent", action: "" };
     return { ok: true as const, action: "sent", error: "" };
   }
 
+  if (intent === "email_supplier") {
+    const result = await emailPurchaseOrderToSupplier(po.id, shop);
+    if (!result.ok) {
+      return { ok: false as const, error: result.error ?? "Could not send the email", action: "" };
+    }
+    return { ok: true as const, action: `emailed:${result.emailedTo}`, error: "" };
+  }
+
   if (intent === "mark_received") {
-    if (po.status === "received") return { ok: false as const, error: "Already received", action: "" };
     const actualDelivery = formData.get("actualDeliveryDate") as string;
-
-    // Receipts go through the per-location path.
-    //
-    // Incrementing Product.currentStock directly left ProductLocationStock untouched
-    // and never told Shopify. Since syncShopifyInventory recomputes currentStock as the
-    // sum of per-location on-hand, the received units silently disappeared at the next
-    // sync — and Shopify never knew the stock had arrived at all.
-    const receiptLocationId = await resolveDefaultLocationId(
-      shop,
-      (formData.get("locationId") as string) || null,
-    );
-    const receiveErrors: string[] = [];
-
-    for (const item of po.items) {
-      const receivedQty = parseInt(
-        (formData.get(`received_${item.id}`) as string) ?? String(item.quantityOrdered),
-        10,
-      );
-      if (isNaN(receivedQty) || receivedQty < 0) continue;
-
-      // Only the not-yet-received remainder moves, so re-confirming a partially
-      // received PO cannot double-count stock.
-      const delta = receivedQty - item.quantityReceived;
-
-      if (delta !== 0) {
-        if (receiptLocationId) {
-          const res = await applyLocationDelta(
-            admin,
-            shop,
-            item.productId,
-            receiptLocationId,
-            delta,
-          );
-          if (!res.ok) {
-            receiveErrors.push(res.error ?? "stock update failed");
-            continue;
-          }
-          if (res.shopifyError) receiveErrors.push(res.shopifyError);
-        } else {
-          // No locations synced yet — fall back to the aggregate count.
-          await prisma.product.update({
-            where: { id: item.productId },
-            data: { currentStock: { increment: delta } },
-          });
-        }
-      }
-
-      await prisma.purchaseOrderItem.update({
-        where: { id: item.id },
-        data: { quantityReceived: receivedQty },
-      });
+    const parsedActual = parseFormDate(actualDelivery);
+    if (actualDelivery && !parsedActual) {
+      return { ok: false as const, error: "Actual delivery date is not a valid date", action: "" };
     }
 
-    await prisma.purchaseOrder.update({
-      where: { id: po.id },
-      data: {
-        status: "received",
-        actualDeliveryDate: actualDelivery ? new Date(actualDelivery) : new Date(),
-      },
+    const result = await receivePurchaseOrder(admin, shop, po.id, {
+      actualDeliveryDate: parsedActual,
+      locationId: (formData.get("locationId") as string) || null,
+      quantities: parseReceivedQuantities(
+        formData,
+        po.items.map((i) => i.id),
+      ),
     });
 
-    // Lead time is measured from when the PO was actually sent.
-    if (po.supplierId && po.sentAt) {
-      const receivedDate = actualDelivery ? new Date(actualDelivery) : new Date();
-      const actualLeadDays = Math.max(
-        1,
-        Math.round((receivedDate.getTime() - po.sentAt.getTime()) / 86400000),
-      );
-
-      const supplier = await prisma.supplier.findFirst({
-        where: { id: po.supplierId, shop },
-      });
-      if (supplier) {
-        const stats = updateLeadTimeStats(
-          {
-            count: supplier.totalPosReceived,
-            mean: supplier.avgActualLeadTime,
-            m2: supplier.leadTimeM2,
-          },
-          actualLeadDays,
-        );
-
-        await prisma.supplier.update({
-          where: { id: po.supplierId },
-          data: {
-            totalPosReceived: stats.count,
-            avgActualLeadTime: stats.mean,
-            leadTimeM2: stats.m2,
-            leadTimeVariance: stats.stdDev,
-          },
-        });
-      }
+    if (!result.ok) {
+      return { ok: false as const, error: result.error ?? "Could not receive", action: "" };
     }
 
+    // A partial failure still receives what it could; the merchant needs to know which
+    // lines did not move rather than seeing an unqualified success.
+    const problems = [
+      ...result.lines.filter((l) => l.error).map((l) => l.error as string),
+      ...result.shopifyWarnings,
+    ];
     return {
       ok: true as const,
       action: "received",
-      error: receiveErrors.length > 0 ? receiveErrors.join("; ") : "",
+      error: problems.length > 0 ? problems.join("; ") : "",
     };
   }
 
@@ -201,12 +153,14 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 
 interface DraftLine {
   productId: string;
+  /** Held beside the id so the picker can show a chosen product without a search. */
+  label: string;
   quantity: number;
   unitCost: number;
 }
 
 export default function PODetail() {
-  const { po, products, suppliers } = useLoaderData<typeof loader>();
+  const { po, suppliers } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const { timezone = "UTC", currency = "USD", theme = "emerald" } =
@@ -224,17 +178,26 @@ export default function PODetail() {
   const [draftSupplierId, setDraftSupplierId] = useState(po.supplierId ?? "");
   const [draftNotes, setDraftNotes] = useState(po.notes ?? "");
   const [draftLines, setDraftLines] = useState<DraftLine[]>(() =>
-    po.items.map((item) => ({ productId: item.productId, quantity: item.quantityOrdered, unitCost: item.unitCost })),
+    po.items.map((item) => ({
+      productId: item.productId,
+      label: item.product.variantTitle
+        ? `${item.product.title} — ${item.product.variantTitle}`
+        : item.product.title,
+      quantity: item.quantityOrdered,
+      unitCost: item.unitCost,
+    })),
   );
 
   const isBusy = fetcher.state !== "idle";
 
   useEffect(() => {
     if (fetcher.data?.ok) {
-      const msg =
-        fetcher.data.action === "received"
+      const action = fetcher.data.action;
+      const msg = action.startsWith("emailed:")
+        ? `Purchase order emailed to ${action.slice("emailed:".length)}`
+        : action === "received"
           ? "PO marked as received — stock updated"
-          : fetcher.data.action === "draft_updated"
+          : action === "draft_updated"
             ? "Draft PO updated"
             : "PO updated";
       shopify.toast.show(msg);
@@ -245,20 +208,27 @@ export default function PODetail() {
   }, [fetcher.data, shopify]);
 
   const addDraftLine = useCallback(() => {
-    setDraftLines((l) => [...l, { productId: products[0]?.id ?? "", quantity: 1, unitCost: 0 }]);
-  }, [products]);
+    setDraftLines((l) => [...l, { productId: "", label: "", quantity: 1, unitCost: 0 }]);
+  }, []);
 
   const removeDraftLine = useCallback((idx: number) => {
     setDraftLines((l) => l.filter((_, i) => i !== idx));
   }, []);
 
-  const updateDraftLine = useCallback((idx: number, field: keyof DraftLine, value: string) => {
-    setDraftLines((l) =>
-      l.map((line, i) =>
-        i === idx ? { ...line, [field]: field === "productId" ? value : parseFloat(value) || 0 } : line,
-      ),
-    );
+  const updateDraftLine = useCallback((idx: number, field: "quantity" | "unitCost", value: string) => {
+    setDraftLines((l) => l.map((line, i) => (i === idx ? { ...line, [field]: parseFloat(value) || 0 } : line)));
   }, []);
+
+  const setDraftLineProduct = useCallback(
+    (idx: number, id: string, label: string, unitCost?: number) => {
+      setDraftLines((l) =>
+        l.map((line, i) =>
+          i === idx ? { ...line, productId: id, label, unitCost: line.unitCost || unitCost || 0 } : line,
+        ),
+      );
+    },
+    [],
+  );
 
   const draftTotal = draftLines.reduce((s, l) => s + l.quantity * l.unitCost, 0);
 
@@ -382,11 +352,11 @@ export default function PODetail() {
               <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
                 {draftLines.map((line, idx) => (
                   <div key={idx} style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 1fr 1fr auto", gap: "10px", alignItems: "center" }}>
-                    <SelectInput value={line.productId} onChange={(e) => updateDraftLine(idx, "productId", e.target.value)}>
-                      {products.map((p) => (
-                        <option key={p.id} value={p.id}>{p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title}</option>
-                      ))}
-                    </SelectInput>
+                    <ProductCombobox
+                      value={line.productId}
+                      valueLabel={line.label || null}
+                      onChange={(id, product) => setDraftLineProduct(idx, id, product?.label ?? "", product?.unitCost)}
+                    />
                     <TextInput type="number" min={1} value={line.quantity} onChange={(e) => updateDraftLine(idx, "quantity", e.target.value)} />
                     <TextInput type="number" min={0} step={0.01} value={line.unitCost} onChange={(e) => updateDraftLine(idx, "unitCost", e.target.value)} />
                     <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "13px" }}>{formatCurrency(line.quantity * line.unitCost, currency)}</span>
@@ -405,7 +375,11 @@ export default function PODetail() {
 
             <div style={{ display: "flex", gap: "9px", justifyContent: "flex-end", marginBottom: "18px" }}>
               <Button variant="ghost" onClick={() => setIsEditing(false)}>Cancel</Button>
-              <Button variant="primary" disabled={isBusy || draftLines.length === 0} onClick={saveDraft}>
+              <Button
+                variant="primary"
+                disabled={isBusy || draftLines.length === 0 || draftLines.some((l) => !l.productId)}
+                onClick={saveDraft}
+              >
                 Save changes
               </Button>
             </div>
@@ -469,7 +443,7 @@ export default function PODetail() {
                 onChange={(e) => setExpectedDate(e.target.value)}
                 style={{ marginBottom: "14px", maxWidth: "240px" }}
               />
-              <div>
+              <div style={{ display: "flex", gap: "9px", flexWrap: "wrap", alignItems: "center" }}>
                 <Button
                   variant="primary"
                   disabled={isBusy}
@@ -477,12 +451,16 @@ export default function PODetail() {
                 >
                   Mark as sent to supplier
                 </Button>
+                <EmailSupplierButton po={po} isBusy={isBusy} fetcher={fetcher} />
               </div>
             </div>
           )}
 
           {po.status === "sent" && (
             <div>
+              <div style={{ marginBottom: "14px" }}>
+                <EmailSupplierButton po={po} isBusy={isBusy} fetcher={fetcher} />
+              </div>
               <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>
                 Actual delivery date
               </label>
@@ -526,6 +504,50 @@ export default function PODetail() {
           <Button variant="ghost" onClick={() => window.print()}>Print / PDF</Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Sends the order to the supplier and says what it did.
+ *
+ * The button is disabled with a reason rather than hidden when it cannot be used: a
+ * missing supplier email is a thing the merchant can fix, and a control that silently
+ * vanishes teaches nobody. Re-sending stays available — suppliers lose emails — but the
+ * label makes clear it would be a repeat.
+ */
+function EmailSupplierButton({
+  po,
+  isBusy,
+  fetcher,
+}: {
+  po: { supplier: { name: string; email: string | null } | null; emailedAt: string | Date | null; emailedTo: string | null };
+  isBusy: boolean;
+  fetcher: { submit: (data: Record<string, string>, opts: { method: "POST" }) => void };
+}) {
+  const email = po.supplier?.email?.trim() || null;
+  const blocked = !po.supplier
+    ? "Assign a supplier first"
+    : !email
+      ? `${po.supplier.name} has no email address on file`
+      : null;
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "9px", flexWrap: "wrap" }}>
+      <Button
+        variant="ghost"
+        disabled={isBusy || blocked !== null}
+        onClick={() => fetcher.submit({ intent: "email_supplier" }, { method: "POST" })}
+      >
+        {po.emailedAt ? "Email again" : "Email to supplier"}
+      </Button>
+      <span style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
+        {blocked
+          ? blocked
+          : po.emailedAt
+            ? `Sent to ${po.emailedTo} on ${new Date(po.emailedAt).toISOString().slice(0, 10)}`
+            : `Will send to ${email}`}
+      </span>
     </div>
   );
 }

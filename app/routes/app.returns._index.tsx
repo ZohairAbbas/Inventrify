@@ -1,5 +1,5 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useRouteLoaderData, Link } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigation, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { formatDate } from "../lib/format";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
@@ -7,13 +7,17 @@ import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { applyStockDelta } from "../lib/stock.server";
+import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
+import { useListParams } from "../lib/use-list-params";
 import {
   Button,
   Card,
   DataTable,
   FilterChips,
   PageHead,
+  Pagination,
   Pill,
+  ProductCombobox,
   ProductThumb,
   SelectInput,
   type DataTableColumn,
@@ -23,15 +27,40 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
-  const [returns, locations, settings, products] = await Promise.all([
+  const url = new URL(request.url);
+  const statusFilter = url.searchParams.get("status") ?? "pending";
+  const search = parseSearch(url.searchParams);
+  const pageRequest = parsePageRequest(url.searchParams);
+
+  const where = {
+    shop,
+    ...(statusFilter !== "all" ? { status: statusFilter } : {}),
+    ...(search
+      ? {
+          OR: [
+            { shopifyOrderName: { contains: search, mode: "insensitive" as const } },
+            { sku: { contains: search, mode: "insensitive" as const } },
+            { title: { contains: search, mode: "insensitive" as const } },
+          ],
+        }
+      : {}),
+  };
+
+  const page = resolvePage(pageRequest, await prisma.returnItem.count({ where }));
+
+  const [returns, locations, settings, unmatchedCount] = await Promise.all([
     prisma.returnItem.findMany({
-      where: { shop },
+      where,
       include: {
         product: {
           select: { id: true, title: true, variantTitle: true, imageUrl: true },
         },
       },
-      orderBy: [{ status: "asc" }, { returnReceivedAt: "desc" }],
+      // returnReceivedAt is nullable and shared across a batch, so it is not a total
+      // order on its own; id keeps paging stable.
+      orderBy: [{ status: "asc" }, { returnReceivedAt: "desc" }, { id: "asc" }],
+      skip: page.skip,
+      take: page.take,
     }),
     prisma.location.findMany({
       where: { shop, isActive: true },
@@ -39,15 +68,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       select: { id: true, name: true },
     }),
     prisma.shopSettings.findUnique({ where: { shop }, select: { courierifyApiKey: true } }),
-    // For the manual-assignment picker on unmatched returns.
-    prisma.product.findMany({
-      where: { shop },
-      orderBy: { title: "asc" },
-      select: { id: true, title: true, variantTitle: true, sku: true },
-    }),
+    // Drives the hint on the Pending tab. The product list for the assignment picker is
+    // no longer loaded here: it fetched the entire catalogue on every visit to populate
+    // a dropdown that most rows never open. It is fetched on demand instead.
+    prisma.returnItem.count({ where: { shop, status: "pending", productId: null } }),
   ]);
 
-  return { returns, locations, products, courierifyConnected: !!settings?.courierifyApiKey };
+  return {
+    returns,
+    locations,
+    page,
+    statusFilter,
+    unmatchedCount,
+    courierifyConnected: !!settings?.courierifyApiKey,
+  };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -146,17 +180,19 @@ const RETURN_PILL: Record<string, { bg: string; fg: string }> = {
 };
 
 export default function ReturnsQueue() {
-  const { returns, locations, products, courierifyConnected } = useLoaderData<typeof loader>();
+  const { returns, locations, page, statusFilter, unmatchedCount, courierifyConnected } =
+    useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
+  const navigation = useNavigation();
+  const { searchInput, setSearchInput, setFilter, setPage, setPageSize } = useListParams();
   const { timezone = "UTC", theme = "emerald" } =
     useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
-  const [filter, setFilter] = useState("pending");
   const [selected, setSelected] = useState<string[]>([]);
   const [locationId, setLocationId] = useState(locations[0]?.id ?? "");
   // Per-row product choice for unmatched returns awaiting manual assignment.
-  const [assignChoice, setAssignChoice] = useState<Record<string, string>>({});
+  const [assignChoice, setAssignChoice] = useState<Record<string, { id: string; label: string }>>({});
 
   useEffect(() => {
     const r = fetcher.data as { intent?: string; ok?: boolean; error?: string; resolved?: number; errors?: string[]; assigned?: boolean } | undefined;
@@ -181,7 +217,7 @@ export default function ReturnsQueue() {
     fetcher.submit({ intent: "assign", returnId, productId }, { method: "POST" });
   };
 
-  const list = returns.filter((r) => filter === "all" || r.status === filter);
+  const list = returns;
   const pendingIds = list.filter((r) => r.status === "pending").map((r) => r.id);
   const allPendingSelected = pendingIds.length > 0 && pendingIds.every((id) => selected.includes(id));
 
@@ -267,22 +303,19 @@ export default function ReturnsQueue() {
           unmatched ? (
             // Unmatched line — let the merchant assign a product before resolving.
             <div key="actions" style={{ display: "flex", gap: "6px", justifyContent: "flex-end", alignItems: "center" }}>
-              <div style={{ minWidth: "160px", flex: "1 1 160px" }}>
-                <SelectInput
-                  value={assignChoice[r.id] ?? ""}
-                  onChange={(e) => setAssignChoice((s) => ({ ...s, [r.id]: e.target.value }))}
-                >
-                  <option value="">Assign product…</option>
-                  {products.map((pr) => (
-                    <option key={pr.id} value={pr.id}>
-                      {(pr.variantTitle ? `${pr.title} — ${pr.variantTitle}` : pr.title) + (pr.sku ? ` (${pr.sku})` : "")}
-                    </option>
-                  ))}
-                </SelectInput>
+              <div style={{ minWidth: "200px", flex: "1 1 200px" }}>
+                <ProductCombobox
+                  value={assignChoice[r.id]?.id ?? ""}
+                  valueLabel={assignChoice[r.id]?.label ?? null}
+                  placeholder="Search a product to assign…"
+                  onChange={(id, product) =>
+                    setAssignChoice((s) => ({ ...s, [r.id]: { id, label: product?.label ?? "" } }))
+                  }
+                />
               </div>
               <button
-                onClick={() => assign(r.id, assignChoice[r.id] ?? "")}
-                disabled={fetcher.state !== "idle" || !assignChoice[r.id]}
+                onClick={() => assign(r.id, assignChoice[r.id]?.id ?? "")}
+                disabled={fetcher.state !== "idle" || !assignChoice[r.id]?.id}
                 style={{ fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-accent)", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
               >
                 Assign
@@ -342,10 +375,41 @@ export default function ReturnsQueue() {
           </Card>
         )}
 
-        <FilterChips options={STATUS_TABS} active={filter} onChange={(v) => { setFilter(v); setSelected([]); }} />
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              flex: 1, minWidth: "220px", display: "flex", alignItems: "center", gap: "9px",
+              background: "#fff", border: "1px solid var(--inv-input-border)",
+              borderRadius: "10px", padding: "0 12px", height: "38px",
+            }}
+          >
+            <span style={{ color: "var(--inv-muted)" }}>⌕</span>
+            <input
+              value={searchInput}
+              placeholder="Search order, SKU or product"
+              onChange={(e) => setSearchInput(e.target.value)}
+              style={{ border: "none", outline: "none", flex: 1, fontSize: "13px", background: "transparent", color: "var(--inv-ink)" }}
+            />
+          </div>
+        </div>
+
+        <FilterChips
+          options={STATUS_TABS}
+          active={statusFilter}
+          onChange={(v) => { setFilter("status", v); setSelected([]); }}
+        />
+
+        {statusFilter === "pending" && unmatchedCount > 0 && (
+          <Card padding="10px 14px" style={{ marginBottom: "10px" }}>
+            <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>
+              {unmatchedCount} pending return{unmatchedCount === 1 ? "" : "s"} could not be matched to a
+              product and need one assigned before they can be restocked.
+            </div>
+          </Card>
+        )}
 
         {/* Bulk action bar — restock destination + apply to selection */}
-        {filter === "pending" && pendingIds.length > 0 && (
+        {statusFilter === "pending" && pendingIds.length > 0 && (
           <Card padding="12px 16px">
             <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
               <label style={{ display: "flex", alignItems: "center", gap: "4px", cursor: "pointer", fontSize: "12.5px" }}>
@@ -385,17 +449,26 @@ export default function ReturnsQueue() {
           <Card padding="40px 24px">
             <div style={{ textAlign: "center" }}>
               <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>
-                {filter === "pending" ? "No returns waiting" : "Nothing here"}
+                {statusFilter === "pending" ? "No returns waiting" : "Nothing here"}
               </div>
               <div style={{ fontSize: "13px", color: "var(--inv-muted)" }}>
-                {filter === "pending"
+                {statusFilter === "pending"
                   ? "Returned parcels received by Courierify will appear here to restock or write off."
                   : "No returns in this state yet."}
               </div>
             </div>
           </Card>
         ) : (
-          <DataTable columns={columns} rows={rows} />
+          <>
+            <DataTable columns={columns} rows={rows} />
+            <Pagination
+              page={page}
+              onPageChange={setPage}
+              onPageSizeChange={setPageSize}
+              itemLabel="returns"
+              busy={navigation.state === "loading"}
+            />
+          </>
         )}
       </div>
     </div>

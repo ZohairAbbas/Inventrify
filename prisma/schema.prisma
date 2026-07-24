@@ -357,6 +357,12 @@ model PurchaseOrder {
   // When the PO was actually sent to the supplier. Lead time is measured
   // sentAt -> actualDeliveryDate, NOT createdAt (a draft may sit for weeks).
   sentAt               DateTime?
+  // When the PO was actually emailed to the supplier, and to which address.
+  // Deliberately separate from sentAt: a merchant may phone the supplier or hand over a
+  // printout, so "sent" is a status the merchant sets, while this records a delivery the
+  // app can actually vouch for.
+  emailedAt            DateTime?
+  emailedTo            String?
   expectedDeliveryDate DateTime?
   actualDeliveryDate   DateTime?
   createdAt            DateTime  @default(now())

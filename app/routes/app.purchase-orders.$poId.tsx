@@ -15,6 +15,7 @@ import {
   validateSupplierId,
 } from "../lib/purchase-order.server";
 import { parseFormDate } from "../lib/date-range";
+import { emailPurchaseOrderToSupplier } from "../lib/purchase-order-email.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -104,6 +105,14 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return { ok: true as const, action: "sent", error: "" };
   }
 
+  if (intent === "email_supplier") {
+    const result = await emailPurchaseOrderToSupplier(po.id, shop);
+    if (!result.ok) {
+      return { ok: false as const, error: result.error ?? "Could not send the email", action: "" };
+    }
+    return { ok: true as const, action: `emailed:${result.emailedTo}`, error: "" };
+  }
+
   if (intent === "mark_received") {
     const actualDelivery = formData.get("actualDeliveryDate") as string;
     const parsedActual = parseFormDate(actualDelivery);
@@ -172,10 +181,12 @@ export default function PODetail() {
 
   useEffect(() => {
     if (fetcher.data?.ok) {
-      const msg =
-        fetcher.data.action === "received"
+      const action = fetcher.data.action;
+      const msg = action.startsWith("emailed:")
+        ? `Purchase order emailed to ${action.slice("emailed:".length)}`
+        : action === "received"
           ? "PO marked as received — stock updated"
-          : fetcher.data.action === "draft_updated"
+          : action === "draft_updated"
             ? "Draft PO updated"
             : "PO updated";
       shopify.toast.show(msg);
@@ -410,7 +421,7 @@ export default function PODetail() {
                 onChange={(e) => setExpectedDate(e.target.value)}
                 style={{ marginBottom: "14px", maxWidth: "240px" }}
               />
-              <div>
+              <div style={{ display: "flex", gap: "9px", flexWrap: "wrap", alignItems: "center" }}>
                 <Button
                   variant="primary"
                   disabled={isBusy}
@@ -418,12 +429,16 @@ export default function PODetail() {
                 >
                   Mark as sent to supplier
                 </Button>
+                <EmailSupplierButton po={po} isBusy={isBusy} fetcher={fetcher} />
               </div>
             </div>
           )}
 
           {po.status === "sent" && (
             <div>
+              <div style={{ marginBottom: "14px" }}>
+                <EmailSupplierButton po={po} isBusy={isBusy} fetcher={fetcher} />
+              </div>
               <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>
                 Actual delivery date
               </label>
@@ -467,6 +482,50 @@ export default function PODetail() {
           <Button variant="ghost" onClick={() => window.print()}>Print / PDF</Button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Sends the order to the supplier and says what it did.
+ *
+ * The button is disabled with a reason rather than hidden when it cannot be used: a
+ * missing supplier email is a thing the merchant can fix, and a control that silently
+ * vanishes teaches nobody. Re-sending stays available — suppliers lose emails — but the
+ * label makes clear it would be a repeat.
+ */
+function EmailSupplierButton({
+  po,
+  isBusy,
+  fetcher,
+}: {
+  po: { supplier: { name: string; email: string | null } | null; emailedAt: string | Date | null; emailedTo: string | null };
+  isBusy: boolean;
+  fetcher: { submit: (data: Record<string, string>, opts: { method: "POST" }) => void };
+}) {
+  const email = po.supplier?.email?.trim() || null;
+  const blocked = !po.supplier
+    ? "Assign a supplier first"
+    : !email
+      ? `${po.supplier.name} has no email address on file`
+      : null;
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "9px", flexWrap: "wrap" }}>
+      <Button
+        variant="ghost"
+        disabled={isBusy || blocked !== null}
+        onClick={() => fetcher.submit({ intent: "email_supplier" }, { method: "POST" })}
+      >
+        {po.emailedAt ? "Email again" : "Email to supplier"}
+      </Button>
+      <span style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
+        {blocked
+          ? blocked
+          : po.emailedAt
+            ? `Sent to ${po.emailedTo} on ${new Date(po.emailedAt).toISOString().slice(0, 10)}`
+            : `Will send to ${email}`}
+      </span>
     </div>
   );
 }

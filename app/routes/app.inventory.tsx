@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
-import { useLoaderData, useFetcher, useSearchParams, useRouteLoaderData, Link } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigation, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import Papa from "papaparse";
@@ -8,6 +8,9 @@ import { useEffect, useRef, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { applyStockDelta } from "../lib/stock.server";
+import { getDamagedUnitsByProduct } from "../lib/damage.server";
+import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
+import { useListParams } from "../lib/use-list-params";
 import {
   getStockStatus,
   calculateDaysRemaining,
@@ -25,6 +28,7 @@ import {
   Drawer,
   FilterChips,
   PageHead,
+  Pagination,
   SelectInput,
   ProductThumb,
   StatusBadge,
@@ -35,33 +39,103 @@ import {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
+  const shop = session.shop;
   const url = new URL(request.url);
   const statusFilter = url.searchParams.get("status") ?? "all";
-  const search = url.searchParams.get("search") ?? "";
+  const search = parseSearch(url.searchParams);
   const locationFilter = url.searchParams.get("location") ?? "all";
+  const pageRequest = parsePageRequest(url.searchParams);
+
+  // Search and location narrow the set in SQL. Status cannot: it is judged on inventory
+  // position, which is assembled from four tables in application code.
+  const where = {
+    shop,
+    isArchived: false,
+    ...(search
+      ? {
+          OR: [
+            { title: { contains: search, mode: "insensitive" as const } },
+            { sku: { contains: search, mode: "insensitive" as const } },
+            { variantTitle: { contains: search, mode: "insensitive" as const } },
+          ],
+        }
+      : {}),
+    ...(locationFilter !== "all"
+      ? { locationStock: { some: { locationId: locationFilter } } }
+      : {}),
+  };
+
+  // Two paths, because status is the only filter that cannot be pushed into the query.
+  //
+  // Unfiltered (the overwhelmingly common case) the database counts and slices, and only
+  // the rows on this page are ever loaded. With a status filter we still have to know
+  // every candidate's position before we can tell which ones match — but that is a set of
+  // cheap aggregates over id columns, not the full row payload with supplier and
+  // per-location stock joined, which is what this page used to fetch for the entire
+  // catalogue on every request.
+  let pageProductIds: string[] | null = null;
+  let totalItems: number;
+
+  if (statusFilter === "all") {
+    totalItems = await prisma.product.count({ where });
+  } else {
+    const [candidates, allPositions] = await Promise.all([
+      prisma.product.findMany({
+        where,
+        select: {
+          id: true,
+          currentStock: true,
+          reorderPoint: true,
+          // Only needed for the per-location view, where status is judged on that
+          // location's physical stock rather than the shop-wide position.
+          ...(locationFilter !== "all"
+            ? {
+                locationStock: {
+                  where: { locationId: locationFilter },
+                  select: { onHand: true },
+                },
+              }
+            : {}),
+        },
+        orderBy: [{ title: "asc" }, { id: "asc" }],
+      }),
+      // Skipped entirely in the per-location view, which does not consult position.
+      locationFilter === "all"
+        ? getInventoryPositions(shop)
+        : Promise.resolve(new Map<string, { position: number }>()),
+    ]);
+
+    // This must apply exactly the rule the rows below are rendered with, or the filter
+    // selects one set and the table displays a status from another.
+    const matching = candidates.filter((p) => {
+      const stock =
+        locationFilter !== "all"
+          ? ("locationStock" in p ? p.locationStock?.[0]?.onHand : undefined) ?? 0
+          : allPositions.get(p.id)?.position ?? p.currentStock;
+      return getStockStatus(stock, p.reorderPoint) === statusFilter;
+    });
+
+    totalItems = matching.length;
+    const resolved = resolvePage(pageRequest, totalItems);
+    pageProductIds = matching.slice(resolved.skip, resolved.skip + resolved.take).map((p) => p.id);
+  }
+
+  const page = resolvePage(pageRequest, totalItems);
 
   const products = await prisma.product.findMany({
-    where: {
-      shop: session.shop,
-      ...(search
-        ? {
-            OR: [
-              { title: { contains: search, mode: "insensitive" } },
-              { sku: { contains: search, mode: "insensitive" } },
-              { variantTitle: { contains: search, mode: "insensitive" } },
-            ],
-          }
-        : {}),
-    },
+    where: pageProductIds ? { shop, id: { in: pageProductIds } } : where,
     include: {
       supplier: { select: { name: true } },
       locationStock: { include: { location: { select: { id: true, name: true } } } },
     },
-    orderBy: { title: "asc" },
+    // title alone is not a total order — variants of one product share it — so a row
+    // could otherwise appear on two pages or on neither. id breaks the tie.
+    orderBy: [{ title: "asc" }, { id: "asc" }],
+    ...(pageProductIds ? {} : { skip: page.skip, take: page.take }),
   });
 
   const positions = await getInventoryPositions(
-    session.shop,
+    shop,
     products.map((p) => p.id),
   );
 
@@ -98,11 +172,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         daysRemaining: calculateDaysRemaining(effectiveStock, p.avgDailySales),
         displayName: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
       };
-    })
-    .filter((p) => statusFilter === "all" || p.status === statusFilter)
-    .filter((p) => locationFilter === "all" || p.locationBreakdown.some((l) => l.locationId === locationFilter));
+    });
+  // No trailing filters: search and location are applied in SQL and status is applied to
+  // the candidate set above. Re-filtering here would silently return fewer rows than the
+  // count promised whenever a status changed between the two queries.
 
-  const [suppliers, locations, settings, damageTally, writeOffTally] = await Promise.all([
+  const [suppliers, locations, settings, damageByProduct] = await Promise.all([
     prisma.supplier.findMany({
       where: { shop: session.shop },
       orderBy: { name: "asc" },
@@ -117,28 +192,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       where: { shop: session.shop },
       select: { courierifyApiKey: true },
     }),
-    // Damaged pipeline count = units removed via damage adjustments (§7.8)...
-    prisma.stockAdjustment.groupBy({
-      by: ["productId"],
-      where: { shop: session.shop, reason: "damage" },
-      _sum: { delta: true },
-    }),
-    // ...plus returned units written off from the returns queue.
-    prisma.returnItem.groupBy({
-      by: ["productId"],
-      where: { shop: session.shop, status: "written_off", productId: { not: null } },
-      _sum: { quantity: true },
-    }),
+    // Damaged pipeline count: units removed by damage adjustments, plus returned units
+    // written off from the returns queue (§7.8 of the integration contract).
+    getDamagedUnitsByProduct(session.shop),
   ]);
 
-  const damageByProduct = new Map<string, number>();
-  for (const d of damageTally) {
-    damageByProduct.set(d.productId, Math.abs(d._sum.delta ?? 0));
-  }
-  for (const w of writeOffTally) {
-    if (!w.productId) continue;
-    damageByProduct.set(w.productId, (damageByProduct.get(w.productId) ?? 0) + (w._sum.quantity ?? 0));
-  }
   const courierifyConnected = !!settings?.courierifyApiKey;
 
   const withPipeline = enriched.map((p) => ({
@@ -148,6 +206,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   return {
     products: withPipeline,
+    page,
     statusFilter,
     search,
     suppliers,
@@ -349,13 +408,14 @@ type CsvDiffRow = {
 };
 
 export default function Inventory() {
-  const { products, statusFilter, search, suppliers, locations, locationFilter, courierifyConnected } = useLoaderData<typeof loader>();
+  const { products, page, statusFilter, suppliers, locations, locationFilter, courierifyConnected } =
+    useLoaderData<typeof loader>();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const importFetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
-  const [, setSearchParams] = useSearchParams();
-  const [queryValue, setQueryValue] = useState(search);
+  const navigation = useNavigation();
+  const { searchInput, setSearchInput, setFilter, setPage, setPageSize } = useListParams();
   const [selected, setSelected] = useState<string[]>([]);
   const [drawerId, setDrawerId] = useState<string | null>(null);
   const [toast, setToast] = useState("");
@@ -472,39 +532,20 @@ export default function Inventory() {
     );
   };
 
-  useEffect(() => {
-    const t = setTimeout(() => {
-      setSearchParams((p) => {
-        const next = new URLSearchParams(p);
-        if (queryValue) next.set("search", queryValue);
-        else next.delete("search");
-        return next;
-      });
-    }, 300);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queryValue]);
+  const setStatusFilter = (value: string) => setFilter("status", value);
+  const setLocationFilter = (value: string) => setFilter("location", value);
+  const isNavigating = navigation.state === "loading";
 
-  const setStatusFilter = (value: string) => {
-    setSearchParams((p) => {
-      const next = new URLSearchParams(p);
-      if (value !== "all") next.set("status", value);
-      else next.delete("status");
-      return next;
-    });
-  };
-
-  const setLocationFilter = (value: string) => {
-    setSearchParams((p) => {
-      const next = new URLSearchParams(p);
-      if (value !== "all") next.set("location", value);
-      else next.delete("location");
-      return next;
-    });
-  };
-
-  const allSelected = products.length > 0 && selected.length === products.length;
-  const toggleAll = () => setSelected(allSelected ? [] : products.map((p) => p.id));
+  // "Select all" covers this page only. Selection is held in component state, so it does
+  // not survive a page change — saying "all" when it means "the 50 you can see" would be
+  // a lie the moment someone paginates and then generates POs.
+  const allSelected = products.length > 0 && products.every((p) => selected.includes(p.id));
+  const toggleAll = () =>
+    setSelected((s) =>
+      allSelected
+        ? s.filter((id) => !products.some((p) => p.id === id))
+        : [...new Set([...s, ...products.map((p) => p.id)])],
+    );
   const toggleOne = (id: string) =>
     setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
 
@@ -760,9 +801,9 @@ export default function Inventory() {
           >
             <span style={{ color: "var(--inv-muted)" }}>⌕</span>
             <input
-              value={queryValue}
+              value={searchInput}
               placeholder="Search product, variant or SKU"
-              onChange={(e) => setQueryValue(e.target.value)}
+              onChange={(e) => setSearchInput(e.target.value)}
               style={{ border: "none", outline: "none", flex: 1, fontSize: "13px", background: "transparent", color: "var(--inv-ink)" }}
             />
           </div>
@@ -797,8 +838,15 @@ export default function Inventory() {
               </label>
             </div>
             <DataTable columns={columns} rows={rows} />
-            <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginTop: "10px", textAlign: "center" }}>
-              Showing {products.length} variant{products.length !== 1 ? "s" : ""} · click a row for detail
+            <Pagination
+              page={page}
+              onPageChange={setPage}
+              onPageSizeChange={setPageSize}
+              itemLabel="variants"
+              busy={isNavigating}
+            />
+            <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginTop: "6px", textAlign: "center" }}>
+              Click a row for detail
             </div>
           </>
         )}

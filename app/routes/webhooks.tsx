@@ -4,6 +4,7 @@ import prisma from "../db.server";
 import { isCodOrder, parseCodGateways } from "../lib/cod.server";
 import { shopDateKey, shopWeekStart } from "../lib/tz.server";
 import { purgeShopData } from "../lib/shop-purge.server";
+import { applyInventoryLevelUpdate } from "../lib/stock.server";
 
 interface OrderPayload {
   id: number;
@@ -191,65 +192,19 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     case "INVENTORY_LEVELS_UPDATE": {
-      // Per-location update.
-      //
-      // The old handler wrote the single location's `available` straight into
-      // Product.currentStock, so on a multi-location shop the whole product collapsed to
-      // whichever location reported last. It also stored `available` in a field that
-      // means on-hand everywhere else. Now the level is written to the location it
-      // belongs to and currentStock is recomputed as the sum.
+      // Per-location update. The logic lives in lib/stock.server so it can be tested
+      // without standing up webhook authentication; see stock.db.test.ts.
       const data = payload as {
         inventory_item_id: number;
         available: number;
         location_id: number;
       };
-      const inventoryItemGid = `gid://shopify/InventoryItem/${data.inventory_item_id}`;
-      const locationGid = `gid://shopify/Location/${data.location_id}`;
-
-      const product = await prisma.product.findFirst({
-        where: { shop, inventoryItemId: inventoryItemGid },
-        select: { id: true },
-      });
-      if (!product) break;
-
-      const location = await prisma.location.findUnique({
-        where: { shop_shopifyLocationId: { shop, shopifyLocationId: locationGid } },
-        select: { id: true },
-      });
-
-      if (!location) {
-        // Unknown location (not yet synced): fall back to the aggregate so we do not
-        // lose the signal entirely, but do not invent per-location rows.
-        await prisma.product.update({
-          where: { id: product.id },
-          data: { currentStock: data.available },
-        });
-        break;
-      }
-
-      await prisma.$transaction(async (tx) => {
-        await tx.productLocationStock.upsert({
-          where: {
-            productId_locationId: { productId: product.id, locationId: location.id },
-          },
-          create: {
-            shop,
-            productId: product.id,
-            locationId: location.id,
-            onHand: data.available,
-            reserved: 0,
-          },
-          update: { onHand: data.available },
-        });
-        const agg = await tx.productLocationStock.aggregate({
-          where: { productId: product.id },
-          _sum: { onHand: true },
-        });
-        await tx.product.update({
-          where: { id: product.id },
-          data: { currentStock: agg._sum.onHand ?? 0 },
-        });
-      });
+      await applyInventoryLevelUpdate(
+        shop,
+        `gid://shopify/InventoryItem/${data.inventory_item_id}`,
+        `gid://shopify/Location/${data.location_id}`,
+        data.available,
+      );
       break;
     }
 

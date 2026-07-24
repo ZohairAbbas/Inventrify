@@ -4,6 +4,7 @@ import type { loader as appLoader } from "./app";
 import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { resolveDateRange } from "../lib/date-range";
+import { getRtoByCarrier } from "../lib/rto-attribution.server";
 import {
   getSalesTrend,
   getPeriodComparison,
@@ -26,7 +27,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const deadStockDays = settings?.deadStockDays ?? 60;
   const deadStockMinUnits = settings?.deadStockMinUnits ?? 20;
 
-  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, codFunnel] =
+  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, rtoByCarrier, codFunnel] =
     await Promise.all([
     getSalesTrend(shop, range),
     getPeriodComparison(shop, range),
@@ -38,12 +39,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getStatusDistribution(shop),
     getHighReturnRateProducts(shop, 10),
     getRtoByRegion(shop, range),
+    getRtoByCarrier(shop, range),
     getCodFunnel(shop, range),
   ]);
 
   return {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, range, deadStockDays,
+    codFunnel, rtoByCarrier, range, deadStockDays,
   };
 };
 
@@ -57,7 +59,7 @@ const SEGMENT_COLORS: Record<string, string> = {
 export default function Analytics() {
   const {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, range, deadStockDays,
+    codFunnel, rtoByCarrier, range, deadStockDays,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -271,12 +273,76 @@ export default function Analytics() {
               ))}
             </div>
             {codFunnel.attritionRate > 0 && (
-              <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "10px" }}>
+              <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "10px", lineHeight: 1.5 }}>
                 <strong style={{ color: codFunnel.attritionRate >= 0.3 ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)" }}>
-                  {(codFunnel.attritionRate * 100).toFixed(0)}%
+                  {(codFunnel.attritionRate * 100).toFixed(1)}%
                 </strong>{" "}
-                of placed COD orders never reached dispatch — forecasts built on placed
-                orders are overstated by roughly that much.
+                of COD orders that were not cancelled ({codFunnel.pending} of{" "}
+                {codFunnel.placed - codFunnel.cancelled}) quietly never reached dispatch, so
+                demand is overstated by roughly that much.
+                {codFunnel.cancelled > 0 && (
+                  <>
+                    {" "}
+                    The {codFunnel.cancelled} cancelled order
+                    {codFunnel.cancelled === 1 ? "" : "s"} {codFunnel.cancelled === 1 ? "is" : "are"}{" "}
+                    excluded — those units were already removed from demand when the
+                    cancellation came in.
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {rtoByCarrier.length > 0 && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
+              <div style={{ fontSize: "14px", fontWeight: 600 }}>RTO by carrier</div>
+              <Pill label="Shopify tracking" bg="var(--inv-status-low-bg)" fg="var(--inv-status-low-fg)" />
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "10px" }}>
+              {range.label}, carriers with at least 10 resolved units. The spread between
+              couriers on the same lane is often wider than the spread between products,
+              and unlike a product mix it can be changed next week.
+            </div>
+            <DataTable
+              columns={[
+                { header: "Carrier", width: "2fr" },
+                { header: "Delivered", width: "1fr", align: "right" },
+                { header: "Not delivered", width: "1fr", align: "right" },
+                { header: "In route", width: "1fr", align: "right" },
+                { header: "RTO rate", width: "1fr", align: "right" },
+              ]}
+              rows={rtoByCarrier.map((c) => ({
+                key: c.carrier,
+                cells: [
+                  <span key="c" style={{ fontWeight: 500 }}>{c.carrier}</span>,
+                  <span key="d" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.deliveredUnits}</span>,
+                  <span key="n" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.notDeliveredUnits}</span>,
+                  <span key="t" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>{c.inRouteUnits}</span>,
+                  <span
+                    key="r"
+                    style={{
+                      fontFamily: "var(--inv-font-mono)",
+                      fontWeight: 600,
+                      color:
+                        c.rtoRate >= 0.4
+                          ? "var(--inv-status-stockout-fg)"
+                          : c.rtoRate >= 0.25
+                            ? "var(--inv-status-critical-fg)"
+                            : "var(--inv-status-healthy-fg)",
+                    }}
+                  >
+                    {(c.rtoRate * 100).toFixed(1)}%
+                  </span>,
+                ],
+              }))}
+            />
+            {rtoByCarrier.length > 1 && (
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginTop: "8px" }}>
+                {rtoByCarrier[0].carrier} returns{" "}
+                {((rtoByCarrier[0].rtoRate - rtoByCarrier[rtoByCarrier.length - 1].rtoRate) * 100).toFixed(1)}
+                {" "}points more often than {rtoByCarrier[rtoByCarrier.length - 1].carrier} on this period's volume.
               </div>
             )}
           </div>

@@ -7,8 +7,14 @@ import { useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { Button, Card, DataTable, PageHead, POStatusPill, ProductThumb, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
-import { applyLocationDelta, resolveDefaultLocationId } from "../lib/stock.server";
-import { updateLeadTimeStats } from "../lib/lead-time.server";
+import {
+  markPurchaseOrderSent,
+  parseReceivedQuantities,
+  receivePurchaseOrder,
+  validateDraftLines,
+  validateSupplierId,
+} from "../lib/purchase-order.server";
+import { parseFormDate } from "../lib/date-range";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -50,13 +56,24 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const quantities = formData.getAll("quantity") as string[];
     const unitCosts = formData.getAll("unitCost") as string[];
 
-    if (productIds.length === 0) return { ok: false as const, error: "Add at least one product", action: "" };
+    // Product and supplier ids come from the form, so they are attacker-controlled and
+    // must be checked against this shop before anything is linked to the PO.
+    const { items, error: lineError } = await validateDraftLines(
+      shop,
+      productIds.map((id, i) => ({
+        productId: id,
+        quantity: quantities[i] ?? null,
+        unitCost: unitCosts[i] ?? null,
+      })),
+    );
+    if (lineError) return { ok: false as const, error: lineError, action: "" };
 
-    const items = productIds.map((id, i) => ({
-      productId: id,
-      quantityOrdered: parseInt(quantities[i] ?? "0", 10),
-      unitCost: parseFloat(unitCosts[i] ?? "0"),
-    }));
+    const { supplierId: ownedSupplierId, error: supplierError } = await validateSupplierId(
+      shop,
+      supplierId,
+    );
+    if (supplierError) return { ok: false as const, error: supplierError, action: "" };
+
     const totalCost = items.reduce((s, item) => s + item.quantityOrdered * item.unitCost, 0);
 
     await prisma.$transaction([
@@ -64,7 +81,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       prisma.purchaseOrder.update({
         where: { id: po.id },
         data: {
-          supplierId,
+          supplierId: ownedSupplierId,
           notes,
           totalCost,
           items: { create: items },
@@ -76,123 +93,47 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   if (intent === "mark_sent") {
-    if (po.status !== "draft") return { ok: false as const, error: "Only draft POs can be marked sent", action: "" };
     const expectedDelivery = formData.get("expectedDeliveryDate") as string;
-    await prisma.purchaseOrder.update({
-      where: { id: po.id },
-      data: {
-        status: "sent",
-        // Stamped so supplier lead time can be measured sent -> received. Measuring
-        // from createdAt counted however long the draft sat unsent, which inflated
-        // the supplier's average lead time and every safety stock derived from it.
-        sentAt: new Date(),
-        expectedDeliveryDate: expectedDelivery ? new Date(expectedDelivery) : null,
-      },
-    });
+    const parsedExpected = parseFormDate(expectedDelivery);
+    if (expectedDelivery && !parsedExpected) {
+      return { ok: false as const, error: "Expected delivery date is not a valid date", action: "" };
+    }
+
+    const result = await markPurchaseOrderSent(shop, po.id, parsedExpected);
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not mark sent", action: "" };
     return { ok: true as const, action: "sent", error: "" };
   }
 
   if (intent === "mark_received") {
-    if (po.status === "received") return { ok: false as const, error: "Already received", action: "" };
     const actualDelivery = formData.get("actualDeliveryDate") as string;
-
-    // Receipts go through the per-location path.
-    //
-    // Incrementing Product.currentStock directly left ProductLocationStock untouched
-    // and never told Shopify. Since syncShopifyInventory recomputes currentStock as the
-    // sum of per-location on-hand, the received units silently disappeared at the next
-    // sync — and Shopify never knew the stock had arrived at all.
-    const receiptLocationId = await resolveDefaultLocationId(
-      shop,
-      (formData.get("locationId") as string) || null,
-    );
-    const receiveErrors: string[] = [];
-
-    for (const item of po.items) {
-      const receivedQty = parseInt(
-        (formData.get(`received_${item.id}`) as string) ?? String(item.quantityOrdered),
-        10,
-      );
-      if (isNaN(receivedQty) || receivedQty < 0) continue;
-
-      // Only the not-yet-received remainder moves, so re-confirming a partially
-      // received PO cannot double-count stock.
-      const delta = receivedQty - item.quantityReceived;
-
-      if (delta !== 0) {
-        if (receiptLocationId) {
-          const res = await applyLocationDelta(
-            admin,
-            shop,
-            item.productId,
-            receiptLocationId,
-            delta,
-          );
-          if (!res.ok) {
-            receiveErrors.push(res.error ?? "stock update failed");
-            continue;
-          }
-          if (res.shopifyError) receiveErrors.push(res.shopifyError);
-        } else {
-          // No locations synced yet — fall back to the aggregate count.
-          await prisma.product.update({
-            where: { id: item.productId },
-            data: { currentStock: { increment: delta } },
-          });
-        }
-      }
-
-      await prisma.purchaseOrderItem.update({
-        where: { id: item.id },
-        data: { quantityReceived: receivedQty },
-      });
+    const parsedActual = parseFormDate(actualDelivery);
+    if (actualDelivery && !parsedActual) {
+      return { ok: false as const, error: "Actual delivery date is not a valid date", action: "" };
     }
 
-    await prisma.purchaseOrder.update({
-      where: { id: po.id },
-      data: {
-        status: "received",
-        actualDeliveryDate: actualDelivery ? new Date(actualDelivery) : new Date(),
-      },
+    const result = await receivePurchaseOrder(admin, shop, po.id, {
+      actualDeliveryDate: parsedActual,
+      locationId: (formData.get("locationId") as string) || null,
+      quantities: parseReceivedQuantities(
+        formData,
+        po.items.map((i) => i.id),
+      ),
     });
 
-    // Lead time is measured from when the PO was actually sent.
-    if (po.supplierId && po.sentAt) {
-      const receivedDate = actualDelivery ? new Date(actualDelivery) : new Date();
-      const actualLeadDays = Math.max(
-        1,
-        Math.round((receivedDate.getTime() - po.sentAt.getTime()) / 86400000),
-      );
-
-      const supplier = await prisma.supplier.findFirst({
-        where: { id: po.supplierId, shop },
-      });
-      if (supplier) {
-        const stats = updateLeadTimeStats(
-          {
-            count: supplier.totalPosReceived,
-            mean: supplier.avgActualLeadTime,
-            m2: supplier.leadTimeM2,
-          },
-          actualLeadDays,
-        );
-
-        await prisma.supplier.update({
-          where: { id: po.supplierId },
-          data: {
-            totalPosReceived: stats.count,
-            avgActualLeadTime: stats.mean,
-            leadTimeM2: stats.m2,
-            leadTimeVariance: stats.stdDev,
-          },
-        });
-      }
+    if (!result.ok) {
+      return { ok: false as const, error: result.error ?? "Could not receive", action: "" };
     }
 
+    // A partial failure still receives what it could; the merchant needs to know which
+    // lines did not move rather than seeing an unqualified success.
+    const problems = [
+      ...result.lines.filter((l) => l.error).map((l) => l.error as string),
+      ...result.shopifyWarnings,
+    ];
     return {
       ok: true as const,
       action: "received",
-      error: receiveErrors.length > 0 ? receiveErrors.join("; ") : "",
+      error: problems.length > 0 ? problems.join("; ") : "",
     };
   }
 

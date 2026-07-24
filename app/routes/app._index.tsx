@@ -11,6 +11,7 @@ import {
   calculateDaysRemaining,
 } from "../lib/forecast.server";
 import { getFulfilmentBreakdown, getRtoFreshness } from "../lib/rto-attribution.server";
+import { getDamagedUnitsTotal } from "../lib/damage.server";
 import { previousRange, resolveDateRange } from "../lib/date-range";
 import {
   computeProcurementPlan,
@@ -56,7 +57,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // Delivered/In-transit/Returned are the live per-variant snapshot Courierify syncs onto
   // Product.fulfilled*. Damaged mirrors the inventory page's tally: damage stock-adjustments
   // plus returned units written off from the queue (§7.8 of the integration contract).
-  const [settings, damageTally, writeOffTally] = await Promise.all([
+  const [settings, pipeDamaged] = await Promise.all([
     prisma.shopSettings.findUnique({
       where: { shop },
       select: {
@@ -70,34 +71,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     // Windowed to match the fulfilment stages this is displayed beside. An all-time
     // damage tally under a "last N days" heading is the same mistake as the delivery
     // pipeline showing 90-day figures next to a 30-day breakdown.
-    prisma.stockAdjustment.groupBy({
-      by: ["productId"],
-      where: {
-        shop,
-        reason: "damage",
-        createdAt: { gte: range.from, lt: range.to },
-      },
-      _sum: { delta: true },
-    }),
-    prisma.returnItem.groupBy({
-      by: ["productId"],
-      where: {
-        shop,
-        status: "written_off",
-        productId: { not: null },
-        resolvedAt: { gte: range.from, lt: range.to },
-      },
-      _sum: { quantity: true },
-    }),
+    getDamagedUnitsTotal(shop, { from: range.from, to: range.to }),
   ]);
 
   const courierifyConnected = !!settings?.courierifyApiKey;
   const pipeDelivered = products.reduce((sum, p) => sum + (p.fulfilledDelivered || 0), 0);
   const pipeInTransit = products.reduce((sum, p) => sum + (p.fulfilledInTransit || 0), 0);
   const pipeReturned = products.reduce((sum, p) => sum + (p.fulfilledReturned || 0), 0);
-  let pipeDamaged = 0;
-  for (const d of damageTally) pipeDamaged += Math.abs(d._sum.delta ?? 0);
-  for (const w of writeOffTally) pipeDamaged += w._sum.quantity ?? 0;
 
   // Return rate over resolved shipments (delivered + returned); damage rate over all handled.
   const retDenom = pipeDelivered + pipeReturned;

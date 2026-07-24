@@ -236,7 +236,15 @@ export interface CodFunnel {
   pending: number;
   /** False when the merchant has not told us which tag marks an order confirmed. */
   confirmationTracked: boolean;
-  /** Share of placed orders that never reached dispatch. */
+  /**
+   * Share of *non-cancelled* COD orders that quietly never reached dispatch.
+   *
+   * Cancellations are excluded from both halves deliberately. They are already backed
+   * out of demand by the orders/cancelled webhook, so counting them here would describe
+   * an overstatement that has in fact already been corrected — and it made the card
+   * contradict itself, reporting "9.1% never reached dispatch" (68 orders) directly
+   * beneath a "Never dispatched" tile reading 42.
+   */
   attritionRate: number;
 }
 
@@ -270,6 +278,10 @@ export async function getCodFunnel(shop: string, range: DateRange): Promise<CodF
   ]);
 
   const pending = Math.max(0, placed - dispatched - cancelled);
+  // The denominator is orders that could still have shipped. A cancelled order did not
+  // "quietly fail to dispatch" — it was deliberately stopped, and its demand has already
+  // been removed from SalesRecord by the webhook.
+  const exposed = placed - cancelled;
 
   return {
     placed,
@@ -278,6 +290,6 @@ export async function getCodFunnel(shop: string, range: DateRange): Promise<CodF
     cancelled,
     pending,
     confirmationTracked,
-    attritionRate: placed > 0 ? (placed - dispatched) / placed : 0,
+    attritionRate: exposed > 0 ? pending / exposed : 0,
   };
 }

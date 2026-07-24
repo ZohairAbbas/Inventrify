@@ -123,14 +123,21 @@ export interface InventoryPosition {
  */
 export async function getInventoryPositions(
   shop: string,
-  productIds: string[],
+  productIds?: string[],
 ): Promise<Map<string, InventoryPosition>> {
   const result = new Map<string, InventoryPosition>();
-  if (productIds.length === 0) return result;
+  // An explicit empty list means "nothing to look up"; omitting the argument entirely
+  // means "the whole shop". The distinction matters because the inventory page has to
+  // know every product's position before it can filter by stock status, and threading
+  // fifty thousand ids through an IN clause to say "all of them" is worse than not
+  // narrowing at all.
+  if (productIds && productIds.length === 0) return result;
+  const scope = productIds ? { id: { in: productIds } } : {};
+  const idScope = productIds ? { productId: { in: productIds } } : {};
 
   const [products, reservedRows, onOrderRows] = await Promise.all([
     prisma.product.findMany({
-      where: { shop, id: { in: productIds } },
+      where: { shop, isArchived: false, ...scope },
       select: {
         id: true,
         currentStock: true,
@@ -142,13 +149,13 @@ export async function getInventoryPositions(
     }),
     prisma.productLocationStock.groupBy({
       by: ["productId"],
-      where: { shop, productId: { in: productIds } },
+      where: { shop, ...idScope },
       _sum: { reserved: true },
     }),
     // Outstanding = ordered minus already received, on POs that are sent.
     prisma.purchaseOrderItem.findMany({
       where: {
-        productId: { in: productIds },
+        ...idScope,
         purchaseOrder: { shop, status: "sent" },
       },
       select: { productId: true, quantityOrdered: true, quantityReceived: true },
@@ -169,7 +176,7 @@ export async function getInventoryPositions(
   // part of RTO inbound; the fulfilment snapshot covers what is still in transit.
   const pendingReturns = await prisma.returnItem.groupBy({
     by: ["productId"],
-    where: { shop, productId: { in: productIds }, status: "pending" },
+    where: { shop, ...idScope, status: "pending" },
     _sum: { quantity: true },
   });
   const pendingById = new Map(

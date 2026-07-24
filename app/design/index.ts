@@ -23,3 +23,6 @@ export { BarChart } from "./BarChart";
 export { ProductThumb } from "./ProductThumb";
 export { ProductPicker } from "./ProductPicker";
 export type { PickerProduct } from "./ProductPicker";
+export { Pagination } from "./Pagination";
+export { ProductCombobox } from "./ProductCombobox";
+export type { ComboboxProduct } from "./ProductCombobox";

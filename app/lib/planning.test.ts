@@ -9,7 +9,12 @@ import {
   type ProcurementInput,
 } from "./planning.server";
 import { updateLeadTimeStats } from "./lead-time.server";
-import { calculateReorderPoint, forecastDemand, getStockStatus } from "./forecast.server";
+import {
+  calculateReorderPoint,
+  dueAtForHorizon,
+  forecastDemand,
+  getStockStatus,
+} from "./forecast.server";
 import { calculateSafetyStock } from "./safety-stock.server";
 
 const base: ProcurementInput = {
@@ -309,5 +314,32 @@ describe("ABC / XYZ classification", () => {
   it("holds a higher service level for A items than for the tail", () => {
     expect(serviceLevelZFor("A", 1.65)).toBeGreaterThan(serviceLevelZFor("C", 1.65));
     expect(serviceLevelZFor("B", 1.65)).toBe(1.65);
+  });
+});
+
+describe("dueAtForHorizon", () => {
+  it("lands on midnight UTC regardless of when the forecast ran", () => {
+    // The unique key on ForecastAccuracy is (product, horizon, dueAt). Carrying the time
+    // of day made every planning run a new pending row instead of updating that
+    // horizon-day's prediction — one shop accumulated three rows per product per horizon
+    // from three runs minutes apart.
+    const morning = dueAtForHorizon(new Date("2026-07-22T06:04:11.000Z"), 30);
+    const evening = dueAtForHorizon(new Date("2026-07-22T16:56:48.743Z"), 30);
+
+    expect(morning.toISOString()).toBe("2026-08-21T00:00:00.000Z");
+    expect(evening.toISOString()).toBe(morning.toISOString());
+  });
+
+  it("keeps the horizons distinct", () => {
+    const from = new Date("2026-07-22T16:21:42.915Z");
+    expect(dueAtForHorizon(from, 30).toISOString()).toBe("2026-08-21T00:00:00.000Z");
+    expect(dueAtForHorizon(from, 60).toISOString()).toBe("2026-09-20T00:00:00.000Z");
+    expect(dueAtForHorizon(from, 90).toISOString()).toBe("2026-10-20T00:00:00.000Z");
+  });
+
+  it("still separates runs on different days", () => {
+    const a = dueAtForHorizon(new Date("2026-07-22T23:59:59.000Z"), 30);
+    const b = dueAtForHorizon(new Date("2026-07-23T00:00:01.000Z"), 30);
+    expect(a.toISOString()).not.toBe(b.toISOString());
   });
 });

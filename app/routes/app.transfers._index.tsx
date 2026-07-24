@@ -1,25 +1,43 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData, Link } from "@remix-run/react";
+import { useLoaderData, useFetcher, useNavigate, useNavigation, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
 import { formatDate } from "../lib/format";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, FilterChips, PageHead, TransferStatusPill, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, FilterChips, PageHead, Pagination, TransferStatusPill, type DataTableColumn } from "../design";
+import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
+import { useListParams } from "../lib/use-list-params";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
+  const url = new URL(request.url);
+  const statusFilter = url.searchParams.get("status") ?? "all";
+  const search = parseSearch(url.searchParams);
+  const pageRequest = parsePageRequest(url.searchParams);
+
+  const where = {
+    shop: session.shop,
+    ...(statusFilter !== "all" ? { status: statusFilter } : {}),
+    ...(search ? { transferNumber: { contains: search, mode: "insensitive" as const } } : {}),
+  };
+
+  const page = resolvePage(pageRequest, await prisma.stockTransfer.count({ where }));
+
   const transfers = await prisma.stockTransfer.findMany({
-    where: { shop: session.shop },
+    where,
     include: {
       fromLocation: { select: { name: true } },
       toLocation: { select: { name: true } },
       items: { select: { quantitySent: true } },
     },
-    orderBy: { createdAt: "desc" },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    skip: page.skip,
+    take: page.take,
   });
-  return { transfers };
+
+  return { transfers, page, statusFilter };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
@@ -45,11 +63,12 @@ const STATUS_TABS = [
 ];
 
 export default function StockTransfers() {
-  const { transfers } = useLoaderData<typeof loader>();
+  const { transfers, page, statusFilter } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const navigate = useNavigate();
-  const [filter, setFilter] = useState("all");
+  const navigation = useNavigation();
+  const { searchInput, setSearchInput, setFilter, setPage, setPageSize } = useListParams();
   const { timezone = "UTC", theme = "emerald" } =
     useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
 
@@ -58,8 +77,6 @@ export default function StockTransfers() {
   }, [fetcher.data, shopify]);
 
   const submit = (data: Record<string, string>) => fetcher.submit(data, { method: "POST" });
-
-  const list = transfers.filter((t) => filter === "all" || t.status === filter);
 
   const columns: DataTableColumn[] = [
     { header: "Transfer #", width: "1.4fr" },
@@ -72,7 +89,7 @@ export default function StockTransfers() {
     { header: "", width: "1.4fr", align: "right" },
   ];
 
-  const rows = list.map((t) => {
+  const rows = transfers.map((t) => {
     const units = t.items.reduce((s, i) => s + i.quantitySent, 0);
     return {
       key: t.id,
@@ -117,12 +134,34 @@ export default function StockTransfers() {
           right={<Button variant="primary" onClick={() => navigate("/app/transfers/new")}>+ New transfer</Button>}
         />
 
-        <FilterChips options={STATUS_TABS} active={filter} onChange={setFilter} />
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "12px", flexWrap: "wrap" }}>
+          <div
+            style={{
+              flex: 1, minWidth: "220px", display: "flex", alignItems: "center", gap: "9px",
+              background: "#fff", border: "1px solid var(--inv-input-border)",
+              borderRadius: "10px", padding: "0 12px", height: "38px",
+            }}
+          >
+            <span style={{ color: "var(--inv-muted)" }}>⌕</span>
+            <input
+              value={searchInput}
+              placeholder="Search transfer number"
+              onChange={(e) => setSearchInput(e.target.value)}
+              style={{ border: "none", outline: "none", flex: 1, fontSize: "13px", background: "transparent", color: "var(--inv-ink)" }}
+            />
+          </div>
+        </div>
+
+        <FilterChips options={STATUS_TABS} active={statusFilter} onChange={(v) => setFilter("status", v)} />
 
         {transfers.length === 0 ? (
           <Card padding="40px 24px">
             <div style={{ textAlign: "center" }}>
-              <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>No stock transfers yet</div>
+              <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>
+                {page.totalItems === 0 && !searchInput && statusFilter === "all"
+                  ? "No stock transfers yet"
+                  : "No transfers match these filters"}
+              </div>
               <div style={{ fontSize: "13px", color: "var(--inv-muted)", marginBottom: "16px" }}>
                 Move inventory between your locations — create a transfer, ship it, then receive it.
               </div>
@@ -130,7 +169,16 @@ export default function StockTransfers() {
             </div>
           </Card>
         ) : (
-          <DataTable columns={columns} rows={rows} />
+          <>
+            <DataTable columns={columns} rows={rows} />
+            <Pagination
+              page={page}
+              onPageChange={setPage}
+              onPageSizeChange={setPageSize}
+              itemLabel="transfers"
+              busy={navigation.state === "loading"}
+            />
+          </>
         )}
       </div>
     </div>

@@ -262,12 +262,19 @@ model StockAdjustment {
   productId String
   product   Product  @relation(fields: [productId], references: [id])
   delta      Int      // positive=added, negative=removed
-  reason     String   // damage | count_correction | sample | return | other
+  reason     String   // damage | count_correction | sample | return | other | reversal
   note       String?
   locationId String?  // Location.id this adjustment applied to (null = legacy/primary)
+  // Set on a reversal row, naming the adjustment it undoes. Unique, so the database
+  // itself guarantees an adjustment is reversed at most once: two clicks on "Reverse"
+  // (or one double-submit) previously created two opposing movements and swung stock by
+  // twice the original delta, with nothing in the audit trail to show why.
+  reversalOf String?  @unique
   createdAt  DateTime @default(now())
 
   @@index([shop, productId])
+  @@index([shop, reason])
+  @@index([shop, createdAt])
 }
 
 // COD return rate per product per week (trend tracking)

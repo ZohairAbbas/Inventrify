@@ -6,6 +6,7 @@ import { useState, useCallback, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { Button, Card, PageHead, SelectInput, TextArea, TextInput } from "../design";
+import { validateDraftLines } from "../lib/purchase-order.server";
 
 function generateTransferNumber(): string {
   const d = new Date();
@@ -39,13 +40,25 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   if (!fromLocationId || !toLocationId) return { error: "Pick both a source and destination location" };
   if (fromLocationId === toLocationId) return { error: "Source and destination must be different locations" };
-  if (productIds.length === 0) return { error: "Add at least one product" };
 
-  const items = productIds
-    .map((id, i) => ({ productId: id, quantitySent: parseInt(quantities[i] ?? "0", 10) }))
-    .filter((it) => it.quantitySent > 0);
+  // Locations and products both arrive from the form. Without this check a crafted POST
+  // could move another tenant's stock, or move this shop's stock into their warehouse.
+  const locations = await prisma.location.findMany({
+    where: { shop: session.shop, id: { in: [fromLocationId, toLocationId] } },
+    select: { id: true },
+  });
+  if (locations.length !== 2) return { error: "Pick two locations from this shop" };
 
-  if (items.length === 0) return { error: "Each line must have a quantity greater than zero" };
+  const { items: validated, error: lineError } = await validateDraftLines(
+    session.shop,
+    productIds.map((id, i) => ({ productId: id, quantity: quantities[i] ?? null })),
+  );
+  if (lineError) return { error: lineError };
+
+  const items = validated.map((line) => ({
+    productId: line.productId,
+    quantitySent: line.quantityOrdered,
+  }));
 
   await prisma.stockTransfer.create({
     data: {

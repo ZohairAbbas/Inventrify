@@ -6,7 +6,8 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { useState, useCallback, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, PageHead, SelectInput, TextArea, TextInput } from "../design";
+import { Button, Card, PageHead, ProductCombobox, SelectInput, TextArea, TextInput } from "../design";
+import { validateDraftLines, validateSupplierId } from "../lib/purchase-order.server";
 
 function generatePoNumber(): string {
   const d = new Date();
@@ -19,10 +20,16 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const url = new URL(request.url);
 
-  const products = await prisma.product.findMany({
-    where: { shop: session.shop },
-    orderBy: { title: "asc" },
-  });
+  // The catalogue is no longer loaded here: the line-item picker searches on demand via
+  // /api/products/search. Only the prefilled product (arriving from a reorder link) is
+  // resolved, so its name can be shown before any search runs.
+  const prefilledProductId = url.searchParams.get("product");
+  const prefilled = prefilledProductId
+    ? await prisma.product.findFirst({
+        where: { id: prefilledProductId, shop: session.shop },
+        select: { id: true, title: true, variantTitle: true, unitCost: true },
+      })
+    : null;
 
   const suppliers = await prisma.supplier.findMany({
     where: { shop: session.shop },
@@ -30,9 +37,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   });
 
   return {
-    products,
     suppliers,
-    prefilledProductId: url.searchParams.get("product"),
+    prefilled: prefilled
+      ? {
+          id: prefilled.id,
+          label: prefilled.variantTitle ? `${prefilled.title} — ${prefilled.variantTitle}` : prefilled.title,
+          unitCost: prefilled.unitCost,
+        }
+      : null,
     prefilledQty: url.searchParams.get("qty"),
   };
 };
@@ -47,23 +59,31 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const quantities = formData.getAll("quantity") as string[];
   const unitCosts = formData.getAll("unitCost") as string[];
 
-  if (productIds.length === 0) return { error: "Add at least one product" };
+  // Ids posted from the form are attacker-controlled; validate them against this shop
+  // before linking anything to the new PO.
+  const { items, error: lineError } = await validateDraftLines(
+    session.shop,
+    productIds.map((id, i) => ({
+      productId: id,
+      quantity: quantities[i] ?? null,
+      unitCost: unitCosts[i] ?? null,
+    })),
+  );
+  if (lineError) return { error: lineError };
 
-  const poNumber = generatePoNumber();
-
-  const items = productIds.map((id, i) => ({
-    productId: id,
-    quantityOrdered: parseInt(quantities[i] ?? "0", 10),
-    unitCost: parseFloat(unitCosts[i] ?? "0"),
-  }));
+  const { supplierId: ownedSupplierId, error: supplierError } = await validateSupplierId(
+    session.shop,
+    supplierId || null,
+  );
+  if (supplierError) return { error: supplierError };
 
   const totalCost = items.reduce((s, item) => s + item.quantityOrdered * item.unitCost, 0);
 
   await prisma.purchaseOrder.create({
     data: {
       shop: session.shop,
-      poNumber,
-      supplierId: supplierId || null,
+      poNumber: generatePoNumber(),
+      supplierId: ownedSupplierId,
       notes: notes || null,
       totalCost,
       items: { create: items },
@@ -75,12 +95,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
 interface LineItem {
   productId: string;
+  /** Kept alongside the id so the picker can render a chosen product before searching. */
+  label: string;
   quantity: number;
   unitCost: number;
 }
 
 export default function NewPurchaseOrder() {
-  const { products, suppliers, prefilledProductId, prefilledQty } = useLoaderData<typeof loader>();
+  const { suppliers, prefilled, prefilledQty } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
   const { currency = "USD", theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -88,10 +110,17 @@ export default function NewPurchaseOrder() {
   const [supplierId, setSupplierId] = useState("");
   const [notes, setNotes] = useState("");
   const [lines, setLines] = useState<LineItem[]>(() => {
-    if (prefilledProductId) {
-      return [{ productId: prefilledProductId, quantity: parseInt(prefilledQty ?? "10", 10), unitCost: 0 }];
+    if (prefilled) {
+      const qty = parseInt(prefilledQty ?? "", 10);
+      return [{
+        productId: prefilled.id,
+        label: prefilled.label,
+        // Seeded from the product's own cost so the PO total is not zero on arrival.
+        quantity: Number.isFinite(qty) && qty > 0 ? qty : 1,
+        unitCost: prefilled.unitCost,
+      }];
     }
-    return [{ productId: products[0]?.id ?? "", quantity: 1, unitCost: 0 }];
+    return [{ productId: "", label: "", quantity: 1, unitCost: 0 }];
   });
 
   const isBusy = fetcher.state !== "idle";
@@ -104,17 +133,23 @@ export default function NewPurchaseOrder() {
   }, [fetcher.data, error, navigate]);
 
   const addLine = useCallback(() => {
-    setLines((l) => [...l, { productId: products[0]?.id ?? "", quantity: 1, unitCost: 0 }]);
-  }, [products]);
+    setLines((l) => [...l, { productId: "", label: "", quantity: 1, unitCost: 0 }]);
+  }, []);
 
   const removeLine = useCallback((idx: number) => {
     setLines((l) => l.filter((_, i) => i !== idx));
   }, []);
 
-  const updateLine = useCallback((idx: number, field: keyof LineItem, value: string) => {
+  const updateLine = useCallback((idx: number, field: "quantity" | "unitCost", value: string) => {
+    setLines((l) => l.map((line, i) => (i === idx ? { ...line, [field]: parseFloat(value) || 0 } : line)));
+  }, []);
+
+  const setLineProduct = useCallback((idx: number, id: string, label: string, unitCost?: number) => {
     setLines((l) =>
       l.map((line, i) =>
-        i === idx ? { ...line, [field]: field === "productId" ? value : parseFloat(value) || 0 } : line,
+        i === idx
+          ? { ...line, productId: id, label, unitCost: line.unitCost || unitCost || 0 }
+          : line,
       ),
     );
   }, []);
@@ -180,11 +215,11 @@ export default function NewPurchaseOrder() {
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
             {lines.map((line, idx) => (
               <div key={idx} style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 1fr 1fr auto", gap: "10px", alignItems: "center" }}>
-                <SelectInput value={line.productId} onChange={(e) => updateLine(idx, "productId", e.target.value)}>
-                  {products.map((p) => (
-                    <option key={p.id} value={p.id}>{p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title}</option>
-                  ))}
-                </SelectInput>
+                <ProductCombobox
+                  value={line.productId}
+                  valueLabel={line.label || null}
+                  onChange={(id, product) => setLineProduct(idx, id, product?.label ?? "", product?.currentStock !== undefined ? undefined : undefined)}
+                />
                 <TextInput
                   type="number"
                   min={1}
@@ -221,7 +256,11 @@ export default function NewPurchaseOrder() {
           <Link to="/app/purchase-orders">
             <Button variant="ghost">Cancel</Button>
           </Link>
-          <Button variant="primary" disabled={isBusy || lines.length === 0} onClick={handleSubmit}>
+          <Button
+            variant="primary"
+            disabled={isBusy || lines.length === 0 || lines.some((l) => !l.productId)}
+            onClick={handleSubmit}
+          >
             Create PO
           </Button>
         </div>

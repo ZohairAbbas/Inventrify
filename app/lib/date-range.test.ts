@@ -3,6 +3,7 @@ import {
   DEFAULT_RANGE_DAYS,
   HISTORY_WINDOW_DAYS,
   MAX_RANGE_DAYS,
+  parseFormDate,
   previousRange,
   resolveDateRange,
 } from "./date-range";
@@ -95,5 +96,38 @@ describe("previousRange", () => {
     const r = resolve("range=30");
     const p = previousRange(r);
     expect(Math.round((p.to.getTime() - p.from.getTime()) / 86400000)).toBe(30);
+  });
+});
+
+describe("parseFormDate", () => {
+  it("parses a date-input value at UTC midnight", () => {
+    // A date picker yields a calendar date, not an instant, so it must not be shifted
+    // by the server's timezone — otherwise a delivery recorded in Karachi lands on the
+    // previous day for a server running in UTC-5.
+    expect(parseFormDate("2026-07-15")?.toISOString()).toBe("2026-07-15T00:00:00.000Z");
+  });
+
+  it("treats blank and missing input as 'not supplied'", () => {
+    expect(parseFormDate("")).toBeNull();
+    expect(parseFormDate("   ")).toBeNull();
+    expect(parseFormDate(null)).toBeNull();
+  });
+
+  it("rejects malformed input rather than inventing a date", () => {
+    // `new Date(...)` accepts all of these — some as Invalid Date, which Prisma then
+    // rejects at write time, and some as a real date nobody meant.
+    expect(parseFormDate("15/07/2026")).toBeNull();
+    expect(parseFormDate("2026-7-5")).toBeNull();
+    expect(parseFormDate("not a date")).toBeNull();
+    expect(parseFormDate("26-07-15")).toBeNull();
+  });
+
+  it("rejects an out-of-range calendar date", () => {
+    expect(parseFormDate("2026-13-01")).toBeNull();
+    expect(parseFormDate("2026-02-31")).toBeNull();
+  });
+
+  it("trims surrounding whitespace", () => {
+    expect(parseFormDate(" 2026-07-15 ")?.toISOString()).toBe("2026-07-15T00:00:00.000Z");
   });
 });

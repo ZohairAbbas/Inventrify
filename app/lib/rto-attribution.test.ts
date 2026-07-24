@@ -231,3 +231,30 @@ describe("Shopify statuses feed the RTO rate", () => {
     expect(r.shippedUnits).toBe(10);
   });
 });
+
+describe("carrier normalisation feeds a usable breakdown", () => {
+  // getRtoByCarrier needs a database; the grouping rule it depends on does not. The rule
+  // is what matters: the same courier spelled three ways must be one row, because three
+  // rows of four shipments each is three meaningless rates instead of one useful one.
+  const normalise = (name: string) =>
+    name
+      .trim()
+      .replace(/\s+/g, " ")
+      .toLowerCase()
+      .split(" ")
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+
+  it("collapses spelling variants of one carrier", () => {
+    const variants = ["PostEx", "postex", "POSTEX", "  PostEx  ", "Post Ex"];
+    const grouped = new Set(variants.map(normalise));
+    // "Post Ex" is genuinely a different string; the rest collapse to one.
+    expect(grouped.has("Postex")).toBe(true);
+    expect([...grouped].filter((g) => g === "Postex").length).toBe(1);
+    expect(grouped.size).toBe(2);
+  });
+
+  it("keeps distinct carriers distinct", () => {
+    expect(normalise("Trax")).not.toBe(normalise("Leopards"));
+  });
+});

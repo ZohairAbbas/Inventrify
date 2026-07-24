@@ -16,6 +16,21 @@ import {
 
 const DAY_MS = 86400000;
 
+/**
+ * The day a forecast made at `from` becomes scoreable, as midnight UTC.
+ *
+ * Truncating matters because this is part of ForecastAccuracy's unique key: keeping the
+ * time of day would make every run of the planning job a distinct row rather than an
+ * update of that horizon-day's prediction. Scoring reads `date >= dueAt - horizon` and
+ * `< dueAt`, and SalesRecord is bucketed at midnight UTC, so a midnight boundary also
+ * lines the comparison window up with whole days of demand.
+ */
+export function dueAtForHorizon(from: Date, horizonDays: number): Date {
+  const due = new Date(from.getTime() + horizonDays * DAY_MS);
+  due.setUTCHours(0, 0, 0, 0);
+  return due;
+}
+
 export interface OrderHistoryItem {
   quantity: number;
   createdAt: Date;
@@ -283,25 +298,21 @@ export async function generateAndSaveForecast(
       });
     }),
     // Forecast-vs-actual ledger, so accuracy can be scored once the horizon elapses.
-    ...horizons.map(([horizon, f]) =>
-      prisma.forecastAccuracy.upsert({
-        where: {
-          productId_horizon_dueAt: {
-            productId,
-            horizon,
-            dueAt: new Date(now.getTime() + horizon * DAY_MS),
-          },
-        },
-        create: {
-          shop,
-          productId,
-          horizon,
-          dueAt: new Date(now.getTime() + horizon * DAY_MS),
-          predicted: f.grossDemand,
-        },
+    //
+    // `dueAt` is truncated to midnight UTC so the unique key identifies a horizon-day
+    // rather than an instant. It previously carried the time of day, so every re-run —
+    // the nightly planning job, or a merchant clicking "Recalculate Forecast" — inserted
+    // another pending row instead of replacing the day's. One live shop had three rows
+    // per product per horizon from three runs minutes apart, and MAPE would later have
+    // been averaged over them, over-weighting whichever day happened to run most.
+    ...horizons.map(([horizon, f]) => {
+      const dueAt = dueAtForHorizon(now, horizon);
+      return prisma.forecastAccuracy.upsert({
+        where: { productId_horizon_dueAt: { productId, horizon, dueAt } },
+        create: { shop, productId, horizon, dueAt, predicted: f.grossDemand },
         update: { predicted: f.grossDemand },
-      }),
-    ),
+      });
+    }),
   ]);
 
   return { f30, f60, f90 };

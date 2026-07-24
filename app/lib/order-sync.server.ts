@@ -20,7 +20,11 @@ const ORDERS_QUERY = `
           # Shopify's own carrier tracking. This is the delivery signal every shop has
           # without any courier integration: DELIVERED / NOT_DELIVERED are what make a
           # per-SKU RTO rate possible on their own.
-          fulfillments { id displayStatus updatedAt }
+          # trackingInfo.company is the carrier. Shopify reports it for every shop that
+          # books through a tracked carrier, so RTO can be broken down per courier with
+          # no courier integration at all — and in COD the spread between carriers on the
+          # same route is routinely larger than the spread between products.
+          fulfillments { id displayStatus updatedAt trackingInfo { company } }
           shippingAddress { city province country }
           lineItems(first: 100) {
             edges {
@@ -46,7 +50,12 @@ interface OrderNode {
   paymentGatewayNames: string[] | null;
   tags: string[] | null;
   displayFulfillmentStatus: string | null;
-  fulfillments: { id: string; displayStatus: string | null; updatedAt: string | null }[];
+  fulfillments: {
+    id: string;
+    displayStatus: string | null;
+    updatedAt: string | null;
+    trackingInfo: { company: string | null }[] | null;
+  }[];
   shippingAddress: { city: string | null; province: string | null; country: string | null } | null;
   lineItems: Paged<{
     variant: { id: string; sku: string | null } | null;
@@ -113,6 +122,7 @@ export async function syncOrderHistory(
     shipmentId: string;
     orderName: string;
     status: string;
+    courier: string | null;
     updatedAt: Date;
   }[] = [];
 
@@ -225,6 +235,7 @@ export async function syncOrderHistory(
               shipmentId: f.id,
               orderName: order.name,
               status: f.displayStatus,
+              courier: normaliseCarrier(f.trackingInfo?.[0]?.company),
               updatedAt: f.updatedAt ? new Date(f.updatedAt) : placedAt,
             });
           }
@@ -252,10 +263,10 @@ export async function syncOrderHistory(
   // Only variants we track, resolved in one query rather than one per variant.
   const tracked = await prisma.product.findMany({
     where: { shop, id: { in: [...salesMap.keys()] } },
-    select: { id: true },
+    select: { id: true, firstSoldAt: true },
   });
 
-  for (const { id: variantId } of tracked) {
+  for (const { id: variantId, firstSoldAt: knownFirstSold } of tracked) {
     const dayMap = salesMap.get(variantId);
     if (!dayMap) continue;
 
@@ -276,10 +287,25 @@ export async function syncOrderHistory(
     ]);
     recordsSynced += records.length;
 
-    const firstSold = records.reduce<Date | null>(
+    const firstInWindow = records.reduce<Date | null>(
       (min, r) => (min === null || r.date < min ? r.date : min),
       null,
     );
+
+    // firstSoldAt only ever moves earlier.
+    //
+    // `firstInWindow` is the earliest sale in *this sync window*, which is not the
+    // earliest sale full stop: the delete above only clears rows from `since` onward, so
+    // older history survives, and a shop that has been selling for a year has a first
+    // sale far outside the window. Writing the window's minimum unconditionally pushed
+    // firstSoldAt forward every sync. That matters because this bounds the demand-
+    // variance window — moving it later shortens the window and understates sigma, the
+    // mirror image of the padding problem the field was added to prevent.
+    const firstSold =
+      knownFirstSold && (!firstInWindow || knownFirstSold < firstInWindow)
+        ? knownFirstSold
+        : firstInWindow;
+
     // One estimator for the whole app: the cached avgDailySales that drives reorder
     // points is now the same number the forecast uses, rather than a second, slightly
     // different moving average maintained in parallel here.
@@ -294,7 +320,9 @@ export async function syncOrderHistory(
         avgDailySales: dailyRate,
         // Bounds the variance window so a SKU launched three weeks ago is not treated
         // as having 70 days of zero demand.
-        ...(firstSold ? { firstSoldAt: firstSold } : {}),
+        ...(firstSold && firstSold.getTime() !== knownFirstSold?.getTime()
+          ? { firstSoldAt: firstSold }
+          : {}),
       },
     });
 
@@ -351,7 +379,14 @@ export async function syncOrderHistory(
     await prisma.orderOutcome.upsert({
       where: { shop_shipmentId: { shop, shipmentId: o.shipmentId } },
       create: { shop, source: "shopify", ...o },
-      update: { status: o.status, updatedAt: o.updatedAt, orderName: o.orderName },
+      update: {
+        status: o.status,
+        updatedAt: o.updatedAt,
+        orderName: o.orderName,
+        // Only overwrite with a known carrier; a later fulfilment fetch that omits
+        // tracking must not erase one we already recorded.
+        ...(o.courier ? { courier: o.courier } : {}),
+      },
     });
   }
 
@@ -374,6 +409,24 @@ export async function syncOrderHistory(
   }
 
   return { recordsSynced, variantsSeen, completed };
+}
+
+/**
+ * Normalise a carrier name so it groups consistently.
+ *
+ * Merchants and apps spell the same courier differently — "PostEx", "postex partner",
+ * "POSTEX  " — and each spelling would otherwise become its own row with its own
+ * too-small sample, which is exactly how a rate stops meaning anything.
+ */
+function normaliseCarrier(name: string | null | undefined): string | null {
+  if (!name) return null;
+  const cleaned = name.trim().replace(/\s+/g, " ");
+  if (!cleaned) return null;
+  return cleaned
+    .toLowerCase()
+    .split(" ")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
 }
 
 /** Trim, collapse whitespace and title-case a city so it groups consistently. */

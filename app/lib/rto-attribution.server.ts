@@ -547,3 +547,98 @@ export async function getFulfilmentBreakdown(
     source: outcomes.some((o) => o.source === "courierify") ? "courierify" : "shopify",
   };
 }
+
+export interface CarrierRto {
+  carrier: string;
+  deliveredUnits: number;
+  notDeliveredUnits: number;
+  /** Units on journeys that finished — the denominator. */
+  resolvedUnits: number;
+  rtoRate: number;
+  /** Units still moving with this carrier. */
+  inRouteUnits: number;
+}
+
+/**
+ * RTO broken down by carrier.
+ *
+ * In COD the spread between couriers on the same lane is routinely larger than the spread
+ * between products — one carrier's reattempt policy or rider coverage can move the return
+ * rate by fifteen points. A shop-wide average hides that completely, and it is directly
+ * actionable: move volume, renegotiate, or drop the worst lane.
+ *
+ * Derived from Shopify's own tracking company, so it needs no courier integration.
+ * Carriers below `minResolved` are omitted rather than shown with a meaningless rate —
+ * two shipments and one return is not a 50% carrier.
+ */
+export async function getRtoByCarrier(
+  shop: string,
+  range: { from: Date; to: Date },
+  minResolved = 10,
+): Promise<CarrierRto[]> {
+  const [outcomes, lines] = await Promise.all([
+    prisma.orderOutcome.findMany({
+      where: {
+        shop,
+        updatedAt: { gte: range.from, lt: range.to },
+        courier: { not: null },
+      },
+      select: { orderName: true, status: true, source: true, courier: true },
+    }),
+    prisma.orderLineItem.findMany({
+      where: { shop, orderedAt: { gte: range.from, lt: range.to } },
+      select: { orderName: true, quantity: true },
+    }),
+  ]);
+  if (outcomes.length === 0) return [];
+
+  // Units per order, so a multi-line order counts once per line as elsewhere.
+  const unitsByOrder = new Map<string, number>();
+  for (const l of lines) {
+    unitsByOrder.set(l.orderName, (unitsByOrder.get(l.orderName) ?? 0) + l.quantity);
+  }
+
+  // One outcome per order, courier feed preferred — same rule the rest of the module uses.
+  const chosen = new Map<string, { status: string; source: string; courier: string }>();
+  for (const o of outcomes) {
+    if (!o.courier) continue;
+    const existing = chosen.get(o.orderName);
+    if (existing && existing.source === "courierify" && o.source !== "courierify") continue;
+    chosen.set(o.orderName, { status: o.status, source: o.source, courier: o.courier });
+  }
+
+  const tally = new Map<string, CarrierRto>();
+  for (const [orderName, { status, courier }] of chosen) {
+    const units = unitsByOrder.get(orderName) ?? 0;
+    if (units <= 0) continue;
+
+    const stage = classifyFulfilmentStage(status);
+    if (!stage) continue; // cancelled or voided: never a journey
+
+    const entry =
+      tally.get(courier) ??
+      {
+        carrier: courier,
+        deliveredUnits: 0,
+        notDeliveredUnits: 0,
+        resolvedUnits: 0,
+        rtoRate: 0,
+        inRouteUnits: 0,
+      };
+
+    if (stage === "not_delivered") entry.notDeliveredUnits += units;
+    else if (stage === "delivered") entry.deliveredUnits += units;
+    else entry.inRouteUnits += units;
+
+    tally.set(courier, entry);
+  }
+
+  return [...tally.values()]
+    .map((c) => {
+      c.resolvedUnits = c.deliveredUnits + c.notDeliveredUnits;
+      c.rtoRate = c.resolvedUnits > 0 ? c.notDeliveredUnits / c.resolvedUnits : 0;
+      return c;
+    })
+    .filter((c) => c.resolvedUnits >= minResolved)
+    .sort((a, b) => b.rtoRate - a.rtoRate);
+}

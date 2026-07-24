@@ -54,7 +54,27 @@ function midnightUtc(d: Date): Date {
 function parseIsoDate(value: string | null): Date | null {
   if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
   const d = new Date(`${value}T00:00:00.000Z`);
-  return Number.isNaN(d.getTime()) ? null : d;
+  if (Number.isNaN(d.getTime())) return null;
+  // Reject dates that do not exist. JS rolls an overflowing day into the next month, so
+  // "2026-02-31" parses happily as 3 March — a typo becomes a real date a week away,
+  // silently, which is worse than an error. The round trip only matches a real date.
+  return d.toISOString().slice(0, 10) === value ? d : null;
+}
+
+/**
+ * Parse a `<input type="date">` value posted in a form.
+ *
+ * Returns null for empty *and* for malformed input, so a caller can tell "the merchant
+ * left it blank" from "the merchant sent something we cannot read". `new Date(value)`
+ * cannot: it yields an Invalid Date that Prisma then rejects at write time, or — worse
+ * for a two-digit-year typo — a real date nobody meant. Dates chosen in a date picker
+ * are calendar dates, so they anchor at UTC midnight rather than the server's zone.
+ */
+export function parseFormDate(value: FormDataEntryValue | string | null): Date | null {
+  if (value === null || value === undefined) return null;
+  const raw = String(value).trim();
+  if (raw === "") return null;
+  return parseIsoDate(raw);
 }
 
 const iso = (d: Date) => d.toISOString().slice(0, 10);

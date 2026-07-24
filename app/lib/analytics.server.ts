@@ -1,7 +1,7 @@
 import prisma from "../db.server";
 import { previousRange, type DateRange } from "./date-range";
 import { getStockStatus } from "./forecast.server";
-import { getInventoryPositions } from "./planning.server";
+import { getInventoryPositions, serviceLevelZFor } from "./planning.server";
 
 /** Daily sales totals across all products for the last N days */
 export async function getSalesTrend(shop: string, range: DateRange) {
@@ -236,7 +236,15 @@ export interface CodFunnel {
   pending: number;
   /** False when the merchant has not told us which tag marks an order confirmed. */
   confirmationTracked: boolean;
-  /** Share of placed orders that never reached dispatch. */
+  /**
+   * Share of *non-cancelled* COD orders that quietly never reached dispatch.
+   *
+   * Cancellations are excluded from both halves deliberately. They are already backed
+   * out of demand by the orders/cancelled webhook, so counting them here would describe
+   * an overstatement that has in fact already been corrected — and it made the card
+   * contradict itself, reporting "9.1% never reached dispatch" (68 orders) directly
+   * beneath a "Never dispatched" tile reading 42.
+   */
   attritionRate: number;
 }
 
@@ -270,6 +278,10 @@ export async function getCodFunnel(shop: string, range: DateRange): Promise<CodF
   ]);
 
   const pending = Math.max(0, placed - dispatched - cancelled);
+  // The denominator is orders that could still have shipped. A cancelled order did not
+  // "quietly fail to dispatch" — it was deliberately stopped, and its demand has already
+  // been removed from SalesRecord by the webhook.
+  const exposed = placed - cancelled;
 
   return {
     placed,
@@ -278,6 +290,205 @@ export async function getCodFunnel(shop: string, range: DateRange): Promise<CodF
     cancelled,
     pending,
     confirmationTracked,
-    attritionRate: placed > 0 ? (placed - dispatched) / placed : 0,
+    attritionRate: exposed > 0 ? pending / exposed : 0,
+  };
+}
+
+export interface ClassRow {
+  abcClass: string;
+  skus: number;
+  /** Units sold in the window, across the class. */
+  units: number;
+  /** Share of the window's total units, 0..1. */
+  unitShare: number;
+  /** Stock currently held, valued at cost. */
+  stockValue: number;
+  avgSafetyStock: number;
+  /** The service-level Z this class is bought at. */
+  serviceZ: number;
+}
+
+/**
+ * How the catalogue splits by ABC, and what each class actually gets as a result.
+ *
+ * Deliberately a table rather than an ABC x XYZ heatmap. The 3x3 grid is the textbook
+ * presentation, but on real catalogues it is sparse and wildly skewed — on the audited
+ * shop, five of nine cells are empty and one holds 41 of 49 SKUs, so a sequential ramp
+ * renders four cells as near-white and says only "almost everything is C", which is a
+ * sentence rather than a picture. What a merchant actually needs is the consequence: this
+ * class is bought to this service level and therefore carries this much buffer.
+ */
+export async function getClassBreakdown(
+  shop: string,
+  range: DateRange,
+  baseServiceZ: number,
+): Promise<{ rows: ClassRow[]; unclassified: number }> {
+  const products = await prisma.product.findMany({
+    where: { shop, isArchived: false },
+    select: {
+      id: true,
+      abcClass: true,
+      safetyStock: true,
+      currentStock: true,
+      unitCost: true,
+    },
+  });
+  if (products.length === 0) return { rows: [], unclassified: 0 };
+
+  const sales = await prisma.salesRecord.groupBy({
+    by: ["productId"],
+    where: { shop, date: { gte: range.from, lt: range.to } },
+    _sum: { quantity: true },
+  });
+  const unitsById = new Map(sales.map((s) => [s.productId, s._sum.quantity ?? 0]));
+  const totalUnits = [...unitsById.values()].reduce((a, b) => a + b, 0);
+
+  const buckets = new Map<string, ClassRow>();
+  let unclassified = 0;
+
+  for (const p of products) {
+    if (!p.abcClass) {
+      unclassified++;
+      continue;
+    }
+    const row =
+      buckets.get(p.abcClass) ??
+      {
+        abcClass: p.abcClass,
+        skus: 0,
+        units: 0,
+        unitShare: 0,
+        stockValue: 0,
+        avgSafetyStock: 0,
+        serviceZ: serviceLevelZFor(p.abcClass, baseServiceZ),
+      };
+    row.skus += 1;
+    row.units += unitsById.get(p.id) ?? 0;
+    // Negative stock is an oversell, not negative-value inventory.
+    row.stockValue += Math.max(0, p.currentStock) * p.unitCost;
+    row.avgSafetyStock += p.safetyStock;
+    buckets.set(p.abcClass, row);
+  }
+
+  const rows = [...buckets.values()]
+    .map((r) => ({
+      ...r,
+      unitShare: totalUnits > 0 ? r.units / totalUnits : 0,
+      avgSafetyStock: r.skus > 0 ? r.avgSafetyStock / r.skus : 0,
+    }))
+    .sort((a, b) => a.abcClass.localeCompare(b.abcClass));
+
+  return { rows, unclassified };
+}
+
+export interface AccuracyRow {
+  productId: string;
+  title: string;
+  sku: string | null;
+  horizon: number;
+  scored: number;
+  /** Mean absolute percentage error, or null where every actual was zero. */
+  mape: number | null;
+  /** Mean signed error. Negative = we forecast under what actually sold. */
+  bias: number;
+}
+
+export interface AccuracySummary {
+  rows: AccuracyRow[];
+  scoredTotal: number;
+  pendingTotal: number;
+  /** Earliest forecast still waiting for its horizon to elapse. */
+  nextDueAt: Date | null;
+  /** Catalogue-wide mean signed error; null until something is scored. */
+  overallBias: number | null;
+  overallMape: number | null;
+}
+
+/**
+ * Forecast versus actual, per SKU and horizon.
+ *
+ * Bias is the figure that matters most and the one nothing else surfaces. A persistent
+ * negative bias across a shop is the fingerprint of systematically under-buying — exactly
+ * what planning on net-of-returns demand used to cause — and it is invisible in a MAPE,
+ * which treats over- and under-forecasting as equally wrong.
+ *
+ * Rows where every actual was zero are counted but carry a null MAPE: dividing by zero
+ * demand yields infinity, and reporting that as "100% error" would make a SKU that simply
+ * stopped selling look like the worst forecast in the catalogue.
+ */
+export async function getForecastAccuracy(
+  shop: string,
+  limit = 25,
+): Promise<AccuracySummary> {
+  const [scoredRows, pending] = await Promise.all([
+    prisma.forecastAccuracy.findMany({
+      where: { shop, evaluatedAt: { not: null }, actual: { not: null } },
+      orderBy: { dueAt: "desc" },
+      take: 2000,
+      select: { productId: true, horizon: true, predicted: true, actual: true },
+    }),
+    prisma.forecastAccuracy.findMany({
+      where: { shop, evaluatedAt: null },
+      orderBy: { dueAt: "asc" },
+      take: 1,
+      select: { dueAt: true },
+    }),
+  ]);
+
+  const pendingTotal = await prisma.forecastAccuracy.count({
+    where: { shop, evaluatedAt: null },
+  });
+
+  if (scoredRows.length === 0) {
+    return {
+      rows: [],
+      scoredTotal: 0,
+      pendingTotal,
+      nextDueAt: pending[0]?.dueAt ?? null,
+      overallBias: null,
+      overallMape: null,
+    };
+  }
+
+  const products = await prisma.product.findMany({
+    where: { shop, id: { in: [...new Set(scoredRows.map((r) => r.productId))] } },
+    select: { id: true, title: true, variantTitle: true, sku: true },
+  });
+  const byId = new Map(products.map((p) => [p.id, p]));
+
+  const groups = new Map<string, { productId: string; horizon: number; errs: number[]; pcts: number[] }>();
+  for (const r of scoredRows) {
+    const key = `${r.productId}:${r.horizon}`;
+    const g = groups.get(key) ?? { productId: r.productId, horizon: r.horizon, errs: [], pcts: [] };
+    const actual = r.actual as number;
+    g.errs.push(r.predicted - actual);
+    if (actual > 0) g.pcts.push(Math.abs(r.predicted - actual) / actual);
+    groups.set(key, g);
+  }
+
+  const rows: AccuracyRow[] = [...groups.values()].map((g) => {
+    const p = byId.get(g.productId);
+    return {
+      productId: g.productId,
+      title: p ? (p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title) : "Unknown product",
+      sku: p?.sku ?? null,
+      horizon: g.horizon,
+      scored: g.errs.length,
+      mape: g.pcts.length > 0 ? g.pcts.reduce((a, b) => a + b, 0) / g.pcts.length : null,
+      bias: g.errs.reduce((a, b) => a + b, 0) / g.errs.length,
+    };
+  });
+
+  const allPcts = [...groups.values()].flatMap((g) => g.pcts);
+  const allErrs = [...groups.values()].flatMap((g) => g.errs);
+
+  return {
+    // Worst absolute bias first — the SKUs whose buying is most consistently wrong.
+    rows: rows.sort((a, b) => Math.abs(b.bias) - Math.abs(a.bias)).slice(0, limit),
+    scoredTotal: scoredRows.length,
+    pendingTotal,
+    nextDueAt: pending[0]?.dueAt ?? null,
+    overallBias: allErrs.length > 0 ? allErrs.reduce((a, b) => a + b, 0) / allErrs.length : null,
+    overallMape: allPcts.length > 0 ? allPcts.reduce((a, b) => a + b, 0) / allPcts.length : null,
   };
 }

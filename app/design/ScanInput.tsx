@@ -53,23 +53,46 @@ export function ScanInput({
   const [code, setCode] = useState("");
   const [message, setMessage] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  // The code that produced the response currently in `fetcher.data`, so one result is
-  // never handled twice across re-renders.
-  const pending = useRef<string | null>(null);
+
+  // A FIFO queue of codes awaiting lookup.
+  //
+  // A scanner can send the next code before the previous lookup returns, and each PO
+  // receiving scan is an increment — so a dropped scan is an undercount, not a cosmetic
+  // glitch. The input is also cleared the instant Enter is pressed, so a code arriving
+  // mid-lookup cannot append to the last one and corrupt it. One lookup runs at a time;
+  // the queue drains in order.
+  const queue = useRef<string[]>([]);
+  const inFlight = useRef<string | null>(null);
+  // The response object already consumed. useFetcher keeps `data` from the previous load
+  // until the next one resolves, so after pumping the next scan there is a window where
+  // `state` is idle and `data` still holds the last result. Comparing identity stops that
+  // stale result being processed a second time and attributed to the new code.
+  const handled = useRef<ScanOutcome | null>(null);
+
+  const pump = () => {
+    if (inFlight.current !== null || queue.current.length === 0) return;
+    const next = queue.current.shift() as string;
+    inFlight.current = next;
+    fetcher.load(`/api/products/scan?code=${encodeURIComponent(next)}`);
+  };
 
   useEffect(() => {
-    if (!fetcher.data || fetcher.state !== "idle" || pending.current === null) return;
-    const scanned = pending.current;
-    pending.current = null;
+    if (
+      fetcher.state !== "idle" ||
+      inFlight.current === null ||
+      !fetcher.data ||
+      fetcher.data === handled.current
+    ) {
+      return;
+    }
+    handled.current = fetcher.data;
+    const scanned = inFlight.current;
+    inFlight.current = null;
 
     const result = fetcher.data;
     if (result.status === "found") {
       onScan(result.product, result.matchedOn);
-      setMessage({
-        tone: "ok",
-        text: `${result.product.label} · matched on ${result.matchedOn}`,
-      });
-      setCode("");
+      setMessage({ tone: "ok", text: `${result.product.label} · matched on ${result.matchedOn}` });
       if (keepFocus) inputRef.current?.focus();
     } else if (result.status === "ambiguous") {
       // Deliberately not resolved for the operator: two variants sharing a barcode is a
@@ -81,6 +104,8 @@ export function ScanInput({
     } else {
       setMessage({ tone: "error", text: `Nothing matches “${scanned}”.` });
     }
+    // Drain the next queued scan, if any.
+    pump();
     // onScan identity changes per render for inline closures; re-running on it would
     // reprocess the same result.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -88,10 +113,13 @@ export function ScanInput({
 
   const submit = () => {
     const trimmed = code.trim();
-    if (trimmed === "" || fetcher.state !== "idle") return;
+    // Clear immediately, before the lookup: the next scan must start from an empty field,
+    // never append to this one.
+    setCode("");
+    if (trimmed === "") return;
     setMessage(null);
-    pending.current = trimmed;
-    fetcher.load(`/api/products/scan?code=${encodeURIComponent(trimmed)}`);
+    queue.current.push(trimmed);
+    pump();
   };
 
   return (

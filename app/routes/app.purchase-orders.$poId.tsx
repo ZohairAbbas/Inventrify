@@ -481,15 +481,23 @@ export default function PODetail() {
                     // Match the scanned product to a line on this PO and tick it up. A
                     // scanned code that is a real product but not on this PO is a wrong
                     // delivery, so it is refused rather than silently ignored.
-                    const line = po.items.find((i) => i.productId === scanned.id);
-                    if (!line) {
+                    const productLines = po.items.filter((i) => i.productId === scanned.id);
+                    if (productLines.length === 0) {
                       shopify.toast.show(`${scanned.label} is not on this purchase order`, { isError: true });
                       return;
                     }
                     setReceivedQtys((prev) => {
-                      const current = parseInt(prev[line.id] ?? "0", 10);
+                      // A product can appear on more than one line. Fill the first line
+                      // that still has room before spilling onto the next, so scanning a
+                      // box of N never overshoots one line while another sits empty.
+                      const target =
+                        productLines.find((l) => {
+                          const got = parseInt(prev[l.id] ?? "0", 10);
+                          return (Number.isFinite(got) ? got : 0) < l.quantityOrdered;
+                        }) ?? productLines[0];
+                      const current = parseInt(prev[target.id] ?? "0", 10);
                       const next = (Number.isFinite(current) ? current : 0) + 1;
-                      return { ...prev, [line.id]: String(next) };
+                      return { ...prev, [target.id]: String(next) };
                     });
                     shopify.toast.show(`${scanned.label} — counted`);
                   }}

@@ -88,6 +88,16 @@ describe("resolveScan", () => {
     expect(r.status).toBe("found");
   });
 
+  it("takes an exact-case match in preference to a case-variant one", async () => {
+    // The exact match runs first (and is the index-backed path). A product whose barcode
+    // is exactly what was scanned is that item, even if another differs only in case.
+    const exact = await product({ barcode: "abc123" });
+    await product({ barcode: "ABC123" });
+    const r = await resolveScan(SHOP, "abc123");
+    expect(r.status).toBe("found");
+    if (r.status === "found") expect(r.product.id).toBe(exact.id);
+  });
+
   it("does not match a prefix — ABC-1 must not resolve to ABC-10", async () => {
     await product({ sku: "ABC-10" });
     const r = await resolveScan(SHOP, "ABC-1");

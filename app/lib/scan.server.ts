@@ -73,32 +73,40 @@ export async function resolveScan(shop: string, rawCode: string): Promise<ScanOu
   const code = rawCode.trim();
   if (code === "") return { status: "not_found" };
 
-  // Archived products are excluded: they are gone from Shopify, so a scan matching one
-  // is a stale label rather than stock to act on.
-  const byBarcode = await prisma.product.findMany({
-    where: { shop, isArchived: false, barcode: { equals: code, mode: "insensitive" } },
-    select: SELECT,
-    take: 5,
-  });
-  if (byBarcode.length === 1) {
-    return { status: "found", product: toScanned(byBarcode[0]), matchedOn: "barcode" };
-  }
-  if (byBarcode.length > 1) {
-    // Duplicate barcodes across variants are a real and common data-entry mistake.
-    // Guessing would put stock against the wrong SKU without anyone noticing.
-    return { status: "ambiguous", candidates: byBarcode.map(toScanned) };
-  }
+  // Four lookups, ordered so the common case stays on the index.
+  //
+  //   1. barcode, exact case      3. sku, exact case
+  //   2. barcode, any case        4. sku, any case
+  //
+  // The (shop, barcode) and (shop, sku) btree indexes serve case-sensitive equality but
+  // not a case-insensitive one, which Postgres can only satisfy with a scan. A scanner
+  // reproduces a code byte-for-byte, so the exact match is what almost every scan hits —
+  // keeping it index-backed matters during a receiving session of hundreds of scans over
+  // a large catalogue. The insensitive passes exist only for a hand-typed odd-case entry
+  // and run only when the exact ones miss.
+  const attempts: { field: "barcode" | "sku"; where: object }[] = [
+    { field: "barcode", where: { barcode: code } },
+    { field: "barcode", where: { barcode: { equals: code, mode: "insensitive" } } },
+    { field: "sku", where: { sku: code } },
+    { field: "sku", where: { sku: { equals: code, mode: "insensitive" } } },
+  ];
 
-  const bySku = await prisma.product.findMany({
-    where: { shop, isArchived: false, sku: { equals: code, mode: "insensitive" } },
-    select: SELECT,
-    take: 5,
-  });
-  if (bySku.length === 1) {
-    return { status: "found", product: toScanned(bySku[0]), matchedOn: "sku" };
-  }
-  if (bySku.length > 1) {
-    return { status: "ambiguous", candidates: bySku.map(toScanned) };
+  for (const attempt of attempts) {
+    // Archived products are excluded: they are gone from Shopify, so a scan matching one
+    // is a stale label rather than stock to act on.
+    const rows = await prisma.product.findMany({
+      where: { shop, isArchived: false, ...attempt.where },
+      select: SELECT,
+      take: 5,
+    });
+    if (rows.length === 1) {
+      return { status: "found", product: toScanned(rows[0]), matchedOn: attempt.field };
+    }
+    if (rows.length > 1) {
+      // Duplicate codes across variants are a real and common data-entry mistake.
+      // Guessing would put stock against the wrong SKU without anyone noticing.
+      return { status: "ambiguous", candidates: rows.map(toScanned) };
+    }
   }
 
   return { status: "not_found" };

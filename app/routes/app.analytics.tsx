@@ -5,6 +5,7 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { resolveDateRange } from "../lib/date-range";
 import { getRtoByCarrier } from "../lib/rto-attribution.server";
+import { formatCurrency } from "../lib/format";
 import {
   getSalesTrend,
   getPeriodComparison,
@@ -14,9 +15,10 @@ import {
   getHighReturnRateProducts,
   getRtoByRegion,
   getCodFunnel,
+  getClassBreakdown,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
-import { BarChart, Card, DataTable, DateRangePicker, KpiCard, Pill, type DataTableColumn } from "../design";
+import { BarChart, Card, ClassBadge, DataTable, DateRangePicker, KpiCard, Pill, type DataTableColumn } from "../design";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -27,7 +29,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const deadStockDays = settings?.deadStockDays ?? 60;
   const deadStockMinUnits = settings?.deadStockMinUnits ?? 20;
 
-  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, rtoByCarrier, codFunnel] =
+  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, rtoByCarrier, codFunnel, classes] =
     await Promise.all([
     getSalesTrend(shop, range),
     getPeriodComparison(shop, range),
@@ -41,11 +43,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getRtoByRegion(shop, range),
     getRtoByCarrier(shop, range),
     getCodFunnel(shop, range),
+    getClassBreakdown(shop, range, settings?.serviceLevel ?? 1.65),
   ]);
 
   return {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, rtoByCarrier, range, deadStockDays,
+    codFunnel, rtoByCarrier, classes, range, deadStockDays,
+    currency: settings?.currency ?? "USD",
   };
 };
 
@@ -59,7 +63,7 @@ const SEGMENT_COLORS: Record<string, string> = {
 export default function Analytics() {
   const {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, rtoByCarrier, range, deadStockDays,
+    codFunnel, rtoByCarrier, classes, range, deadStockDays, currency,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -294,6 +298,54 @@ export default function Analytics() {
           </div>
         )}
 
+        {classes.rows.length > 0 && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>
+              How stock is prioritised
+            </div>
+            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "10px", lineHeight: 1.5 }}>
+              Products are ranked by demand value into A, B and C. The class is not a label —
+              it sets the service level each SKU is bought to, which is why the buffer differs.
+              A steady 98% target on the tail would tie up cash in products that barely move.
+            </div>
+            <DataTable
+              columns={[
+                { header: "Class", width: ".8fr" },
+                { header: "SKUs", width: ".8fr", align: "right" },
+                { header: `Units (${range.label})`, width: "1.2fr", align: "right" },
+                { header: "Share of demand", width: "1.2fr", align: "right" },
+                { header: "Service level", width: "1.1fr", align: "right" },
+                { header: "Avg buffer", width: "1fr", align: "right" },
+                { header: "Stock at cost", width: "1.2fr", align: "right" },
+              ]}
+              rows={classes.rows.map((c) => ({
+                key: c.abcClass,
+                cells: [
+                  <ClassBadge key="c" abc={c.abcClass} />,
+                  <span key="s" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.skus}</span>,
+                  <span key="u" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.units.toLocaleString()}</span>,
+                  <span key="sh" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+                    {(c.unitShare * 100).toFixed(1)}%
+                  </span>,
+                  <span key="z" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+                    {serviceLevelLabel(c.serviceZ)}
+                  </span>,
+                  <span key="b" style={{ fontFamily: "var(--inv-font-mono)" }}>{c.avgSafetyStock.toFixed(1)}</span>,
+                  <span key="v" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+                    {formatCurrency(c.stockValue, currency)}
+                  </span>,
+                ],
+              }))}
+            />
+            {classes.unclassified > 0 && (
+              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginTop: "8px" }}>
+                {classes.unclassified} product{classes.unclassified === 1 ? "" : "s"} not yet
+                classified — they are ranked on the next planning run.
+              </div>
+            )}
+          </div>
+        )}
+
         {rtoByCarrier.length > 0 && (
           <div style={{ marginBottom: "22px" }}>
             <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "4px" }}>
@@ -404,4 +456,16 @@ export default function Analytics() {
       </div>
     </div>
   );
+}
+
+/**
+ * Turn a service-level Z into the fill rate it targets, which is the number a merchant
+ * can actually reason about. Z is the input the maths needs; nobody buys stock in
+ * standard deviations.
+ */
+function serviceLevelLabel(z: number): string {
+  if (z >= 2.05) return "98%";
+  if (z >= 1.64) return "95%";
+  if (z >= 1.28) return "90%";
+  return `${Math.round(z * 100) / 100}z`;
 }

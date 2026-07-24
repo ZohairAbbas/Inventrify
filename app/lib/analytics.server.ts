@@ -1,7 +1,7 @@
 import prisma from "../db.server";
 import { previousRange, type DateRange } from "./date-range";
 import { getStockStatus } from "./forecast.server";
-import { getInventoryPositions } from "./planning.server";
+import { getInventoryPositions, serviceLevelZFor } from "./planning.server";
 
 /** Daily sales totals across all products for the last N days */
 export async function getSalesTrend(shop: string, range: DateRange) {
@@ -292,4 +292,91 @@ export async function getCodFunnel(shop: string, range: DateRange): Promise<CodF
     confirmationTracked,
     attritionRate: exposed > 0 ? pending / exposed : 0,
   };
+}
+
+export interface ClassRow {
+  abcClass: string;
+  skus: number;
+  /** Units sold in the window, across the class. */
+  units: number;
+  /** Share of the window's total units, 0..1. */
+  unitShare: number;
+  /** Stock currently held, valued at cost. */
+  stockValue: number;
+  avgSafetyStock: number;
+  /** The service-level Z this class is bought at. */
+  serviceZ: number;
+}
+
+/**
+ * How the catalogue splits by ABC, and what each class actually gets as a result.
+ *
+ * Deliberately a table rather than an ABC x XYZ heatmap. The 3x3 grid is the textbook
+ * presentation, but on real catalogues it is sparse and wildly skewed — on the audited
+ * shop, five of nine cells are empty and one holds 41 of 49 SKUs, so a sequential ramp
+ * renders four cells as near-white and says only "almost everything is C", which is a
+ * sentence rather than a picture. What a merchant actually needs is the consequence: this
+ * class is bought to this service level and therefore carries this much buffer.
+ */
+export async function getClassBreakdown(
+  shop: string,
+  range: DateRange,
+  baseServiceZ: number,
+): Promise<{ rows: ClassRow[]; unclassified: number }> {
+  const products = await prisma.product.findMany({
+    where: { shop, isArchived: false },
+    select: {
+      id: true,
+      abcClass: true,
+      safetyStock: true,
+      currentStock: true,
+      unitCost: true,
+    },
+  });
+  if (products.length === 0) return { rows: [], unclassified: 0 };
+
+  const sales = await prisma.salesRecord.groupBy({
+    by: ["productId"],
+    where: { shop, date: { gte: range.from, lt: range.to } },
+    _sum: { quantity: true },
+  });
+  const unitsById = new Map(sales.map((s) => [s.productId, s._sum.quantity ?? 0]));
+  const totalUnits = [...unitsById.values()].reduce((a, b) => a + b, 0);
+
+  const buckets = new Map<string, ClassRow>();
+  let unclassified = 0;
+
+  for (const p of products) {
+    if (!p.abcClass) {
+      unclassified++;
+      continue;
+    }
+    const row =
+      buckets.get(p.abcClass) ??
+      {
+        abcClass: p.abcClass,
+        skus: 0,
+        units: 0,
+        unitShare: 0,
+        stockValue: 0,
+        avgSafetyStock: 0,
+        serviceZ: serviceLevelZFor(p.abcClass, baseServiceZ),
+      };
+    row.skus += 1;
+    row.units += unitsById.get(p.id) ?? 0;
+    // Negative stock is an oversell, not negative-value inventory.
+    row.stockValue += Math.max(0, p.currentStock) * p.unitCost;
+    row.avgSafetyStock += p.safetyStock;
+    buckets.set(p.abcClass, row);
+  }
+
+  const rows = [...buckets.values()]
+    .map((r) => ({
+      ...r,
+      unitShare: totalUnits > 0 ? r.units / totalUnits : 0,
+      avgSafetyStock: r.skus > 0 ? r.avgSafetyStock / r.skus : 0,
+    }))
+    .sort((a, b) => a.abcClass.localeCompare(b.abcClass));
+
+  return { rows, unclassified };
 }

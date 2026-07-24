@@ -12,6 +12,7 @@ export { Drawer } from "./Drawer";
 export { Toast } from "./Toast";
 export { FilterChips, TogglePills } from "./FilterChips";
 export { DateRangePicker } from "./DateRangePicker";
+export { ClassBadge } from "./ClassBadge";
 export type { DateRangeValue } from "./DateRangePicker";
 export type { ChipOption } from "./FilterChips";
 export { ReorderRow } from "./ReorderRow";

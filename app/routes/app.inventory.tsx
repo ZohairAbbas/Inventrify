@@ -30,6 +30,7 @@ import {
   PageHead,
   Pagination,
   SelectInput,
+  ClassBadge,
   ProductThumb,
   StatusBadge,
   Toast,
@@ -204,6 +205,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     damaged: damageByProduct.get(p.id) ?? 0,
   }));
 
+  // Driven by whether there IS pipeline data, not by whether a courier integration
+  // exists. Shopify's own carrier tracking fills these fields for every shop, so gating
+  // on Courierify hid a populated column from shops using a different source — 26 SKUs
+  // on one live shop.
+  const hasPipelineData = withPipeline.some(
+    (p) => p.fulfilledDelivered > 0 || p.fulfilledInTransit > 0 || p.fulfilledReturned > 0,
+  );
+
   return {
     products: withPipeline,
     page,
@@ -213,6 +222,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     locations,
     locationFilter,
     courierifyConnected,
+    hasPipelineData,
   };
 };
 
@@ -408,7 +418,7 @@ type CsvDiffRow = {
 };
 
 export default function Inventory() {
-  const { products, page, statusFilter, suppliers, locations, locationFilter, courierifyConnected } =
+  const { products, page, statusFilter, suppliers, locations, locationFilter, courierifyConnected, hasPipelineData } =
     useLoaderData<typeof loader>();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
@@ -566,13 +576,14 @@ export default function Inventory() {
     { header: "", width: "34px" },
     { header: "Product / Variant", width: "2.4fr" },
     { header: "SKU", width: "1fr" },
+    { header: "Class", width: ".7fr" },
     { header: "Stock", width: ".7fr", align: "right" },
     { header: "Reorder", width: ".8fr", align: "right" },
     { header: "Days left", width: ".9fr", align: "right" },
     { header: "COD ret.", width: ".9fr", align: "right" },
     { header: "Margin", width: "1fr", align: "right" },
     { header: "Supplier", width: "1.1fr" },
-    { header: "Pipeline · Courierify", width: "2fr" },
+    { header: "Pipeline", width: "2fr" },
     { header: "Status", width: "1fr", align: "right" },
   ];
 
@@ -648,6 +659,8 @@ export default function Inventory() {
       <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>
         {p.sku ?? "—"}
       </span>,
+      // Explains why two SKUs with similar demand carry different buffers.
+      <ClassBadge key="class" abc={p.abcClass} xyz={p.xyzClass} />,
       <span
         key="stock"
         style={{
@@ -692,9 +705,9 @@ export default function Inventory() {
         {p.supplier?.name ?? "—"}
       </span>,
       <div key="pipeline" style={{ display: "flex", gap: "10px", justifyContent: "flex-start" }}>
-        {courierifyConnected && pipeCell("deliv", p.fulfilledDelivered, "Deliv", "var(--inv-status-healthy-dot)", "Delivered — live snapshot")}
-        {courierifyConnected && pipeCell("transit", p.fulfilledInTransit, "Transit", "var(--inv-transit-fg)", "In-transit — live now")}
-        {courierifyConnected && pipeCell("ret", p.fulfilledReturned, "Ret", "var(--inv-status-critical-fg)", "Returned", "/app/returns")}
+        {hasPipelineData && pipeCell("deliv", p.fulfilledDelivered, "Deliv", "var(--inv-status-healthy-dot)", "Delivered — live snapshot")}
+        {hasPipelineData && pipeCell("transit", p.fulfilledInTransit, "Transit", "var(--inv-transit-fg)", "In-transit — live now")}
+        {hasPipelineData && pipeCell("ret", p.fulfilledReturned, "Ret", "var(--inv-status-critical-fg)", "Returned", "/app/returns")}
         {pipeCell("dmg", p.damaged, "Dmg", "var(--inv-status-stockout-fg)", "Damaged", "/app/returns")}
       </div>,
       <StatusBadge key="status" status={p.status as StockStatus} />,

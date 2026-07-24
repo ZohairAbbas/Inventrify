@@ -380,3 +380,115 @@ export async function getClassBreakdown(
 
   return { rows, unclassified };
 }
+
+export interface AccuracyRow {
+  productId: string;
+  title: string;
+  sku: string | null;
+  horizon: number;
+  scored: number;
+  /** Mean absolute percentage error, or null where every actual was zero. */
+  mape: number | null;
+  /** Mean signed error. Negative = we forecast under what actually sold. */
+  bias: number;
+}
+
+export interface AccuracySummary {
+  rows: AccuracyRow[];
+  scoredTotal: number;
+  pendingTotal: number;
+  /** Earliest forecast still waiting for its horizon to elapse. */
+  nextDueAt: Date | null;
+  /** Catalogue-wide mean signed error; null until something is scored. */
+  overallBias: number | null;
+  overallMape: number | null;
+}
+
+/**
+ * Forecast versus actual, per SKU and horizon.
+ *
+ * Bias is the figure that matters most and the one nothing else surfaces. A persistent
+ * negative bias across a shop is the fingerprint of systematically under-buying — exactly
+ * what planning on net-of-returns demand used to cause — and it is invisible in a MAPE,
+ * which treats over- and under-forecasting as equally wrong.
+ *
+ * Rows where every actual was zero are counted but carry a null MAPE: dividing by zero
+ * demand yields infinity, and reporting that as "100% error" would make a SKU that simply
+ * stopped selling look like the worst forecast in the catalogue.
+ */
+export async function getForecastAccuracy(
+  shop: string,
+  limit = 25,
+): Promise<AccuracySummary> {
+  const [scoredRows, pending] = await Promise.all([
+    prisma.forecastAccuracy.findMany({
+      where: { shop, evaluatedAt: { not: null }, actual: { not: null } },
+      orderBy: { dueAt: "desc" },
+      take: 2000,
+      select: { productId: true, horizon: true, predicted: true, actual: true },
+    }),
+    prisma.forecastAccuracy.findMany({
+      where: { shop, evaluatedAt: null },
+      orderBy: { dueAt: "asc" },
+      take: 1,
+      select: { dueAt: true },
+    }),
+  ]);
+
+  const pendingTotal = await prisma.forecastAccuracy.count({
+    where: { shop, evaluatedAt: null },
+  });
+
+  if (scoredRows.length === 0) {
+    return {
+      rows: [],
+      scoredTotal: 0,
+      pendingTotal,
+      nextDueAt: pending[0]?.dueAt ?? null,
+      overallBias: null,
+      overallMape: null,
+    };
+  }
+
+  const products = await prisma.product.findMany({
+    where: { shop, id: { in: [...new Set(scoredRows.map((r) => r.productId))] } },
+    select: { id: true, title: true, variantTitle: true, sku: true },
+  });
+  const byId = new Map(products.map((p) => [p.id, p]));
+
+  const groups = new Map<string, { productId: string; horizon: number; errs: number[]; pcts: number[] }>();
+  for (const r of scoredRows) {
+    const key = `${r.productId}:${r.horizon}`;
+    const g = groups.get(key) ?? { productId: r.productId, horizon: r.horizon, errs: [], pcts: [] };
+    const actual = r.actual as number;
+    g.errs.push(r.predicted - actual);
+    if (actual > 0) g.pcts.push(Math.abs(r.predicted - actual) / actual);
+    groups.set(key, g);
+  }
+
+  const rows: AccuracyRow[] = [...groups.values()].map((g) => {
+    const p = byId.get(g.productId);
+    return {
+      productId: g.productId,
+      title: p ? (p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title) : "Unknown product",
+      sku: p?.sku ?? null,
+      horizon: g.horizon,
+      scored: g.errs.length,
+      mape: g.pcts.length > 0 ? g.pcts.reduce((a, b) => a + b, 0) / g.pcts.length : null,
+      bias: g.errs.reduce((a, b) => a + b, 0) / g.errs.length,
+    };
+  });
+
+  const allPcts = [...groups.values()].flatMap((g) => g.pcts);
+  const allErrs = [...groups.values()].flatMap((g) => g.errs);
+
+  return {
+    // Worst absolute bias first — the SKUs whose buying is most consistently wrong.
+    rows: rows.sort((a, b) => Math.abs(b.bias) - Math.abs(a.bias)).slice(0, limit),
+    scoredTotal: scoredRows.length,
+    pendingTotal,
+    nextDueAt: pending[0]?.dueAt ?? null,
+    overallBias: allErrs.length > 0 ? allErrs.reduce((a, b) => a + b, 0) / allErrs.length : null,
+    overallMape: allPcts.length > 0 ? allPcts.reduce((a, b) => a + b, 0) / allPcts.length : null,
+  };
+}

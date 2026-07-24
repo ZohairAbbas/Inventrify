@@ -16,6 +16,7 @@ import {
   getRtoByRegion,
   getCodFunnel,
   getClassBreakdown,
+  getForecastAccuracy,
 } from "../lib/analytics.server";
 import prisma from "../db.server";
 import { BarChart, Card, ClassBadge, DataTable, DateRangePicker, KpiCard, Pill, type DataTableColumn } from "../design";
@@ -29,7 +30,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const deadStockDays = settings?.deadStockDays ?? 60;
   const deadStockMinUnits = settings?.deadStockMinUnits ?? 20;
 
-  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, rtoByCarrier, codFunnel, classes] =
+  const [trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion, rtoByCarrier, codFunnel, classes, accuracy] =
     await Promise.all([
     getSalesTrend(shop, range),
     getPeriodComparison(shop, range),
@@ -44,11 +45,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     getRtoByCarrier(shop, range),
     getCodFunnel(shop, range),
     getClassBreakdown(shop, range, settings?.serviceLevel ?? 1.65),
+    getForecastAccuracy(shop),
   ]);
 
   return {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, rtoByCarrier, classes, range, deadStockDays,
+    codFunnel, rtoByCarrier, classes, accuracy, range, deadStockDays,
     currency: settings?.currency ?? "USD",
   };
 };
@@ -63,7 +65,7 @@ const SEGMENT_COLORS: Record<string, string> = {
 export default function Analytics() {
   const {
     trend, comparison, topMovers, deadStock, statusDist, highReturnRate, rtoByRegion,
-    codFunnel, rtoByCarrier, classes, range, deadStockDays, currency,
+    codFunnel, rtoByCarrier, classes, accuracy, range, deadStockDays, currency,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -294,6 +296,98 @@ export default function Analytics() {
                   </>
                 )}
               </div>
+            )}
+          </div>
+        )}
+
+        {(accuracy.scoredTotal > 0 || accuracy.pendingTotal > 0) && (
+          <div style={{ marginBottom: "22px" }}>
+            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>
+              Forecast accuracy
+            </div>
+            {accuracy.scoredTotal === 0 ? (
+              <div style={{ fontSize: "12px", color: "var(--inv-muted)", lineHeight: 1.5 }}>
+                {accuracy.pendingTotal.toLocaleString()} forecasts are recorded and waiting for
+                their horizon to elapse
+                {accuracy.nextDueAt
+                  ? `; the first can be scored on ${new Date(accuracy.nextDueAt).toISOString().slice(0, 10)}`
+                  : ""}
+                . Nothing is shown until then — an accuracy figure computed before the period
+                it covers has finished would be measuring an incomplete month.
+              </div>
+            ) : (
+              <>
+                <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "12px", lineHeight: 1.5 }}>
+                  Every forecast is kept and compared against what actually sold.{" "}
+                  <strong style={{ color: "var(--inv-text-2)" }}>Bias</strong> is the one to watch:
+                  a persistently negative figure means the app has been buying under demand, which
+                  a percentage error alone cannot show — it counts over- and under-forecasting as
+                  equally wrong.
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))", gap: "10px", marginBottom: "14px" }}>
+                  <KpiCard
+                    label="Forecasts scored"
+                    value={accuracy.scoredTotal.toLocaleString()}
+                    sub={`${accuracy.pendingTotal.toLocaleString()} still pending`}
+                  />
+                  <KpiCard
+                    label="Average error"
+                    value={accuracy.overallMape != null ? `${(accuracy.overallMape * 100).toFixed(1)}%` : "—"}
+                    sub="lower is better"
+                  />
+                  <KpiCard
+                    label="Bias"
+                    value={
+                      accuracy.overallBias != null
+                        ? `${accuracy.overallBias >= 0 ? "+" : ""}${accuracy.overallBias.toFixed(1)}`
+                        : "—"
+                    }
+                    sub={
+                      accuracy.overallBias == null
+                        ? "units per forecast"
+                        : accuracy.overallBias < 0
+                          ? "units under actual demand"
+                          : "units over actual demand"
+                    }
+                    valueColor={
+                      accuracy.overallBias != null && accuracy.overallBias < 0
+                        ? "var(--inv-status-critical-fg)"
+                        : undefined
+                    }
+                  />
+                </div>
+                <DataTable
+                  columns={[
+                    { header: "Product", width: "2.4fr" },
+                    { header: "Horizon", width: ".9fr", align: "right" },
+                    { header: "Scored", width: ".8fr", align: "right" },
+                    { header: "Avg error", width: "1fr", align: "right" },
+                    { header: "Bias", width: "1.2fr", align: "right" },
+                  ]}
+                  rows={accuracy.rows.map((r) => ({
+                    key: `${r.productId}:${r.horizon}`,
+                    cells: [
+                      <span key="t" style={{ fontWeight: 500 }}>{r.title}</span>,
+                      <span key="h" style={{ fontFamily: "var(--inv-font-mono)" }}>{r.horizon}d</span>,
+                      <span key="n" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>{r.scored}</span>,
+                      <span key="m" style={{ fontFamily: "var(--inv-font-mono)" }}>
+                        {r.mape != null ? `${(r.mape * 100).toFixed(0)}%` : "—"}
+                      </span>,
+                      <span
+                        key="b"
+                        title={r.bias < 0 ? "Forecast below actual demand — risks under-buying" : "Forecast above actual demand"}
+                        style={{
+                          fontFamily: "var(--inv-font-mono)",
+                          fontWeight: 600,
+                          color: r.bias < 0 ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)",
+                        }}
+                      >
+                        {r.bias >= 0 ? "+" : ""}{r.bias.toFixed(1)}
+                      </span>,
+                    ],
+                  }))}
+                />
+              </>
             )}
           </div>
         )}

@@ -237,6 +237,7 @@ export async function postStockCount(
   admin: AdminApiContext,
   shop: string,
   countId: string,
+  userId?: string | null,
 ): Promise<PostCountResult> {
   const base: Omit<PostCountResult, "ok" | "error"> = {
     applied: 0,
@@ -287,6 +288,7 @@ export async function postStockCount(
       "count_correction",
       `Cycle count ${count.countNumber}: counted ${item.countedQty} vs ${item.snapshotQty} on record`,
       count.locationId,
+      { userId },
     );
 
     if ("error" in result) {

@@ -271,6 +271,13 @@ describe("postStockCount", () => {
     expect(await prisma.stockAdjustment.count({ where: { shop: SHOP, reason: "count_correction" } })).toBe(1);
   });
 
+  it("stamps the acting user on the posted adjustments", async () => {
+    const { countId } = await openCounted([{ onHand: 50, counted: 47 }]);
+    await postStockCount(mockAdmin(), SHOP, countId, "555000");
+    const adj = await prisma.stockAdjustment.findFirstOrThrow({ where: { shop: SHOP, reason: "count_correction" } });
+    expect(adj.createdByUserId).toBe("555000");
+  });
+
   it("refuses to post an already-posted count", async () => {
     const { countId } = await openCounted([{ onHand: 10, counted: 8 }]);
     await postStockCount(mockAdmin(), SHOP, countId);

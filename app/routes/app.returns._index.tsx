@@ -85,8 +85,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
+  const userId = sessionToken?.sub ?? null;
   const formData = await request.formData();
   const intent = formData.get("intent") as string;
 
@@ -123,6 +124,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           "return",
           `Return restocked — order ${item.shopifyOrderName ?? item.shipmentId}`,
           locationId,
+          { userId },
         );
         if ("error" in result) {
           errors.push(`${label}: ${result.error}`);

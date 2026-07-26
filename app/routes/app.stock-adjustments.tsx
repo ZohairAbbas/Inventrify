@@ -116,8 +116,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
+  // The acting staff user, from the embedded session token. `sub` is present on every
+  // embedded admin request; null-safe for the rare non-embedded path.
+  const userId = sessionToken?.sub ?? null;
   const formData = await request.formData();
   const intent = (formData.get("intent") as string) || "adjust";
 
@@ -148,7 +151,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       "reversal",
       `Reversal of ${original.reason} adjustment from ${original.createdAt.toISOString().slice(0, 10)}`,
       original.locationId,
-      { reversalOf: original.id },
+      { reversalOf: original.id, userId },
     );
   }
 
@@ -166,7 +169,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return { error: "Please select a reason" };
   }
 
-  return applyStockDelta(admin, shop, productId, delta, reason, note, locationId);
+  return applyStockDelta(admin, shop, productId, delta, reason, note, locationId, { userId });
 };
 
 export default function StockAdjustments() {
@@ -239,7 +242,8 @@ export default function StockAdjustments() {
     { header: "SKU", width: "1fr" },
     { header: "Change", width: ".8fr", align: "right" },
     { header: "Reason", width: "1.2fr" },
-    { header: "Note", width: "1.6fr" },
+    { header: "Note", width: "1.4fr" },
+    { header: "By", width: ".9fr" },
     { header: "Date", width: "1fr" },
     { header: "", width: ".9fr", align: "right" },
   ];
@@ -257,6 +261,15 @@ export default function StockAdjustments() {
       />,
       <span key="r" style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>{REASONS.find((r) => r.value === a.reason)?.label ?? a.reason}</span>,
       <span key="note" style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>{a.note ?? "—"}</span>,
+      <span
+        key="by"
+        // A Shopify staff user id — the app has no read_users scope to turn it into a
+        // name, but the id still distinguishes who made each change.
+        title={a.createdByUserId ? `Shopify staff user ${a.createdByUserId}` : "No user recorded"}
+        style={{ fontFamily: "var(--inv-font-mono)", fontSize: "11px", color: "var(--inv-muted)" }}
+      >
+        {a.createdByUserId ? `#${a.createdByUserId}` : "—"}
+      </span>,
       <span key="date" style={{ color: "var(--inv-muted)", fontSize: "12px" }}>{new Date(a.createdAt).toLocaleDateString()}</span>,
       a.reversalOf ? (
         <span key="rev" title="This row undoes an earlier adjustment" style={{ fontSize: "11px", color: "var(--inv-faint)" }}>
@@ -454,7 +467,7 @@ export default function StockAdjustments() {
             <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>
               {filteredProductName || reasonFilter !== "all" || unknownProductFilter
                 ? "Try clearing the product or reason filter."
-                : "Your audit trail appears here — every change with reason and timestamp."}
+                : "Your audit trail appears here — every change with reason, staff member and timestamp."}
             </div>
           </Card>
         ) : (

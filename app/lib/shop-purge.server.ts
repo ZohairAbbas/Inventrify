@@ -29,6 +29,13 @@ export async function purgeShopData(shop: string): Promise<void> {
   });
   await prisma.stockTransfer.deleteMany({ where: { shop } });
 
+  // Cycle counts: items are scoped via their parent count, and both FK to Product /
+  // Location, so they must go before the parents below.
+  await prisma.stockCountItem.deleteMany({
+    where: { stockCount: { shop } },
+  });
+  await prisma.stockCount.deleteMany({ where: { shop } });
+
   // Purchase orders: likewise.
   await prisma.purchaseOrderItem.deleteMany({
     where: { purchaseOrder: { shop } },

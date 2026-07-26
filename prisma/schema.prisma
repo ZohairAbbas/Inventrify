@@ -189,6 +189,7 @@ model Product {
   locationStock    ProductLocationStock[]
   transferItems    StockTransferItem[]
   returnItems      ReturnItem[]
+  countItems       StockCountItem[]
 
   forecastAccuracy ForecastAccuracy[]
 
@@ -214,6 +215,7 @@ model Location {
   stockLevels ProductLocationStock[]
   transfersFrom StockTransfer[] @relation("TransferFrom")
   transfersTo   StockTransfer[] @relation("TransferTo")
+  stockCounts   StockCount[]
 
   @@unique([shop, shopifyLocationId])
   @@index([shop])
@@ -492,6 +494,54 @@ model ReturnItem {
 
   @@unique([shipmentId, lineItemId])
   @@index([shop, status])
+}
+
+// A cycle-count session: pick a location, count what is physically there, review the
+// variances, then post them as stock adjustments. This is the daily stockroom job the
+// app was missing — ad-hoc "count_correction" adjustments existed, but not a count with
+// a captured system snapshot to measure against and an all-or-nothing posting step.
+model StockCount {
+  id          String   @id @default(cuid())
+  shop        String
+  countNumber String   @unique
+  // counting → review → posted, or cancelled from either of the first two.
+  status      String   @default("counting")
+  // The location being counted. A count is always scoped to one location so its snapshot
+  // and its posted adjustments target the same per-location on-hand.
+  locationId  String
+  location    Location @relation(fields: [locationId], references: [id])
+  notes       String?
+  // Whether the counter is shown the system quantity while entering counts. A blind count
+  // (the default) hides it, so the number entered is what is on the shelf rather than a
+  // nudge toward what the system expected.
+  blind       Boolean  @default(true)
+  postedAt    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  items StockCountItem[]
+
+  @@index([shop])
+  @@index([shop, status])
+}
+
+// One product on a count. `snapshotQty` is the location's on-hand at the moment the line
+// was added, captured so the variance the operator reviews is measured against a fixed
+// figure rather than a stock level that keeps moving. `countedQty` is null until counted.
+model StockCountItem {
+  id          String     @id @default(cuid())
+  stockCountId String
+  stockCount  StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product    @relation(fields: [productId], references: [id])
+  snapshotQty Int
+  countedQty  Int?
+  note        String?
+
+  // A product appears at most once per count — a second scan of the same SKU updates the
+  // one line rather than creating a duplicate to reconcile.
+  @@unique([stockCountId, productId])
+  @@index([stockCountId])
 }
 
 // Webhook idempotency ledger. Shopify retries on any non-2xx or timeout; without this

@@ -29,7 +29,7 @@ const shopScopedModels = Prisma.dmmf.datamodel.models
  * Models with no `shop` column, scoped through a parent relation instead. These must
  * still be purged, via a nested `where`.
  */
-const RELATION_SCOPED = ["PurchaseOrderItem", "StockTransferItem"];
+const RELATION_SCOPED = ["PurchaseOrderItem", "StockTransferItem", "StockCountItem"];
 
 /** `Product` -> `prisma.product` */
 const clientProperty = (model: string) =>

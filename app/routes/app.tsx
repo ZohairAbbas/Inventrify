@@ -57,6 +57,8 @@ export default function App() {
         <Link to="/app/suppliers">Suppliers</Link>
         <Link to="/app/seasonal-events">Seasonal Events</Link>
         <Link to="/app/stock-adjustments">Stock Adjustments</Link>
+        <Link to="/app/labels">Barcode Labels</Link>
+        <Link to="/app/counts">Cycle Counts</Link>
         <Link to="/app/settings">Settings</Link>
       </NavMenu>
       <Outlet />

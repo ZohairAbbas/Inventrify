@@ -7,7 +7,7 @@ import Papa from "papaparse";
 import { useEffect, useRef, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { applyStockDelta } from "../lib/stock.server";
+import { applyStockDelta, setBinLocation } from "../lib/stock.server";
 import { getDamagedUnitsByProduct } from "../lib/damage.server";
 import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
 import { useListParams } from "../lib/use-list-params";
@@ -160,6 +160,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           onHand: ls.onHand,
           reserved: ls.reserved,
           available: ls.onHand - ls.reserved,
+          binLocation: ls.binLocation,
         })),
         // Status is judged on inventory position (on-hand less reserved, plus stock
         // already on order and coming back from RTO) rather than raw on-hand, so a SKU
@@ -238,8 +239,9 @@ type CsvImportRow = {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
+  const userId = sessionToken?.sub ?? null;
   const formData = await request.formData();
   const intent = formData.get("intent") as string;
 
@@ -280,7 +282,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         if (product) {
           const delta = row.stock - product.currentStock;
           if (delta !== 0) {
-            const result = await applyStockDelta(admin, shop, row.productId, delta, "csv_import", "Bulk CSV import");
+            const result = await applyStockDelta(admin, shop, row.productId, delta, "csv_import", "Bulk CSV import", null, { userId });
             if ("error" in result) errors.push(`${product.title}: ${result.error}`);
             else stockChanges++;
           }
@@ -391,12 +393,22 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     const leadTimeDays = parseInt(formData.get("leadTimeDays") as string, 10);
 
     if (productId && !isNaN(reorderPoint)) {
-      await prisma.product.update({
-        where: { id: productId },
+      // Shop-scoped: `update` by bare id would let a posted product id from another tenant
+      // through. updateMany with the shop in the where clause simply matches nothing.
+      await prisma.product.updateMany({
+        where: { id: productId, shop: session.shop },
         data: { reorderPoint, leadTimeDays: isNaN(leadTimeDays) ? 7 : leadTimeDays },
       });
     }
     return { ok: true };
+  }
+
+  if (intent === "set_bin") {
+    const productId = formData.get("productId") as string;
+    const locationId = formData.get("locationId") as string;
+    const bin = (formData.get("bin") as string) ?? "";
+    const result = await setBinLocation(session.shop, productId, locationId, bin);
+    return result.ok ? { ok: true } : { error: result.error };
   }
 
   return { ok: true };
@@ -575,6 +587,23 @@ export default function Inventory() {
   useEffect(() => {
     setSupplierDraft(drawerProduct?.supplierId ?? "");
   }, [drawerProduct?.id, drawerProduct?.supplierId]);
+
+  // Bin drafts keyed by locationId, seeded whenever the drawer opens on a product.
+  const [binDrafts, setBinDrafts] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!drawerProduct) return;
+    setBinDrafts(
+      Object.fromEntries(drawerProduct.locationBreakdown.map((l) => [l.locationId, l.binLocation ?? ""])),
+    );
+  }, [drawerProduct?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const saveBin = (locationId: string) => {
+    if (!drawerProduct) return;
+    fetcher.submit(
+      { intent: "set_bin", productId: drawerProduct.id, locationId, bin: binDrafts[locationId] ?? "" },
+      { method: "POST" },
+    );
+  };
 
   const columns: DataTableColumn[] = [
     { header: "", width: "34px" },
@@ -975,6 +1004,41 @@ export default function Inventory() {
                       <span style={{ textAlign: "right", fontFamily: "var(--inv-font-mono)", fontWeight: 600 }}>{l.available}</span>
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+            {drawerProduct.locationBreakdown.length > 0 && (
+              <div style={{ marginBottom: "18px" }}>
+                <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginBottom: "8px" }}>
+                  Shelf location{drawerProduct.locationBreakdown.length > 1 ? " (per location)" : ""}
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+                  {drawerProduct.locationBreakdown.map((l) => {
+                    const dirty = (binDrafts[l.locationId] ?? "") !== (l.binLocation ?? "");
+                    return (
+                      <div key={l.locationId} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        {drawerProduct.locationBreakdown.length > 1 && (
+                          <span style={{ flex: "0 0 96px", fontSize: "11.5px", color: "var(--inv-text-2)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{l.name}</span>
+                        )}
+                        <input
+                          value={binDrafts[l.locationId] ?? ""}
+                          placeholder="e.g. A-12 · Rack 3 / Shelf B"
+                          maxLength={60}
+                          onChange={(e) => setBinDrafts((d) => ({ ...d, [l.locationId]: e.target.value }))}
+                          onKeyDown={(e) => { if (e.key === "Enter" && dirty) saveBin(l.locationId); }}
+                          style={{ flex: 1, height: "34px", border: "1px solid var(--inv-input-border-2)", borderRadius: "9px", padding: "0 10px", fontSize: "12.5px", fontFamily: "var(--inv-font-mono)", background: "#fff", color: "var(--inv-ink)" }}
+                        />
+                        {dirty && (
+                          <button
+                            onClick={() => saveBin(l.locationId)}
+                            style={{ flex: "none", border: "none", background: "var(--inv-ink)", color: "#fff", fontSize: "12px", fontWeight: 500, padding: "0 12px", height: "34px", borderRadius: "9px", cursor: "pointer" }}
+                          >
+                            Save
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}

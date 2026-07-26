@@ -17,7 +17,7 @@ if (!/_test(\?|$)/.test(process.env.DATABASE_URL ?? "")) {
   throw new Error("Refusing to run: DATABASE_URL must point at a `*_test` database.");
 }
 
-const { applyStockDelta, applyInventoryLevelUpdate } = await import("./stock.server");
+const { applyStockDelta, applyInventoryLevelUpdate, setBinLocation } = await import("./stock.server");
 const { default: prisma } = await import("../db.server");
 
 const SHOP = "stock-test.myshopify.com";
@@ -309,5 +309,64 @@ describe("applyInventoryLevelUpdate", () => {
     expect(result.applied).toBe("none");
     const after = await prisma.product.findUniqueOrThrow({ where: { id: PRODUCT_ID } });
     expect(after.currentStock).toBe(10);
+  });
+});
+
+describe("setBinLocation", () => {
+  it("sets and clears a bin on an existing location row", async () => {
+    const location = await seed(10);
+    expect((await setBinLocation(SHOP, PRODUCT_ID, location!.id, "  A-12 ")).ok).toBe(true);
+    let level = await prisma.productLocationStock.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(level.binLocation).toBe("A-12"); // trimmed
+
+    // Emptying clears it to null so "no bin" is one state, not "" vs null.
+    await setBinLocation(SHOP, PRODUCT_ID, location!.id, "   ");
+    level = await prisma.productLocationStock.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(level.binLocation).toBeNull();
+  });
+
+  it("creates the location row when the pair has no stock record yet", async () => {
+    // A merchant can shelve something before any quantity is synced for it there.
+    await seed(0, false);
+    const location = await prisma.location.create({
+      data: { shop: SHOP, shopifyLocationId: "gid://shopify/Location/new", name: "New WH" },
+    });
+    const r = await setBinLocation(SHOP, PRODUCT_ID, location.id, "B-7");
+    expect(r.ok).toBe(true);
+    const level = await prisma.productLocationStock.findUniqueOrThrow({
+      where: { productId_locationId: { productId: PRODUCT_ID, locationId: location.id } },
+    });
+    expect(level).toMatchObject({ binLocation: "B-7", onHand: 0 });
+  });
+
+  it("caps an over-long value", async () => {
+    const location = await seed(5);
+    await setBinLocation(SHOP, PRODUCT_ID, location!.id, "x".repeat(200));
+    const level = await prisma.productLocationStock.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(level.binLocation!.length).toBe(60);
+  });
+
+  it("refuses a product or location from another shop", async () => {
+    const location = await seed(5);
+    expect((await setBinLocation("other.myshopify.com", PRODUCT_ID, location!.id, "Z-1")).ok).toBe(false);
+    // The bin was not written.
+    const level = await prisma.productLocationStock.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(level.binLocation).toBeNull();
+  });
+});
+
+describe("user attribution", () => {
+  it("records the acting user id on an adjustment", async () => {
+    await seed(10);
+    await applyStockDelta(mockAdmin(), SHOP, PRODUCT_ID, -2, "damage", null, null, { userId: "998877" });
+    const adj = await prisma.stockAdjustment.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(adj.createdByUserId).toBe("998877");
+  });
+
+  it("leaves it null when no user is supplied (e.g. a cron movement)", async () => {
+    await seed(10);
+    await applyStockDelta(mockAdmin(), SHOP, PRODUCT_ID, -1, "damage", null);
+    const adj = await prisma.stockAdjustment.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(adj.createdByUserId).toBeNull();
   });
 });

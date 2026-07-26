@@ -30,12 +30,22 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     },
   });
   if (!count) throw new Response("Not found", { status: 404 });
-  return { count };
+
+  // The bin/shelf for each item at this count's location, so the counter is told where to
+  // look rather than hunting the floor. One query keyed by (product, location).
+  const bins = await prisma.productLocationStock.findMany({
+    where: { locationId: count.locationId, productId: { in: count.items.map((i) => i.productId) } },
+    select: { productId: true, binLocation: true },
+  });
+  const binByProduct = Object.fromEntries(bins.map((b) => [b.productId, b.binLocation]));
+
+  return { count, binByProduct };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
+  const userId = sessionToken?.sub ?? null;
   const countId = params.countId as string;
   const formData = await request.formData();
   const intent = formData.get("intent") as string;
@@ -71,7 +81,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     case "cancel":
       return withStatus(await cancelStockCount(shop, countId), intent, "Count cancelled");
     case "post": {
-      const r = await postStockCount(admin, shop, countId);
+      const r = await postStockCount(admin, shop, countId, userId);
       if (!r.ok) return { ok: false as const, intent, error: r.error ?? "Could not post" };
       const warn = r.shopifyWarnings.length > 0 ? ` (${r.shopifyWarnings.length} Shopify sync warning${r.shopifyWarnings.length === 1 ? "" : "s"})` : "";
       const failed = r.failures.length > 0 ? ` · ${r.failures.length} line${r.failures.length === 1 ? "" : "s"} failed` : "";
@@ -93,7 +103,7 @@ function variance(item: Item): number | null {
 }
 
 export default function CountDetail() {
-  const { count } = useLoaderData<typeof loader>();
+  const { count, binByProduct } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const { timezone = "UTC", theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -223,7 +233,14 @@ export default function CountDetail() {
               const name = item.product.variantTitle ? `${item.product.title} — ${item.product.variantTitle}` : item.product.title;
               return (
                 <div key={item.id} style={{ display: "grid", gridTemplateColumns: columns.map((c) => c.width).join(" "), gap: "12px", padding: "10px 16px", borderBottom: "1px solid var(--inv-divider)", alignItems: "center", fontSize: "13px" }}>
-                  <div style={{ minWidth: 0, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{name}</div>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{name}</div>
+                    {binByProduct[item.productId] && (
+                      <div style={{ fontSize: "11px", color: "var(--inv-accent)", fontFamily: "var(--inv-font-mono)" }}>
+                        📍 {binByProduct[item.productId]}
+                      </div>
+                    )}
+                  </div>
                   <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>{item.product.sku ?? "—"}</div>
                   {showSystem && <div style={{ textAlign: "right", fontFamily: "var(--inv-font-mono)" }}>{item.snapshotQty}</div>}
                   <div style={{ textAlign: "right" }}>

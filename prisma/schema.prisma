@@ -231,6 +231,12 @@ model ProductLocationStock {
   location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
   onHand     Int      @default(0)
   reserved   Int      @default(0) // available = onHand - reserved
+  // Free-text bin / shelf / aisle within the location — "A-12", "Rack 3 / Shelf B".
+  // Answers "where is it" on the shelf, which is the question a picker or a counter
+  // actually has. Deliberately not a modelled bin master with its own coordinates: that
+  // is a full WMS, and this is the string that gets 80% of the value. Merchant-entered,
+  // never synced from Shopify (which has no concept of it).
+  binLocation String?
   updatedAt  DateTime @updatedAt
 
   @@unique([productId, locationId])
@@ -280,6 +286,12 @@ model StockAdjustment {
   // (or one double-submit) previously created two opposing movements and swung stock by
   // twice the original delta, with nothing in the audit trail to show why.
   reversalOf String?  @unique
+  // Shopify staff user id (session token `sub`) of whoever made the change, when the
+  // request carried one. Just the id: the app lacks read_users scope, so a staff name
+  // cannot be resolved — but an id still tells two people apart in the audit trail, which
+  // is what the "user" column always claimed and never delivered. Null for movements with
+  // no acting user (a cron job, or an older adjustment made before this was captured).
+  createdByUserId String?
   createdAt  DateTime @default(now())
 
   @@index([shop, productId])

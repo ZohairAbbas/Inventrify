@@ -52,6 +52,8 @@ export async function applyStockDelta(
      * check loses to two concurrent submits.
      */
     reversalOf?: string | null;
+    /** Shopify staff user id (session token `sub`) of whoever made the change. */
+    userId?: string | null;
   },
 ) {
   const product = await prisma.product.findFirst({ where: { id: productId, shop } });
@@ -69,6 +71,7 @@ export async function applyStockDelta(
   let newStock = product.currentStock;
   let guardError: string | null = null;
   const reversalOf = options?.reversalOf ?? null;
+  const createdByUserId = options?.userId ?? null;
 
   try {
     await prisma.$transaction(async (tx) => {
@@ -84,7 +87,7 @@ export async function applyStockDelta(
       }
 
       await tx.stockAdjustment.create({
-        data: { shop, productId, delta, reason, note, locationId: targetLocationId, reversalOf },
+        data: { shop, productId, delta, reason, note, locationId: targetLocationId, reversalOf, createdByUserId },
       });
 
       await tx.productLocationStock.upsert({
@@ -121,7 +124,7 @@ export async function applyStockDelta(
       }
 
       await tx.stockAdjustment.create({
-        data: { shop, productId, delta, reason, note, locationId: null, reversalOf },
+        data: { shop, productId, delta, reason, note, locationId: null, reversalOf, createdByUserId },
       });
 
       const updated = await tx.product.update({
@@ -305,6 +308,35 @@ export async function applyInventoryLevelUpdate(
   });
 
   return { applied: "location", productId: product.id, onHand };
+}
+
+/**
+ * Set (or clear) the bin/shelf label for a product at a location.
+ *
+ * Shop-scoped through the location, so a product id posted from a form cannot label
+ * another tenant's stock. Creates the per-location row if the pair has no stock record
+ * yet — a merchant can shelve something before any quantity is synced. Trimmed, and an
+ * empty string clears it so "no bin" is one state.
+ */
+export async function setBinLocation(
+  shop: string,
+  productId: string,
+  locationId: string,
+  bin: string | null,
+): Promise<{ ok: boolean; error?: string }> {
+  const [product, location] = await Promise.all([
+    prisma.product.findFirst({ where: { id: productId, shop }, select: { id: true } }),
+    prisma.location.findFirst({ where: { id: locationId, shop }, select: { id: true } }),
+  ]);
+  if (!product || !location) return { ok: false, error: "Product or location not found in this shop" };
+
+  const value = bin?.trim() ? bin.trim().slice(0, 60) : null;
+  await prisma.productLocationStock.upsert({
+    where: { productId_locationId: { productId, locationId } },
+    create: { shop, productId, locationId, onHand: 0, reserved: 0, binLocation: value },
+    update: { binLocation: value },
+  });
+  return { ok: true };
 }
 
 /** The location a receipt should land at: explicit choice, else first active. */

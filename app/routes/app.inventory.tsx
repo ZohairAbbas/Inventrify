@@ -29,6 +29,7 @@ import {
   FilterChips,
   PageHead,
   Pagination,
+  Barcode,
   SelectInput,
   ClassBadge,
   ProductThumb,
@@ -893,15 +894,6 @@ export default function Inventory() {
               <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "11.5px", color: "var(--inv-muted)" }}>
                 {drawerProduct.sku ?? "—"}
               </span>
-              {drawerProduct.barcode && (
-                <span
-                  title="Barcode"
-                  style={{ display: "inline-flex", alignItems: "center", gap: "5px", fontFamily: "var(--inv-font-mono)", fontSize: "11.5px", color: "var(--inv-muted)" }}
-                >
-                  <span aria-hidden>▮▯▮</span>
-                  {drawerProduct.barcode}
-                </span>
-              )}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "14px", marginBottom: "18px" }}>
               <ProductThumb src={drawerProduct.imageUrl} name={drawerProduct.displayName} size={56} />
@@ -986,6 +978,28 @@ export default function Inventory() {
                 </div>
               </div>
             )}
+            {(() => {
+              // Show the scannable code. A product with no barcode of its own still gets a
+              // label generated from its SKU, which is what most unbranded catalogues in
+              // these markets need — a code to print and stick on, not one from a supplier.
+              const codeValue = drawerProduct.barcode || drawerProduct.sku;
+              if (!codeValue) return null;
+              return (
+                <div style={{ marginBottom: "18px" }}>
+                  <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: "8px" }}>
+                    <label style={{ fontSize: "11px", color: "var(--inv-muted)" }}>
+                      {drawerProduct.barcode ? "Barcode" : "Label from SKU"}
+                    </label>
+                    <Link to={`/app/labels?product=${drawerProduct.id}`} style={{ fontSize: "11.5px", color: "var(--inv-accent)" }}>
+                      Print label →
+                    </Link>
+                  </div>
+                  <div style={{ background: "#fff", border: "1px solid var(--inv-divider)", borderRadius: "10px", padding: "12px", display: "flex", justifyContent: "center" }}>
+                    <Barcode value={codeValue} moduleWidth={1.7} height={48} fontSize={11} />
+                  </div>
+                </div>
+              );
+            })()}
             <div style={{ marginBottom: "18px" }}>
               <label style={{ fontSize: "11px", color: "var(--inv-muted)", display: "block", marginBottom: "6px" }}>Supplier</label>
               <div style={{ display: "flex", gap: "8px" }}>

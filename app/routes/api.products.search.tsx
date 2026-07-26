@@ -39,7 +39,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           }
         : {}),
     },
-    select: { id: true, title: true, variantTitle: true, sku: true, barcode: true, currentStock: true, unitCost: true },
+    select: { id: true, title: true, variantTitle: true, sku: true, barcode: true, currentStock: true, unitCost: true, avgMargin: true },
     orderBy: [{ title: "asc" }, { id: "asc" }],
     take: LIMIT,
   });
@@ -49,10 +49,18 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       id: p.id,
       label: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
       sku: p.sku,
+      barcode: p.barcode,
       currentStock: p.currentStock,
       // Lets a PO line seed its cost from the product instead of defaulting to zero,
       // which is how generated POs used to end up with a total of 0.
       unitCost: p.unitCost,
+      // A retail estimate for label printing, derived from cost and margin server-side.
+      // Never send raw cost to the label page: printing cost on a customer-facing sticker
+      // leaks the margin. Null when it cannot be estimated.
+      retailPrice:
+        p.unitCost > 0 && p.avgMargin > 0 && p.avgMargin < 0.95
+          ? Math.round((p.unitCost / (1 - p.avgMargin)) * 100) / 100
+          : null,
     })),
     // Lets the picker say "refine your search" rather than silently truncating.
     truncated: products.length === LIMIT,

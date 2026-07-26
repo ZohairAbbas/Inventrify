@@ -136,7 +136,9 @@ export function ScanInput({
           height: "40px",
         }}
       >
-        <span aria-hidden style={{ fontSize: "15px", color: "var(--inv-muted)" }}>▮▯▮</span>
+        <svg aria-hidden width="17" height="17" viewBox="0 0 24 24" fill="none" style={{ flexShrink: 0, color: "var(--inv-muted)" }}>
+          <path d="M3 5v14M6 5v14M9.5 5v14M13 5v14M16 5v14M18 5v14M21 5v14" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+        </svg>
         <input
           ref={inputRef}
           value={code}

@@ -29,3 +29,4 @@ export { ProductCombobox } from "./ProductCombobox";
 export type { ComboboxProduct } from "./ProductCombobox";
 export { ScanInput } from "./ScanInput";
 export type { ScannedProduct } from "./ScanInput";
+export { Barcode } from "./Barcode";

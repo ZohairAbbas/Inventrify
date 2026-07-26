@@ -525,10 +525,15 @@ export default function Settings() {
         </Card>
 
         <Card style={{ marginBottom: "14px" }}>
-          <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "10px" }}>Barcode scanning</div>
+          <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "10px" }}>Barcode scanning &amp; labels</div>
           <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.6, marginBottom: "10px" }}>
-            Wherever you see the scan field <span style={{ fontFamily: "var(--inv-font-mono)" }}>▮▯▮</span> — on
-            stock adjustments, purchase-order receiving, and the inventory search box — you can scan a barcode
+            No barcodes on your products? Generate and print them from the{" "}
+            <a href="/app/labels" style={{ color: "var(--inv-accent)" }}>Barcode Labels</a> page — a scannable code
+            is made from each SKU, so an unbranded catalogue can be scanned just like a branded one.
+          </div>
+          <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.6, marginBottom: "10px" }}>
+            Wherever you see the scan field — on stock adjustments, purchase-order receiving, and the
+            inventory search box — you can scan a barcode
             instead of typing. The barcode comes from each variant&apos;s <b>Barcode</b> field in Shopify and
             syncs automatically; a scan matches it exactly, falling back to SKU. A USB or Bluetooth scanner needs
             no setup: it types the code and presses Enter, which is all the field listens for.

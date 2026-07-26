@@ -294,22 +294,41 @@ export default function StockAdjustments() {
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "16px" }}>
             <div>
               <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>Product / variant</label>
-              <div style={{ marginBottom: "8px" }}>
-                <ScanInput
-                  hint="Scan to select the product. A handheld scanner types the code and presses Enter for you."
-                  onScan={(p) =>
-                    setProduct({ id: p.id, label: p.label, currentStock: p.currentStock })
-                  }
-                />
-              </div>
-              <ProductCombobox
-                value={product?.id ?? ""}
-                valueLabel={product?.label ?? null}
-                placeholder="Search a product to adjust…"
-                onChange={(id, picked) =>
-                  setProduct(picked ? { id, label: picked.label, currentStock: picked.currentStock } : null)
-                }
-              />
+              {product ? (
+                // Selected state: a clear confirmation, not a second empty input beside a
+                // scanner. Clearing it returns to the scan/search controls.
+                <div style={{ display: "flex", alignItems: "center", gap: "10px", background: "var(--inv-accent-soft)", border: "1px solid var(--inv-accent)", borderRadius: "10px", padding: "9px 12px" }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontSize: "13px", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{product.label}</div>
+                    <div style={{ fontSize: "11.5px", color: "var(--inv-text-2)", fontFamily: "var(--inv-font-mono)" }}>{product.currentStock} on hand</div>
+                  </div>
+                  <button
+                    onClick={() => setProduct(null)}
+                    style={{ flexShrink: 0, fontSize: "11.5px", border: "1px solid var(--inv-input-border-2)", background: "#fff", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
+                  >
+                    Change
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <ScanInput
+                    hint="A handheld scanner — or your phone — types the code and presses Enter."
+                    onScan={(p) => setProduct({ id: p.id, label: p.label, currentStock: p.currentStock })}
+                  />
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px", margin: "9px 0" }}>
+                    <div style={{ flex: 1, height: "1px", background: "var(--inv-divider)" }} />
+                    <span style={{ fontSize: "11px", color: "var(--inv-muted)" }}>or search</span>
+                    <div style={{ flex: 1, height: "1px", background: "var(--inv-divider)" }} />
+                  </div>
+                  <ProductCombobox
+                    value=""
+                    placeholder="Search a product to adjust…"
+                    onChange={(id, picked) =>
+                      picked && setProduct({ id, label: picked.label, currentStock: picked.currentStock })
+                    }
+                  />
+                </>
+              )}
             </div>
             <div>
               <label style={{ fontSize: "12px", color: "var(--inv-text-2)", display: "block", marginBottom: "6px" }}>Reason</label>

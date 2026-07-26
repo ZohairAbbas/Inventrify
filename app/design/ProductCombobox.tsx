@@ -7,6 +7,8 @@ export interface ComboboxProduct {
   sku: string | null;
   currentStock: number;
   unitCost: number;
+  barcode: string | null;
+  retailPrice: number | null;
 }
 
 interface Props {
@@ -71,7 +73,7 @@ export function ProductCombobox({
   }, [open]);
 
   const options = emptyOption
-    ? [{ id: "", label: emptyOption, sku: null, currentStock: 0, unitCost: 0 }, ...results]
+    ? [{ id: "", label: emptyOption, sku: null, currentStock: 0, unitCost: 0, barcode: null, retailPrice: null }, ...results]
     : results;
 
   const choose = (product: ComboboxProduct) => {

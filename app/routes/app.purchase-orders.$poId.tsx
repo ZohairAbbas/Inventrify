@@ -6,7 +6,7 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, PageHead, POStatusPill, ProductCombobox, ProductThumb, ScanInput, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, PageHead, POStatusPill, PrintSheet, ProductCombobox, ProductThumb, ScanInput, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
 import {
   markPurchaseOrderSent,
   parseReceivedQuantities,
@@ -292,16 +292,73 @@ export default function PODetail() {
   return (
     <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title={`PO ${po.poNumber}`}>
-        <button onClick={() => window.print()}>Print / PDF</button>
+        <button onClick={() => window.print()}>Print</button>
       </TitleBar>
 
-      <style>{`
-        @media print {
-          [data-polaris-topbar], nav, [role="navigation"], .Polaris-Frame__Navigation {
-            display: none !important;
-          }
-        }
-      `}</style>
+      {/* Printable PO document. Print-isolated, so it replaces the old whole-page print.
+          When the PO is out for delivery it gains a blank "Received" column, doubling as
+          a receiving checklist; otherwise it is a clean order to send the supplier. */}
+      <PrintSheet id="po-print-sheet">
+        <div style={{ padding: "6px 2px 14px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px" }}>
+            <div>
+              <div style={{ fontSize: "18px", fontWeight: 700 }}>
+                {po.status === "sent" ? "Receiving sheet" : "Purchase order"} — {po.poNumber}
+              </div>
+              {po.supplier && (
+                <div style={{ fontSize: "12.5px", marginTop: "3px" }}>
+                  Supplier: <b>{po.supplier.name}</b>{po.supplier.email ? ` · ${po.supplier.email}` : ""}
+                </div>
+              )}
+            </div>
+            <div style={{ fontSize: "12px", textAlign: "right" }}>
+              <div>Created {formatDate(po.createdAt, timezone)}</div>
+              {po.expectedDeliveryDate && <div>Expected {formatDate(po.expectedDeliveryDate, timezone)}</div>}
+            </div>
+          </div>
+
+          <table className="sheet-table">
+            <thead>
+              <tr>
+                <th style={{ width: "16%" }}>SKU</th>
+                <th>Product</th>
+                <th className="num" style={{ width: "10%" }}>Qty</th>
+                <th className="num" style={{ width: "14%" }}>Unit cost</th>
+                <th className="num" style={{ width: "14%" }}>Line total</th>
+                {po.status === "sent" && <th style={{ width: "12%" }}>Received</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {po.items.map((item) => {
+                const name = item.product.variantTitle ? `${item.product.title} — ${item.product.variantTitle}` : item.product.title;
+                return (
+                  <tr key={item.id}>
+                    <td style={{ fontFamily: "var(--inv-font-mono)" }}>{item.product.sku ?? "—"}</td>
+                    <td>{name}</td>
+                    <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantityOrdered}</td>
+                    <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(item.unitCost, currency)}</td>
+                    <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(item.quantityOrdered * item.unitCost, currency)}</td>
+                    {po.status === "sent" && <td></td>}
+                  </tr>
+                );
+              })}
+              <tr>
+                <td colSpan={4} style={{ textAlign: "right", fontWeight: 700 }}>Total</td>
+                <td className="num" style={{ fontWeight: 700, fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(po.totalCost, currency)}</td>
+                {po.status === "sent" && <td></td>}
+              </tr>
+            </tbody>
+          </table>
+
+          {po.notes && <div style={{ marginTop: "12px", fontSize: "12px" }}><b>Notes:</b> {po.notes}</div>}
+          {po.status === "sent" && (
+            <div style={{ marginTop: "18px", fontSize: "11.5px", display: "flex", justifyContent: "space-between" }}>
+              <span>Received by ______________________</span>
+              <span>Date __________</span>
+            </div>
+          )}
+        </div>
+      </PrintSheet>
 
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead
@@ -543,7 +600,7 @@ export default function PODetail() {
           <Link to="/app/purchase-orders">
             <Button variant="ghost">← Back to Purchase Orders</Button>
           </Link>
-          <Button variant="ghost" onClick={() => window.print()}>Print / PDF</Button>
+          <Button variant="ghost" onClick={() => window.print()}>Print PO</Button>
         </div>
       </div>
     </div>

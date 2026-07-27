@@ -30,3 +30,4 @@ export type { ComboboxProduct } from "./ProductCombobox";
 export { ScanInput } from "./ScanInput";
 export type { ScannedProduct } from "./ScanInput";
 export { Barcode } from "./Barcode";
+export { PrintSheet } from "./PrintSheet";

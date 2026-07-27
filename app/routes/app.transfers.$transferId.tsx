@@ -7,7 +7,7 @@ import { useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { applyLocationDelta } from "../lib/stock.server";
-import { Button, Card, DataTable, PageHead, TextInput, TransferStatusPill, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, PageHead, PrintSheet, TextInput, TransferStatusPill, type DataTableColumn } from "../design";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -20,7 +20,18 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     },
   });
   if (!transfer) throw new Response("Not found", { status: 404 });
-  return { transfer };
+
+  // Bin/shelf at the SOURCE location, so the pick sheet tells the picker where to pull
+  // each item from. Keyed by product; missing = no bin recorded there.
+  const bins = await prisma.productLocationStock.findMany({
+    where: { locationId: transfer.fromLocationId, productId: { in: transfer.items.map((i) => i.productId) } },
+    select: { productId: true, binLocation: true },
+  });
+  const binByProduct: Record<string, string | null> = Object.fromEntries(
+    bins.map((b) => [b.productId, b.binLocation]),
+  );
+
+  return { transfer, binByProduct };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
@@ -87,7 +98,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 export default function TransferDetail() {
-  const { transfer } = useLoaderData<typeof loader>();
+  const { transfer, binByProduct } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const { timezone = "UTC", theme = "emerald" } =
@@ -151,14 +162,83 @@ export default function TransferDetail() {
 
   return (
     <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
-      <TitleBar title={`Transfer ${transfer.transferNumber}`} />
+      <TitleBar title={`Transfer ${transfer.transferNumber}`}>
+        <button onClick={() => window.print()}>Print pick sheet</button>
+      </TitleBar>
 
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead
           eyebrow="Stock transfer"
           title={transfer.transferNumber}
-          right={<TransferStatusPill status={transfer.status} />}
+          right={
+            <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+              <Button variant="ghost" onClick={() => window.print()}>Print pick sheet</Button>
+              <TransferStatusPill status={transfer.status} />
+            </div>
+          }
         />
+
+        {/* Bin-ordered picking document. Visible as a preview; print isolates it. */}
+        <PrintSheet id="transfer-pick-sheet">
+          <div style={{ padding: "6px 2px 14px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px" }}>
+              <div>
+                <div style={{ fontSize: "18px", fontWeight: 700 }}>Pick sheet — {transfer.transferNumber}</div>
+                <div style={{ fontSize: "12.5px", marginTop: "3px" }}>
+                  Pull from <b>{transfer.fromLocation.name}</b> → deliver to <b>{transfer.toLocation.name}</b>
+                </div>
+              </div>
+              <div style={{ fontSize: "12px", textAlign: "right" }}>
+                <div>Created {formatDate(transfer.createdAt, timezone)}</div>
+                <div>{transfer.items.length} line{transfer.items.length === 1 ? "" : "s"} · {transfer.items.reduce((s, i) => s + i.quantitySent, 0)} units</div>
+              </div>
+            </div>
+
+            <table className="sheet-table">
+              <thead>
+                <tr>
+                  <th style={{ width: "16%" }}>Bin</th>
+                  <th style={{ width: "18%" }}>SKU</th>
+                  <th>Product</th>
+                  <th className="num" style={{ width: "12%" }}>Qty</th>
+                  <th style={{ width: "12%" }}>Picked ✓</th>
+                </tr>
+              </thead>
+              <tbody>
+                {[...transfer.items]
+                  // Order by bin so the picker walks the shelves once. Unbinned items last.
+                  .sort((a, b) => {
+                    const ba = binByProduct[a.productId] ?? "";
+                    const bb = binByProduct[b.productId] ?? "";
+                    if (ba === bb) return 0;
+                    if (!ba) return 1;
+                    if (!bb) return -1;
+                    return ba.localeCompare(bb, undefined, { numeric: true });
+                  })
+                  .map((item) => {
+                    const name = item.product.variantTitle ? `${item.product.title} — ${item.product.variantTitle}` : item.product.title;
+                    return (
+                      <tr key={item.id}>
+                        <td style={{ fontFamily: "var(--inv-font-mono)" }}>{binByProduct[item.productId] || "—"}</td>
+                        <td style={{ fontFamily: "var(--inv-font-mono)" }}>{item.product.sku ?? "—"}</td>
+                        <td>{name}</td>
+                        <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantitySent}</td>
+                        <td></td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+
+            {transfer.notes && (
+              <div style={{ marginTop: "12px", fontSize: "12px" }}><b>Notes:</b> {transfer.notes}</div>
+            )}
+            <div style={{ marginTop: "18px", fontSize: "11.5px", display: "flex", justifyContent: "space-between" }}>
+              <span>Picked by ______________________</span>
+              <span>Date __________</span>
+            </div>
+          </div>
+        </PrintSheet>
 
         {fetcher.data?.error && (
           <Card padding="12px 16px" style={{ marginBottom: "16px", borderColor: "var(--inv-status-critical-dot)" }}>

@@ -144,6 +144,143 @@ describe("syncShopifyInventory", () => {
     expect(levels).toBe(1);
   });
 
+  it("removes a per-location level Shopify no longer reports", async () => {
+    // Regression: levels were upsert-only, so stock that moved off a location kept its
+    // last known onHand forever and no re-sync could correct it. This is the shape of the
+    // "I removed the inventory in Shopify but the app still shows it" report.
+    const twoLocations = {
+      data: {
+        locations: {
+          edges: [
+            { node: { id: "gid://shopify/Location/1", name: "Karachi WH", isActive: true } },
+            { node: { id: "gid://shopify/Location/2", name: "Lahore WH", isActive: true } },
+          ],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    };
+
+    // First sync: stocked at both locations.
+    const atBoth = variant("1");
+    atBoth.node.inventoryItem.inventoryLevels.edges.push({
+      node: {
+        location: { id: "gid://shopify/Location/2" },
+        quantities: [
+          { name: "on_hand", quantity: 40 },
+          { name: "available", quantity: 40 },
+        ],
+      },
+    });
+    const first = mockAdmin((q) =>
+      isLocations(q) ? { body: twoLocations } : { body: variantsBody([atBoth]) },
+    );
+    await syncShopifyInventory(first.admin, SHOP);
+    expect(await prisma.productLocationStock.count({ where: { shop: SHOP } })).toBe(2);
+
+    // Second sync: Lahore no longer holds any of it.
+    const second = mockAdmin((q) =>
+      isLocations(q) ? { body: twoLocations } : { body: variantsBody([variant("1")]) },
+    );
+    await syncShopifyInventory(second.admin, SHOP);
+
+    const levels = await prisma.productLocationStock.findMany({
+      where: { shop: SHOP },
+      include: { location: true },
+    });
+    expect(levels).toHaveLength(1);
+    expect(levels[0].location.shopifyLocationId).toBe("gid://shopify/Location/1");
+
+    const p = await prisma.product.findFirst({ where: { shop: SHOP } });
+    expect(p?.currentStock).toBe(5);
+  });
+
+  it("zeroes rather than deletes a stale level that carries a bin label", async () => {
+    // binLocation is merchant-entered, not Shopify-derived. Reconciling stock away must
+    // not also throw away where they put the goods.
+    const { admin } = mockAdmin((q) =>
+      isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) },
+    );
+    await syncShopifyInventory(admin, SHOP);
+
+    const other = await prisma.location.create({
+      data: { shop: SHOP, shopifyLocationId: "gid://shopify/Location/9", name: "Lahore", isActive: true },
+    });
+    await prisma.productLocationStock.create({
+      data: {
+        shop: SHOP,
+        productId: "gid://shopify/ProductVariant/1",
+        locationId: other.id,
+        onHand: 12,
+        reserved: 0,
+        binLocation: "A-04-3",
+      },
+    });
+
+    // Shopify still reports the variant only at Location/1, so Lahore is stale.
+    const again = mockAdmin((q) =>
+      isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) },
+    );
+    await syncShopifyInventory(again.admin, SHOP);
+
+    const kept = await prisma.productLocationStock.findUnique({
+      where: {
+        productId_locationId: { productId: "gid://shopify/ProductVariant/1", locationId: other.id },
+      },
+    });
+    expect(kept).not.toBeNull();
+    expect(kept?.onHand).toBe(0);
+    expect(kept?.binLocation).toBe("A-04-3");
+  });
+
+  it("keeps existing levels when the shop's token cannot read locations", async () => {
+    // The no-location fallback yields no levels at all. Treating that as "no stock
+    // anywhere" would wipe every level the shop has, so the reconciliation must not fire.
+    const withLocations = mockAdmin((q) =>
+      isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) },
+    );
+    await syncShopifyInventory(withLocations.admin, SHOP);
+    expect(await prisma.productLocationStock.count({ where: { shop: SHOP } })).toBe(1);
+
+    const denied = mockAdmin((q) =>
+      isLocations(q)
+        ? { body: { errors: [{ message: "Access denied for locations field" }] } }
+        : { body: variantsBody([variant("1")]) },
+    );
+    await syncShopifyInventory(denied.admin, SHOP);
+
+    expect(await prisma.productLocationStock.count({ where: { shop: SHOP } })).toBe(1);
+  });
+
+  it("deactivates a location Shopify no longer lists", async () => {
+    const both = {
+      data: {
+        locations: {
+          edges: [
+            { node: { id: "gid://shopify/Location/1", name: "Karachi WH", isActive: true } },
+            { node: { id: "gid://shopify/Location/2", name: "Closed WH", isActive: true } },
+          ],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    };
+    const first = mockAdmin((q) =>
+      isLocations(q) ? { body: both } : { body: variantsBody([variant("1")]) },
+    );
+    await syncShopifyInventory(first.admin, SHOP);
+
+    const second = mockAdmin((q) =>
+      isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) },
+    );
+    await syncShopifyInventory(second.admin, SHOP);
+
+    const closed = await prisma.location.findFirst({
+      where: { shop: SHOP, shopifyLocationId: "gid://shopify/Location/2" },
+    });
+    // Deactivated, not deleted — counts, transfers and bins still reference it.
+    expect(closed).not.toBeNull();
+    expect(closed?.isActive).toBe(false);
+  });
+
   it("stores an empty or missing barcode as null, not an empty string", async () => {
     // A blank must land as NULL so "no barcode" is one value — otherwise an exact-match
     // scan for "" would match every blank row at once.

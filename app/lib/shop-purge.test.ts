@@ -20,6 +20,11 @@ const purgeSource = readFileSync(
   "utf8",
 );
 
+const webhookSource = readFileSync(
+  new URL("../routes/webhooks.tsx", import.meta.url),
+  "utf8",
+);
+
 /** Models carrying their own `shop` column — i.e. directly tenant-scoped. */
 const shopScopedModels = Prisma.dmmf.datamodel.models
   .filter((m) => m.fields.some((f) => f.name === "shop" && f.kind === "scalar"))
@@ -48,6 +53,48 @@ describe("purgeShopData coverage", () => {
 
   it.each(RELATION_SCOPED)("deletes %s via its parent relation", (model) => {
     expect(purgeSource).toContain(`prisma.${clientProperty(model)}.deleteMany`);
+  });
+
+  /**
+   * The purge being correct is worth nothing if the handler declines to call it.
+   *
+   * `case "APP_UNINSTALLED": if (session) await purgeShopData(shop)` shipped for months.
+   * Offline tokens expire and redeliveries arrive after the session row is gone, so
+   * `session` was routinely undefined and the shop's rows survived the uninstall — then
+   * reinstall + re-sync, both upsert-only, showed the merchant their original data back.
+   */
+  it("purges on uninstall unconditionally, not only when a session survives", () => {
+    const branch = webhookSource.slice(
+      webhookSource.indexOf(`case "APP_UNINSTALLED"`),
+      webhookSource.indexOf(`case "SHOP_REDACT"`),
+    );
+    expect(branch).toContain("purgeShopData(shop)");
+    expect(branch).not.toMatch(/if\s*\(\s*session\s*\)/);
+  });
+
+  /**
+   * The dedupe claim is taken before the handler runs. If it is never released on failure,
+   * Shopify's retries are all deduped away and a failed uninstall is lost for good.
+   */
+  it("releases the webhook claim when a handler throws", () => {
+    expect(webhookSource).toContain("releaseDelivery(webhookId, topic)");
+  });
+
+  /**
+   * ...but only for topics that can be re-run. ORDERS_CREATE and ORDERS_CANCELLED apply
+   * relative changes outside a transaction, so releasing their claim would let a retry
+   * re-count units the failed attempt had already committed — permanently inflating
+   * demand, which is the very thing the claim exists to prevent.
+   */
+  it("does not release the claim for topics that apply relative changes", () => {
+    const rerunnable = webhookSource.slice(
+      webhookSource.indexOf("const RERUNNABLE_TOPICS"),
+      webhookSource.indexOf("async function releaseDelivery"),
+    );
+    expect(rerunnable).toContain("APP_UNINSTALLED");
+    expect(rerunnable).toContain("SHOP_REDACT");
+    expect(rerunnable).not.toContain("ORDERS_CREATE");
+    expect(rerunnable).not.toContain("ORDERS_CANCELLED");
   });
 
   it("leaves nothing tenant-scoped unaccounted for", () => {

@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import prisma from "../db.server";
+import { listSyncableShops } from "../lib/active-shops.server";
 import {
   generateAlerts,
   getDispatchableAlerts,
@@ -22,11 +22,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // Get all distinct shops with active sessions
-  const shops = await prisma.session.findMany({
-    distinct: ["shop"],
-    select: { shop: true },
-  });
+  // Installed shops only — an uninstalled one has had its session removed, which also
+  // stops us emailing a merchant who has left.
+  const shops = await listSyncableShops();
 
   let totalAlerts = 0;
   let totalSent = 0;
@@ -40,7 +38,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     error?: string;
   }[] = [];
 
-  for (const { shop } of shops) {
+  for (const shop of shops) {
     try {
       const { total, opened, resolved } = await generateAlerts(shop);
       totalAlerts += total;

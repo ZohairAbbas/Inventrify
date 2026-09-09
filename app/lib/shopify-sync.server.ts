@@ -91,6 +91,22 @@ export async function syncLocations(
     cursor = data.locations.pageInfo.endCursor;
   }
 
+  // A location Shopify no longer lists is deactivated rather than deleted: stock counts,
+  // transfers and bin locations reference it, and destroying that history to reflect a
+  // closed warehouse would be worse than showing it as inactive. Without this the row
+  // stayed `isActive: true` forever and kept appearing in location pickers.
+  //
+  // Guarded on a non-empty result: `notIn: []` matches every row, so a shop that returned
+  // no locations at all — which should be impossible, every Shopify shop has one, but an
+  // empty page from a partial outage would do it — would have its entire location list
+  // deactivated on the strength of one bad response.
+  if (map.size > 0) {
+    await prisma.location.updateMany({
+      where: { shop, isActive: true, shopifyLocationId: { notIn: [...map.keys()] } },
+      data: { isActive: false },
+    });
+  }
+
   return map;
 }
 
@@ -411,6 +427,35 @@ export async function syncShopifyInventory(
               where: { productId_locationId: { productId: variant.id, locationId: l.locationId } },
               create: { shop, productId: variant.id, locationId: l.locationId, onHand: l.onHand, reserved: l.reserved },
               update: { onHand: l.onHand, reserved: l.reserved },
+            });
+          }
+
+          // Drop levels Shopify no longer reports for this variant.
+          //
+          // The loop above only ever upserted, so a level that disappeared — stock moved
+          // off a location, a location closed, inventory untracked — kept its last known
+          // onHand forever. Those rows feed the forecast page, transfers, counts and the
+          // pick sheet, so the merchant went on being shown units at a location that had
+          // held none for weeks, and no re-sync could ever correct it.
+          //
+          // Only done when Shopify actually returned levels: an empty `perLocation` is
+          // also what the missing-`read_locations` fallback produces, and treating that
+          // as "no stock anywhere" would wipe every level the shop has.
+          //
+          // A row carrying a bin/shelf label is zeroed instead of deleted. The label is
+          // merchant-entered, not Shopify-derived — a sync must not throw away where they
+          // put the goods just because Shopify currently reports no units there.
+          if (perLocation.length > 0) {
+            const stale = {
+              productId: variant.id,
+              locationId: { notIn: perLocation.map((l) => l.locationId) },
+            };
+            await prisma.productLocationStock.updateMany({
+              where: { ...stale, binLocation: { not: null } },
+              data: { onHand: 0, reserved: 0 },
+            });
+            await prisma.productLocationStock.deleteMany({
+              where: { ...stale, binLocation: null },
             });
           }
 

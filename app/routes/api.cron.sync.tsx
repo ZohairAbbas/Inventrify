@@ -1,7 +1,7 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
+import { listSyncableShops, standDownIfUninstalled } from "../lib/active-shops.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
 import { describeError } from "../lib/shopify-graphql.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
@@ -30,10 +30,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const shops = await prisma.session.findMany({
-    distinct: ["shop"],
-    select: { shop: true },
-  });
+  const shops = await listSyncableShops();
 
   const results: {
     shop: string;
@@ -42,14 +39,43 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     records: number;
     completed: boolean;
     error?: string;
+    skipped?: string;
   }[] = [];
 
-  for (const { shop } of shops) {
+  for (const shop of shops) {
     try {
       const { admin } = await unauthenticated.admin(shop);
 
       const inventory = await syncShopifyInventory(admin, shop);
+
+      // Both sync halves report a mid-run failure by returning it rather than throwing —
+      // deliberately, so a partial catalogue walk cannot trigger the archive sweep. That
+      // means a rejected token never reaches the catch below, so it has to be inspected
+      // here too, before we spend another full order backfill on a shop that is gone.
+      if (await standDownIfUninstalled(shop, inventory.error)) {
+        results.push({
+          shop,
+          synced: inventory.synced,
+          archived: 0,
+          records: 0,
+          completed: false,
+          skipped: "uninstalled",
+        });
+        continue;
+      }
+
       const orders = await syncOrderHistory(admin, shop);
+      if (await standDownIfUninstalled(shop, orders.error)) {
+        results.push({
+          shop,
+          synced: inventory.synced,
+          archived: inventory.archived,
+          records: orders.recordsSynced,
+          completed: false,
+          skipped: "uninstalled",
+        });
+        continue;
+      }
 
       // Shopify's own carrier tracking now feeds the fulfilment pipeline and per-SKU
       // RTO, so both work with no courier integration at all. A courier feed refines
@@ -73,6 +99,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       });
     } catch (err) {
       const message = describeError(err);
+
+      // An uninstalled shop is not a failure to investigate: drop its session so it stops
+      // being enumerated at all, and report it as skipped.
+      if (await standDownIfUninstalled(shop, err)) {
+        results.push({
+          shop,
+          synced: 0,
+          archived: 0,
+          records: 0,
+          completed: false,
+          skipped: "uninstalled",
+        });
+        continue;
+      }
+
       console.error(`[cron/sync] ${shop} failed:`, message);
       results.push({
         shop,

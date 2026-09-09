@@ -9,6 +9,7 @@ import {
 } from "../lib/courierify.server";
 import { recomputeDerivedRto } from "../lib/rto-attribution.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
+import { listSyncableShops } from "../lib/active-shops.server";
 import { decryptSecret } from "../lib/crypto.server";
 
 /**
@@ -28,8 +29,12 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  // Scoped to installed shops: settings can outlive an uninstall whose webhook was missed,
+  // and polling a departed merchant's courier account on their stored key is not something
+  // we should keep doing.
+  const installed = await listSyncableShops();
   const connected = await prisma.shopSettings.findMany({
-    where: { courierifyApiKey: { not: null } },
+    where: { courierifyApiKey: { not: null }, shop: { in: installed } },
     select: { shop: true, courierifyApiKey: true },
   });
 

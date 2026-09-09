@@ -43,6 +43,21 @@ class NonRetryableGraphqlError extends Error {}
 export class MissingScopeError extends Error {}
 
 /**
+ * Raised when Shopify rejects the shop's access token (401).
+ *
+ * This is the signal that the app is no longer installed — or the token was revoked —
+ * and it is the only reliable one a background job gets, because the `app/uninstalled`
+ * webhook can be missed. Background jobs must stop working the shop when they see it
+ * rather than retrying it on every run forever.
+ *
+ * Strictly 401, never 403. A 403 means the token is valid but the call is not permitted —
+ * most often a scope the shop has not granted, or protected customer data the app is not
+ * approved for. Treating that as an uninstall would stand a live, paying merchant's sync
+ * down over a permissions problem.
+ */
+export class ShopUnauthorizedError extends Error {}
+
+/**
  * Classify a thrown value into a message and whether retrying could ever help.
  *
  * Getting this wrong is expensive in both directions. Observed in production:
@@ -53,7 +68,14 @@ export class MissingScopeError extends Error {}
  *    and the shop needs to re-authorise. It has no `.message`, so the operator-facing
  *    error read "Unknown error" and said nothing about what to do.
  */
-function classifyError(err: unknown): { message: string; retryable: boolean } {
+function classifyError(err: unknown): {
+  message: string;
+  retryable: boolean;
+  unauthorized?: boolean;
+} {
+  if (err instanceof ShopUnauthorizedError) {
+    return { message: err.message, retryable: false, unauthorized: true };
+  }
   if (err instanceof NonRetryableGraphqlError) {
     return { message: err.message, retryable: false };
   }
@@ -65,6 +87,7 @@ function classifyError(err: unknown): { message: string; retryable: boolean } {
         `authentication failed (HTTP ${err.status}) — the shop's token is no longer ` +
         `valid; it must reinstall or re-authorise the app`,
       retryable: false,
+      unauthorized: err.status === 401,
     };
   }
 
@@ -117,6 +140,44 @@ export function describeError(err: unknown): string {
   return `${name ?? "unknown"} thrown: ${safeStringify(err)}`;
 }
 
+/**
+ * True when a failure means the shop's token is dead — i.e. the app has been uninstalled
+ * or its access revoked.
+ *
+ * Matches on the message and constructor name as well as the type, because the error
+ * crosses several layers and arrives in three different shapes: this class, a bare
+ * `Response` thrown by the library on an invalid token, and `SessionNotFoundError` from
+ * `unauthenticated.admin()` when the session vanished between listing the shops and
+ * working one. A background job must not keep hammering a shop that is gone.
+ */
+export function isShopUninstalled(err: unknown): boolean {
+  if (err instanceof ShopUnauthorizedError) return true;
+  if (typeof Response !== "undefined" && err instanceof Response) {
+    return err.status === 401;
+  }
+  const name = (err as { constructor?: { name?: string } })?.constructor?.name ?? "";
+  if (name === "SessionNotFoundError") return true;
+  const msg = describeError(err);
+  return /authentication failed \(HTTP 401\)|HTTP 401\b|could not find a session/i.test(msg);
+}
+
+/**
+ * True when a failure came from the authentication layer rather than from the query.
+ *
+ * Broader than `isShopUninstalled`: the library throws a bare `Response` for anything that
+ * goes wrong obtaining or refreshing a token, and the status is not always 401 — a refresh
+ * of a long-dead offline token has been observed coming back as 500. That is suggestive of
+ * an uninstall but not proof of one, so callers must corroborate it before acting.
+ */
+export function isAuthFailure(err: unknown): boolean {
+  if (isShopUninstalled(err)) return true;
+  if (typeof Response !== "undefined" && err instanceof Response) return true;
+  // Also match the rendered text: the sync helpers report a mid-run failure by returning
+  // `describeError(err)` as a string rather than throwing, and that string is all the
+  // caller has left to classify.
+  return /authentication failed \(HTTP \d+\)/i.test(describeError(err));
+}
+
 /** True when a failure is a missing-scope problem, which callers may degrade around. */
 export function isMissingScope(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
@@ -146,17 +207,27 @@ export async function graphqlWithRetry<T>(
       }
       if (!response.ok) {
         lastError = `HTTP ${response.status}`;
+        // A rejected token means the app is gone from this shop, not that the query
+        // was wrong; callers need to tell those apart to stop syncing uninstalled shops.
+        // 403 is deliberately excluded — that is a permissions problem on a live shop.
+        if (response.status === 401) {
+          throw new ShopUnauthorizedError(
+            `authentication failed (HTTP 401) — the shop's token is no longer valid; ` +
+              `it must reinstall or re-authorise the app`,
+          );
+        }
         // 5xx is worth retrying; other 4xx will not fix themselves.
         if (response.status < 500) throw new NonRetryableGraphqlError(lastError);
         continue;
       }
       json = await response.json();
     } catch (err) {
-      const { message, retryable } = classifyError(err);
+      const { message, retryable, unauthorized } = classifyError(err);
       lastError = message;
       // A permanent failure must escape this loop rather than being folded back into
       // it as another attempt.
       if (!retryable) {
+        if (unauthorized) throw new ShopUnauthorizedError(message);
         throw isMissingScope(err)
           ? new MissingScopeError(message)
           : new Error(message);

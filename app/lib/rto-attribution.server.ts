@@ -201,9 +201,15 @@ export async function recomputeDerivedRto(
     .filter((o) => isResolvedStatus(o.status))
     .reduce<Date | null>((max, o) => (max === null || o.updatedAt > max ? o.updatedAt : max), null);
 
-  await prisma.shopSettings.update({
+  // Upsert, not update: a shop has no settings row until something writes one, and this
+  // runs on the hourly sync for every shop. An `update` threw "no record was found" and
+  // took the whole sync down with it — for a newly installed shop whose merchant had not
+  // yet opened the settings page, and for any shop whose data was reset to be rebuilt
+  // from Shopify. The defaults in the schema are the right starting point.
+  await prisma.shopSettings.upsert({
     where: { shop },
-    data: { rtoDataThrough: dataThrough, rtoOrdersAttributed: resolvedOrders.size },
+    create: { shop, rtoDataThrough: dataThrough, rtoOrdersAttributed: resolvedOrders.size },
+    update: { rtoDataThrough: dataThrough, rtoOrdersAttributed: resolvedOrders.size },
   });
 
   return {

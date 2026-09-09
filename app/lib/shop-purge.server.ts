@@ -12,7 +12,10 @@ import prisma from "../db.server";
  * Ordering respects foreign keys: leaf rows first, then parents. Child tables without
  * their own `shop` column are scoped through their parent relation.
  */
-export async function purgeShopData(shop: string): Promise<void> {
+export async function purgeShopData(
+  shop: string,
+  { keepSession = false }: { keepSession?: boolean } = {},
+): Promise<void> {
   // Rows referencing Product.
   await prisma.forecastAccuracy.deleteMany({ where: { shop } });
   await prisma.forecast.deleteMany({ where: { shop } });
@@ -58,5 +61,14 @@ export async function purgeShopData(shop: string): Promise<void> {
   await prisma.location.deleteMany({ where: { shop } });
   await prisma.supplier.deleteMany({ where: { shop } });
   await prisma.shopSettings.deleteMany({ where: { shop } });
-  await prisma.session.deleteMany({ where: { shop } });
+
+  // Session goes last, and only when the shop is genuinely gone.
+  //
+  // `keepSession` exists for the operational "wipe and re-sync from Shopify" case: the app
+  // is still installed, the token is still good, and dropping the session would force the
+  // merchant to reinstall just to rebuild data we can fetch ourselves. Uninstall and
+  // redaction both leave it at the default and take the session with everything else.
+  if (!keepSession) {
+    await prisma.session.deleteMany({ where: { shop } });
+  }
 }

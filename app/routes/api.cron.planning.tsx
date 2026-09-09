@@ -1,6 +1,6 @@
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { json } from "@remix-run/node";
-import prisma from "../db.server";
+import { listSyncableShops } from "../lib/active-shops.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
 import { describeError } from "../lib/shopify-graphql.server";
 import {
@@ -26,10 +26,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const shops = await prisma.session.findMany({
-    distinct: ["shop"],
-    select: { shop: true },
-  });
+  const shops = await listSyncableShops();
 
   const results: {
     shop: string;
@@ -40,7 +37,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     error?: string;
   }[] = [];
 
-  for (const { shop } of shops) {
+  for (const shop of shops) {
     try {
       const { scored } = await scoreForecastAccuracy(shop);
       const { classified } = await recomputeClassifications(shop);

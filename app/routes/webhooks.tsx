@@ -41,14 +41,75 @@ async function claimDelivery(
   }
 }
 
+/**
+ * Topics whose handler can safely run twice, and may therefore have a failed delivery
+ * released back for Shopify to retry.
+ *
+ * The claim is taken *before* the handler runs, which is what makes it an atomic guard
+ * against double-counting — but it was never released on failure, so a handler that threw
+ * (a DB blip, a timeout on a long purge) burned the only attempt that would ever be
+ * processed: Shopify retries, the retry sees the claim row and returns early, and the
+ * delivery is lost for good. That is how an APP_UNINSTALLED disappears without ever
+ * purging the shop.
+ *
+ * Releasing unconditionally would be worse than the bug it fixes. ORDERS_CREATE and
+ * ORDERS_CANCELLED apply relative changes (`increment`, `quantity - qty`) product by
+ * product outside a transaction, so a handler that dies halfway has already committed
+ * part of its work; re-running it would count those units twice and permanently inflate
+ * demand. For those, a lost delivery — which the hourly reconciliation sync repairs — is
+ * the lesser harm, so the claim stands.
+ *
+ * The topics below are all absolute or idempotent: the purges delete by shop, and
+ * INVENTORY_LEVELS_UPDATE writes an absolute quantity in a transaction.
+ */
+const RERUNNABLE_TOPICS = new Set([
+  "APP_UNINSTALLED",
+  "SHOP_REDACT",
+  "INVENTORY_LEVELS_UPDATE",
+  "CUSTOMERS_DATA_REQUEST",
+  "CUSTOMERS_REDACT",
+]);
+
+/** Give a claimed delivery back so Shopify's retry can pick it up. */
+async function releaseDelivery(webhookId: string | null, topic: string): Promise<void> {
+  if (!webhookId || !RERUNNABLE_TOPICS.has(topic)) return;
+  try {
+    await prisma.webhookEvent.delete({ where: { id: webhookId } });
+  } catch {
+    // Already gone (e.g. purged along with the shop) — nothing to release.
+  }
+}
+
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { topic, shop, session, payload } = await authenticate.webhook(request);
+  const { topic, shop, payload } = await authenticate.webhook(request);
 
   const webhookId = request.headers.get("x-shopify-webhook-id");
   if (!(await claimDelivery(webhookId, shop, topic))) {
     return new Response(null, { status: 200 });
   }
 
+  try {
+    await handleTopic({ topic, shop, payload });
+  } catch (err) {
+    // Hand the claim back before failing, so Shopify's retry is actually processed
+    // instead of being deduped away as "already handled" — for the topics where a
+    // re-run is safe.
+    await releaseDelivery(webhookId, topic);
+    throw err;
+  }
+
+  return new Response(null, { status: 200 });
+};
+
+async function handleTopic({
+  topic,
+  shop,
+  payload,
+}: {
+  topic: string;
+  shop: string;
+  payload: unknown;
+}) {
   switch (topic) {
     case "ORDERS_CREATE": {
       const data = payload as OrderPayload;
@@ -209,7 +270,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
 
     case "APP_UNINSTALLED": {
-      if (session) await purgeShopData(shop);
+      // Deliberately NOT gated on `session`.
+      //
+      // It used to be, and that guard was the whole bug: offline tokens expire
+      // (`expiringOfflineAccessTokens`), a redelivery arrives after the session row is
+      // already gone, and in either case `session` is undefined — so the purge was
+      // skipped and every row for that shop survived the uninstall. Nothing downstream
+      // could then clear it: install, manual re-sync and cron are all upsert-only, so
+      // the merchant reinstalled, re-synced, and saw their original bad data again.
+      //
+      // purgeShopData is idempotent and scoped to this shop, so running it without a
+      // session is safe; SHOP_REDACT below has always done exactly that.
+      await purgeShopData(shop);
       break;
     }
 
@@ -231,9 +303,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       console.warn(`[inventorify] Unhandled webhook topic: ${topic}`);
     }
   }
-
-  return new Response(null, { status: 200 });
-};
+}
 
 /**
  * Cancellation rate = COD units cancelled before dispatch / COD units ordered, over the

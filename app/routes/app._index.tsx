@@ -13,6 +13,16 @@ import {
 import { getFulfilmentBreakdown, getRtoFreshness } from "../lib/rto-attribution.server";
 import { getDamagedUnitsTotal } from "../lib/damage.server";
 import { previousRange, resolveDateRange } from "../lib/date-range";
+import { computeCodFloat, computeStockAtCost } from "../lib/capital.server";
+import { getDashboardSparklines } from "../lib/sparklines.server";
+import { greetingFor, displayShopName } from "../lib/greeting";
+import { shopHour } from "../lib/tz.server";
+import {
+  countByStatus,
+  isActionFilter,
+  selectActionRows,
+  type ActionFilter,
+} from "../lib/needs-action";
 import {
   computeProcurementPlan,
   estimateRestockRate,
@@ -21,88 +31,65 @@ import {
 } from "../lib/planning.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
+import { generateAlerts, getUnreadAlerts } from "../lib/alerts.server";
 import {
-  generateAlerts,
-  getUnreadAlerts,
-  markAlertRead,
-  snoozeAlert,
-} from "../lib/alerts.server";
-import {
+  ActionBar,
   Card,
-  DataTable,
-  DateRangePicker,
-  ProductThumb,
-  HeroBand,
-  KpiCard,
+  CostPrompt,
+  KpiTile,
+  NeedsActionTable,
   PageHead,
-  ReorderRow,
-  StatusBadge,
+  PipelineCard,
+  Segmented,
   Toast,
+  type NeedsActionRow,
+  type PipelineSegment,
   type StockStatus,
 } from "../design";
 
-/** Worst-first, for the dashboard's stock-status preview. */
-const STATUS_ORDER = ["stockout", "critical", "low", "healthy"];
+/** Rows sent to the browser. The counts beside the chips describe the whole catalogue. */
+const ROW_LIMIT = 25;
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
   const shop = session.shop;
-  const range = resolveDateRange(new URL(request.url).searchParams);
+  const url = new URL(request.url);
+  const range = resolveDateRange(url.searchParams);
+  const filterParam = url.searchParams.get("status");
+  const filter: ActionFilter = isActionFilter(filterParam) ? filterParam : "all";
 
-  // Narrowed to the columns the aggregates below actually read. This used to select every
-  // column of every product — image URLs, the whole RTO provenance chain — purely to sum
-  // four of them.
+  // Narrowed to the columns the aggregates below actually read.
   const products = await prisma.product.findMany({
     where: { shop, isArchived: false },
     select: {
-      id: true, title: true, variantTitle: true, sku: true, imageUrl: true,
+      id: true, title: true, variantTitle: true, sku: true,
       currentStock: true, reorderPoint: true, avgDailySales: true, safetyStock: true,
       unitCost: true, avgMargin: true, moq: true, casePackSize: true,
-      fulfilledDelivered: true, fulfilledInTransit: true, fulfilledReturned: true,
+      fulfilledInTransit: true,
       courierRtoRate: true, derivedRtoRate: true, estimatedRtoRate: true,
     },
   });
-  const alerts = await getUnreadAlerts(shop);
-  const pendingPOs = await prisma.purchaseOrder.count({
-    where: { shop, status: { in: ["draft", "sent"] } },
-  });
-  const locationCount = await prisma.location.count({ where: { shop, isActive: true } });
 
-  // ---------- Courierify delivery pipeline (aggregate) ----------
-  // Delivered/In-transit/Returned are the live per-variant snapshot Courierify syncs onto
-  // Product.fulfilled*. Damaged mirrors the inventory page's tally: damage stock-adjustments
-  // plus returned units written off from the queue (§7.8 of the integration contract).
-  const [settings, pipeDamaged] = await Promise.all([
+  const [settings, pipeDamaged, alerts, locationCount] = await Promise.all([
     prisma.shopSettings.findUnique({
       where: { shop },
       select: {
-        courierifyApiKey: true,
+        shopName: true,
         coverageDays: true,
         currency: true,
-        deadStockDays: true,
-        deadStockMinUnits: true,
+        timezone: true,
       },
     }),
-    // Windowed to match the fulfilment stages this is displayed beside. An all-time
-    // damage tally under a "last N days" heading is the same mistake as the delivery
-    // pipeline showing 90-day figures next to a 30-day breakdown.
+    // Windowed to match the fulfilment stages this is displayed beside. An all-time damage
+    // tally under a "last N days" heading is the same mistake as the delivery pipeline
+    // showing 90-day figures next to a 30-day breakdown.
     getDamagedUnitsTotal(shop, { from: range.from, to: range.to }),
+    getUnreadAlerts(shop),
+    prisma.location.count({ where: { shop, isActive: true } }),
   ]);
 
-  const courierifyConnected = !!settings?.courierifyApiKey;
-  const pipeDelivered = products.reduce((sum, p) => sum + (p.fulfilledDelivered || 0), 0);
-  const pipeInTransit = products.reduce((sum, p) => sum + (p.fulfilledInTransit || 0), 0);
-  const pipeReturned = products.reduce((sum, p) => sum + (p.fulfilledReturned || 0), 0);
-
-  // Return rate over resolved shipments (delivered + returned); damage rate over all handled.
-  const retDenom = pipeDelivered + pipeReturned;
-  const returnRate = retDenom > 0 ? (pipeReturned / retDenom) * 100 : 0;
-  const dmgDenom = pipeDelivered + pipeReturned + pipeDamaged;
-  const damageRate = dmgDenom > 0 ? (pipeDamaged / dmgDenom) * 100 : 0;
-
   // Replenishment decisions are made against inventory position, not on-hand: stock
-  // already on an open PO, or coming back through RTO, is supply that has been paid
-  // for. Judging on currentStock alone re-flags SKUs that were ordered yesterday.
+  // already on an open PO, or coming back through RTO, is supply that has been paid for.
   const positions = await getInventoryPositions(shop);
   const shopRestockRate = await estimateRestockRate(shop);
   const coverageDays = settings?.coverageDays ?? 30;
@@ -114,33 +101,32 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       ...p,
       inventoryPosition: position,
       onOrder: pos?.onOrder ?? 0,
-      rtoInbound: pos?.rtoInbound ?? 0,
-      inTransit: pos?.inTransit ?? 0,
       inTransitReturning: pos?.inTransitReturning ?? 0,
       status: getStockStatus(position, p.reorderPoint),
       // No demand means no runway — not a fabricated 0.5 units/day.
       daysRemaining: calculateDaysRemaining(position, p.avgDailySales),
-      isBackordered: p.currentStock < 0,
       displayName: p.variantTitle ? `${p.title} — ${p.variantTitle}` : p.title,
     };
   });
 
-  const lowStock = stockStatuses.filter((p) => p.status === "low").length;
-  const critical = stockStatuses.filter(
-    (p) => p.status === "critical" || p.status === "stockout",
-  ).length;
 
-  const reorderItems = stockStatuses
-    .filter((p) => p.status !== "healthy")
-    .map((p) => ({
-      productId: p.id,
-      title: p.displayName,
-      sku: p.sku,
-      currentStock: p.currentStock,
-      reorderPoint: p.reorderPoint,
-      daysRemaining: p.daysRemaining,
-      onOrder: p.onOrder,
-      suggestedQty: computeProcurementPlan({
+  // ---------- Needs-action queue ----------
+  //
+  // Counts describe the whole catalogue; only ROW_LIMIT rows cross the wire. Filtering
+  // happens here rather than in the browser so the two cannot disagree — a chip reading
+  // "Stockout 340" beside a list holding 25 of them is the bug this shape prevents.
+  const actionCounts = countByStatus(stockStatuses);
+
+  // revenueAtRisk is what the email/WhatsApp digest already reports for the same SKU. A
+  // second, locally-computed definition would disagree with it and undermine both.
+  const riskByProduct = new Map(
+    alerts.filter((a) => a.revenueAtRisk > 0).map((a) => [a.productId, a.revenueAtRisk]),
+  );
+
+  const actionRows: NeedsActionRow[] = selectActionRows(stockStatuses, filter, ROW_LIMIT)
+    .map((p) => {
+      const risk = riskByProduct.get(p.id);
+      const suggestedQty = computeProcurementPlan({
         shipUnits: p.avgDailySales * coverageDays,
         returnRate: resolveReturnRate(p).rate,
         restockRate: shopRestockRate,
@@ -149,61 +135,40 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         safetyStock: p.safetyStock,
         moq: p.moq,
         casePackSize: p.casePackSize,
-      }).orderQty,
-      status: p.status,
-    }))
-    // SKUs with no demand have no runway; sort them last rather than treating
-    // "no data" as "zero days left".
-    .sort((a, b) => (a.daysRemaining ?? Infinity) - (b.daysRemaining ?? Infinity))
-    .slice(0, 5);
+      }).orderQty;
+      return {
+        productId: p.id,
+        title: p.displayName,
+        sku: p.sku,
+        stock: p.currentStock,
+        daysRemaining: p.daysRemaining,
+        status: p.status as StockStatus,
+        suggestedQty,
+        riskLabel: risk ? formatCurrency(risk, settings?.currency ?? "USD") : null,
+        createPoHref: `/app/purchase-orders/new?product=${p.id}&qty=${suggestedQty}`,
+      };
+    });
 
   // ---------- Capital tied up ----------
   //
-  // COD ties up cash in two places at once: stock sitting in the warehouse, and stock
-  // already shipped but not yet collected/remitted. Neither was visible anywhere, and
-  // both are the actual constraint on how much can be reordered.
-  //
-  // Everything here is derived from unitCost, which many shops will not have populated,
-  // so coverage is reported alongside the totals — a value computed over 20% of the
-  // catalogue must not be presented as the inventory value.
+  // Derived from unitCost, which many shops will not have populated, so coverage is
+  // reported alongside the totals — a value computed over 20% of the catalogue must not
+  // be presented as the inventory value.
   const withCost = products.filter((p) => p.unitCost > 0);
   const costCoverage = products.length > 0 ? withCost.length / products.length : 0;
+  const stockValue = computeStockAtCost(products);
+  const codFloat = computeCodFloat(products);
 
-  // Negative stock is an oversell/backorder, not negative-value inventory. Multiplying
-  // it by cost subtracted real money from the total — on one live shop the inventory
-  // value read Rs 194,475 less than the stock actually on the shelves.
-  const stockValue = products.reduce(
-    (sum, p) => sum + Math.max(0, p.currentStock) * p.unitCost,
-    0,
-  );
+  const [rtoFreshness, fulfilment, priorFulfilment, sparklines] = await Promise.all([
+    getRtoFreshness(shop),
+    getFulfilmentBreakdown(shop, range),
+    // Same length of window, immediately before this one — the basis for the return-rate
+    // trend on the outcomes card.
+    getFulfilmentBreakdown(shop, previousRange(range)),
+    getDashboardSparklines(shop, range.days),
+  ]);
 
-  const deadStockSince = new Date(Date.now() - (settings?.deadStockDays ?? 60) * 86400000);
-  const soldRecently = await prisma.salesRecord.groupBy({
-    by: ["productId"],
-    where: { shop, date: { gte: deadStockSince } },
-    _sum: { quantity: true },
-    having: { quantity: { _sum: { gt: 0 } } },
-  });
-  const movedIds = new Set(soldRecently.map((r) => r.productId));
-  const deadStockValue = products
-    .filter((p) => !movedIds.has(p.id) && p.currentStock >= (settings?.deadStockMinUnits ?? 20))
-    .reduce((sum, p) => sum + p.currentStock * p.unitCost, 0);
-
-  // Cash sitting with the courier: units dispatched and not yet delivered, valued at
-  // estimated sale price rather than cost, since that is what is owed back.
-  const codFloat = products.reduce((sum, p) => {
-    const price =
-      p.unitCost > 0 && p.avgMargin > 0 && p.avgMargin < 0.95
-        ? p.unitCost / (1 - p.avgMargin)
-        : p.unitCost;
-    return sum + p.fulfilledInTransit * price;
-  }, 0);
-
-  const rtoFreshness = await getRtoFreshness(shop);
-  const fulfilment = await getFulfilmentBreakdown(shop, range);
-
-  // Genuinely windowed figures. Everything else on this page is current state — stock,
-  // alerts, reorder suggestions — which is why the range only drives these.
+  // Genuinely windowed figures. Everything else on this page is current state.
   const prior = previousRange(range);
   const [periodSold, periodPrior] = await Promise.all([
     prisma.salesRecord.aggregate({
@@ -218,111 +183,72 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   const soldUnits = periodSold._sum.quantity ?? 0;
   const priorUnits = periodPrior._sum.quantity ?? 0;
 
-  // Only a preview crosses the wire. The aggregates above are computed over the whole
-  // catalogue server-side, but serialising every product into the page payload is what
-  // actually made this unusable at scale — and nobody scrolls ten thousand rows on a
-  // dashboard.
-  const PREVIEW = 25;
-  const stockStatusPage = {
-    rows: [...stockStatuses]
-      .sort((a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status))
-      .slice(0, PREVIEW),
-    total: stockStatuses.length,
-    preview: PREVIEW,
-  };
+  const timezone = settings?.timezone ?? "UTC";
 
   return {
-    fulfilment,
-    stockStatusPage,
     range,
+    filter,
+    greeting: greetingFor(shopHour(new Date(), timezone)),
+    shopName: displayShopName(settings?.shopName, shop),
+    todayLabel: new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      weekday: "long",
+      month: "short",
+      day: "numeric",
+    }).format(new Date()),
     period: {
       soldUnits,
       priorUnits,
-      // Null rather than 0% when there is no prior window to compare against — at 90
-      // days there is none, because only 90 days are retained.
+      // Null rather than 0% when there is no prior window to compare against — at 90 days
+      // there is none, because only 90 days are retained.
       changePct: priorUnits > 0 ? ((soldUnits - priorUnits) / priorUnits) * 100 : null,
     },
     currency: settings?.currency ?? "USD",
     rtoFreshness,
+    sparklines,
     capital: {
       stockValue,
-      deadStockValue,
       codFloat,
       costCoverage,
       pricedSkus: withCost.length,
     },
     totalSkus: products.length,
-    lowStock,
-    critical,
-    pendingPOs,
+    lowStock: actionCounts.low,
+    // The KPI card and the ActionBar both mean "critical or worse", which is the two
+    // severities the merchant cannot defer. The chips keep them apart because filtering
+    // to one or the other is a different question.
+    critical: actionCounts.critical + actionCounts.stockout,
     locationCount,
-    stockStatuses: stockStatusPage.rows,
-    alerts,
-    reorderItems,
-    courierifyConnected,
-    pipeline: {
-      delivered: pipeDelivered,
-      inTransit: pipeInTransit,
-      returned: pipeReturned,
-      damaged: pipeDamaged,
-      returnRate,
-      damageRate,
-    },
+    actionRows,
+    actionCounts,
+    fulfilment,
+    // Only the rate is needed; sending the whole prior breakdown would double the payload
+    // for one number.
+    priorRtoRate: priorFulfilment.rtoRate,
+    damagedUnits: pipeDamaged,
   };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
-  const formData = await request.formData();
-  const intent = (formData.get("intent") as string) || "sync";
-
-  // Both alert actions are shop-scoped inside the lib; an alert id alone is never
-  // enough to touch another tenant's row.
-  if (intent === "dismiss_alert") {
-    const id = formData.get("alertId") as string;
-    if (id) await markAlertRead(id, shop);
-    return { intent: "dismiss_alert" as const, ok: true };
-  }
-
-  if (intent === "snooze_alert") {
-    const id = formData.get("alertId") as string;
-    const days = parseInt((formData.get("days") as string) ?? "7", 10);
-    if (id) {
-      await snoozeAlert(
-        id,
-        shop,
-        new Date(Date.now() + (isNaN(days) ? 7 : days) * 86400000),
-      );
-    }
-    return { intent: "snooze_alert" as const, ok: true };
-  }
 
   const { synced, errors, archived, completed, error: syncError } =
     await syncShopifyInventory(admin, shop);
   const { recordsSynced } = await syncOrderHistory(admin, shop);
   await generateAlerts(shop);
-  return {
-    intent: "sync" as const,
-    synced,
-    errors,
-    archived,
-    completed,
-    syncError,
-    recordsSynced,
-  };
+  return { synced, errors, archived, completed, syncError, recordsSynced };
 };
 
-/** Small ghost button used by the alert row actions. */
-const alertActionStyle: React.CSSProperties = {
-  fontSize: "11px",
-  padding: "3px 8px",
-  borderRadius: "7px",
+const ghostButton: React.CSSProperties = {
   border: "1px solid var(--inv-input-border-2)",
-  background: "transparent",
-  color: "var(--inv-text-2)",
+  background: "#fff",
+  color: "var(--inv-ink)",
+  fontSize: "12px",
+  fontWeight: 500,
+  padding: "7px 12px",
+  borderRadius: "9px",
   cursor: "pointer",
-  whiteSpace: "nowrap",
 };
 
 export default function Dashboard() {
@@ -336,147 +262,167 @@ export default function Dashboard() {
   const [searchParams, setSearchParams] = useSearchParams();
 
   useEffect(() => {
-    if (fetcher.data) {
-      const d = fetcher.data;
-      // Alert actions revalidate on their own; only the sync run reports counts.
-      if (d.intent !== "sync") return;
-      // Report an aborted catalogue walk as a failure. Showing only the counts made a
-      // partial sync look identical to a complete one.
-      const msg = d.completed
-        ? `Synced ${d.synced} variants · ${d.recordsSynced} sales records` +
-          `${d.archived ? ` · ${d.archived} archived` : ""}` +
-          `${d.errors ? ` · ${d.errors} errors` : ""}`
-        : `Sync incomplete — ${d.syncError ?? "Shopify request failed"}. ` +
-          `${d.synced} variants updated; nothing was archived.`;
-      shopify.toast.show(msg, d.completed ? undefined : { isError: true });
-      setToast(msg);
-    }
+    if (!fetcher.data) return;
+    const d = fetcher.data;
+    // Report an aborted catalogue walk as a failure. Showing only the counts made a
+    // partial sync look identical to a complete one.
+    const msg = d.completed
+      ? `Synced ${d.synced} variants · ${d.recordsSynced} sales records` +
+        `${d.archived ? ` · ${d.archived} archived` : ""}` +
+        `${d.errors ? ` · ${d.errors} errors` : ""}`
+      : `Sync incomplete — ${d.syncError ?? "Shopify request failed"}. ` +
+        `${d.synced} variants updated; nothing was archived.`;
+    shopify.toast.show(msg, d.completed ? undefined : { isError: true });
+    setToast(msg);
   }, [fetcher.data, shopify]);
 
-  const columns = [
-    { header: "Product / Variant", width: "2.4fr" as const },
-    { header: "SKU", width: "1fr" as const },
-    { header: "Stock", width: ".7fr" as const, align: "right" as const },
-    { header: "Days left", width: ".9fr" as const, align: "right" as const },
-    { header: "Status", width: "1fr" as const, align: "right" as const },
+  const setParam = (key: string, value: string) => {
+    const next = new URLSearchParams(searchParams);
+    next.set(key, value);
+    next.delete("from");
+    next.delete("to");
+    setSearchParams(next, { preventScrollReset: true });
+  };
+
+  const money = (n: number) => formatCurrency(n, data.currency);
+  const decisions = data.critical + data.lowStock;
+
+  // ---- fulfilment split into what is still moving and how the rest ended up.
+  const stageUnits = (stage: string) =>
+    data.fulfilment.stages.find((s) => s.stage === stage)?.units ?? 0;
+
+  // All four in-route stages, so the card's total equals inRouteUnits. Dropping
+  // "attempted" — a delivery tried and failed, the strongest leading indicator of an RTO —
+  // would make units silently vanish from the picture.
+  const liveSegments: PipelineSegment[] = (
+    [
+      ["dispatched", "Dispatched"],
+      ["in_transit", "In transit"],
+      ["out_for_delivery", "Out for delivery"],
+      ["attempted", "Attempted"],
+    ] as const
+  ).map(([stage, label]) => ({
+    key: stage,
+    label,
+    units: stageUnits(stage),
+    fg: "var(--inv-transit-fg)",
+    bg: "var(--inv-transit-bg)",
+    border: "var(--inv-transit-border)",
+    bar: "var(--inv-transit-value)",
+  }));
+
+  const delivered = data.fulfilment.deliveredUnits;
+  const notDelivered = data.fulfilment.notDeliveredUnits;
+  const resolved = delivered + notDelivered + data.damagedUnits;
+  const rate = (n: number) => (resolved > 0 ? `${((n / resolved) * 100).toFixed(1)}%` : "—");
+
+  const outcomeSegments: PipelineSegment[] = [
+    {
+      key: "delivered",
+      label: "Delivered",
+      units: delivered,
+      fg: "var(--inv-status-healthy-fg)",
+      bg: "var(--inv-status-healthy-bg)",
+      border: "#dcece4",
+      bar: "var(--inv-status-healthy-dot)",
+      note: rate(delivered),
+    },
+    {
+      key: "not_delivered",
+      label: "Not delivered",
+      units: notDelivered,
+      fg: "var(--inv-status-critical-fg)",
+      bg: "#fbf6ee",
+      border: "#f0e2d0",
+      bar: "var(--inv-status-critical-fg)",
+      note: rate(notDelivered),
+      onClick: () => navigate("/app/returns"),
+    },
+    {
+      key: "damaged",
+      label: "Damaged",
+      units: data.damagedUnits,
+      fg: "var(--inv-status-stockout-fg)",
+      bg: "var(--inv-status-stockout-bg)",
+      border: "#f2d9d5",
+      bar: "var(--inv-status-stockout-fg)",
+      note: rate(data.damagedUnits),
+      onClick: () => navigate("/app/returns"),
+    },
   ];
 
-  const rows = data.stockStatuses.map((p) => ({
-    key: p.id,
-    cells: [
-      <div key="name" style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0 }}>
-        <ProductThumb src={p.imageUrl} name={p.displayName} />
-        <span style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-          {p.displayName}
-        </span>
-      </div>,
-      <span key="sku" style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12px", color: "var(--inv-text-2)" }}>
-        {p.sku ?? "—"}
-      </span>,
-      <span
-        key="stock"
-        style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600, color: p.currentStock <= 0 ? "var(--inv-status-stockout-fg)" : "var(--inv-ink)" }}
-      >
-        {p.currentStock}
-      </span>,
-      <span key="days" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
-        {p.daysRemaining === null ? "No demand" : `${p.daysRemaining}d`}
-      </span>,
-      <StatusBadge key="status" status={p.status as StockStatus} />,
-    ],
-  }));
+  // Percentage points, not percent: a return rate moving 22% → 24% is "up 2 points".
+  const rtoTrend =
+    data.fulfilment.rtoRate != null && data.priorRtoRate != null
+      ? (data.fulfilment.rtoRate - data.priorRtoRate) * 100
+      : null;
 
   return (
     <div className="inv-root" data-theme={theme} style={{ minHeight: "100vh" }}>
       <TitleBar title="Inventorify" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
-        <PageHead
-          eyebrow="Command center"
-          title="Good morning"
-          right={
-            <button
-              onClick={() => fetcher.submit({}, { method: "POST" })}
-              disabled={isSyncing}
-              style={{
-                border: "1px solid var(--inv-input-border-2)",
-                background: "#fff",
-                color: "var(--inv-ink)",
-                fontSize: "13px",
-                fontWeight: 500,
-                padding: "9px 15px",
-                borderRadius: "10px",
-                cursor: isSyncing ? "default" : "pointer",
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-                opacity: isSyncing ? 0.6 : 1,
-              }}
-            >
-              ↻ {isSyncing ? "Syncing…" : "Sync inventory"}
-            </button>
-          }
-        />
-
-        {data.critical > 0 && (
-          <HeroBand
-            alertLabel={`${data.alerts.length} active stock alert${data.alerts.length !== 1 ? "s" : ""}`}
-            headline={
-              <>
-                <span style={{ color: "var(--inv-accent)" }}>{data.critical + data.lowStock} decisions</span> need
-                you today
-              </>
-            }
-            body={`${data.critical} SKUs are critical or out of stock${data.lowStock > 0 ? ` and ${data.lowStock} running low` : ""}. Your forecast-adjusted reorder queue is ready — most are one tap from a purchase order.`}
-            primaryAction={{
-              label: "Review reorder queue",
-              onClick: () => document.getElementById("reorder-queue")?.scrollIntoView({ behavior: "smooth" }),
+        {decisions > 0 && (
+          <ActionBar
+            headline={`${decisions} decision${decisions === 1 ? "" : "s"} need${decisions === 1 ? "s" : ""} you today`}
+            body={`${data.critical} SKU${data.critical === 1 ? " is" : "s are"} critical or out of stock${data.lowStock > 0 ? ` and ${data.lowStock} running low` : ""} — each one below is already sized into an order.`}
+            primary={{
+              label: "Review reorder queue →",
+              onClick: () => document.getElementById("needs-action")?.scrollIntoView({ behavior: "smooth" }),
             }}
-            secondaryAction={{
-              label: "Open demand forecast",
-              onClick: () => navigate("/app/forecast"),
-            }}
+            secondary={{ label: "Demand forecast", onClick: () => navigate("/app/forecast") }}
           />
         )}
 
-        <div
-          style={{
-            display: "flex", alignItems: "center", justifyContent: "space-between",
-            gap: "12px", flexWrap: "wrap", marginBottom: "4px",
-          }}
-        >
-          <div style={{ fontSize: "12px", color: "var(--inv-muted)" }}>
-            Sales figures below cover the selected window. Stock, alerts and reorder
-            suggestions are always current.
-          </div>
-          <DateRangePicker
-            value={data.range}
-            onPreset={(days) => {
-              const next = new URLSearchParams(searchParams);
-              next.set("range", days);
-              next.delete("from");
-              next.delete("to");
-              setSearchParams(next, { preventScrollReset: true });
-            }}
-            onCustom={(from, to) => {
-              const next = new URLSearchParams(searchParams);
-              next.set("from", from);
-              next.set("to", to);
-              next.delete("range");
-              setSearchParams(next, { preventScrollReset: true });
-            }}
-          />
-        </div>
+        <PageHead
+          eyebrow={`${data.todayLabel} · Command center`}
+          title={data.shopName ? `${data.greeting}, ${data.shopName}` : data.greeting}
+          right={
+            <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <Segmented
+                label="Reporting window"
+                value={data.range.preset}
+                onChange={(v) => setParam("range", v)}
+                options={[
+                  { value: "7", label: "7d" },
+                  { value: "30", label: "30d" },
+                  { value: "90", label: "90d" },
+                ]}
+              />
+              <button
+                type="button"
+                onClick={() => fetcher.submit({}, { method: "POST" })}
+                disabled={isSyncing}
+                style={{
+                  border: "1px solid var(--inv-input-border-2)",
+                  background: "#fff",
+                  color: "var(--inv-ink)",
+                  fontSize: "12.5px",
+                  fontWeight: 500,
+                  padding: "8px 13px",
+                  borderRadius: "var(--inv-radius-control)",
+                  cursor: isSyncing ? "default" : "pointer",
+                  opacity: isSyncing ? 0.6 : 1,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                ↻ {isSyncing ? "Syncing…" : "Sync"}
+              </button>
+            </div>
+          }
+        />
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: "12px", marginBottom: "16px" }}>
-          <KpiCard
-            label={`Units sold — ${data.range.label}`}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(176px,1fr))", gap: "12px", marginBottom: "16px" }}>
+          <KpiTile
+            label={`Units sold · last ${data.range.days}d`}
             value={data.period.soldUnits.toLocaleString()}
+            series={data.sparklines.unitsSold}
+            sparkColor="var(--inv-status-healthy-dot)"
             sub={
               data.period.changePct != null
-                ? `${data.period.changePct >= 0 ? "+" : ""}${data.period.changePct.toFixed(1)}% vs prior ${data.range.days}d`
+                ? `${data.period.changePct >= 0 ? "▲" : "▼"} ${Math.abs(data.period.changePct).toFixed(1)}% vs prior ${data.range.days}d`
                 : "no prior period to compare"
             }
-            valueColor={
+            subColor={
               data.period.changePct == null
                 ? undefined
                 : data.period.changePct >= 0
@@ -484,23 +430,41 @@ export default function Dashboard() {
                   : "var(--inv-status-critical-fg)"
             }
           />
-          <KpiCard
-            label="Total SKUs tracked"
-            value={data.totalSkus}
-            sub={`across ${data.locationCount} location${data.locationCount !== 1 ? "s" : ""}`}
+          <KpiTile
+            label="Capital tied up"
+            size="currency"
+            value={money(data.capital.stockValue + data.capital.codFloat)}
+            series={data.sparklines.stockAtCost}
+            sub={`${money(data.capital.codFloat)} with courier`}
           />
-          <KpiCard
+          <KpiTile
+            label="In-transit · live"
+            size="currency"
+            value={money(data.capital.codFloat)}
+            valueColor="var(--inv-transit-value)"
+            series={data.sparklines.inRouteUnits}
+            sparkColor="var(--inv-transit-fg)"
+            sub={`${data.fulfilment.inRouteUnits.toLocaleString()} units`}
+            subColor="var(--inv-transit-fg)"
+          />
+          <KpiTile
             label="Low stock"
             value={data.lowStock}
             valueColor="var(--inv-status-low-fg)"
+            series={data.sparklines.lowStock}
+            sparkColor="var(--inv-status-low-fg)"
             sub="needs attention soon"
+            subColor="var(--inv-status-low-fg)"
           />
-          <KpiCard
+          <KpiTile
             label="Critical / stockout"
             value={data.critical}
-            valueColor="var(--inv-status-critical-fg)"
-            sub={`Order now · ${data.pendingPOs} PO${data.pendingPOs !== 1 ? "s" : ""} open`}
+            valueColor="var(--inv-status-stockout-fg)"
             accentBar="var(--inv-status-critical-dot)"
+            series={data.sparklines.critical}
+            sparkColor="var(--inv-status-stockout-fg)"
+            sub={`across ${data.totalSkus} SKUs · ${data.locationCount} location${data.locationCount === 1 ? "" : "s"}`}
+            subColor="var(--inv-status-critical-fg)"
           />
         </div>
 
@@ -512,296 +476,101 @@ export default function Dashboard() {
           </Card>
         )}
 
-        {data.fulfilment.stages.some((s) => s.units > 0) && (
-          <Card padding="18px 20px" style={{ marginBottom: "16px" }}>
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: "14px", flexWrap: "wrap", marginBottom: "4px" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                <div style={{ fontSize: "15px", fontWeight: 600 }}>Units by fulfilment stage</div>
+        {(data.fulfilment.inRouteUnits > 0 || resolved > 0) && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(320px,1fr))", gap: "14px", marginBottom: "16px" }}>
+            <PipelineCard
+              title="In route now"
+              badge="LIVE"
+              subtitle="Already out of stock, not yet resolved"
+              headerRight={
+                <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "22px", fontWeight: 600, color: "var(--inv-transit-value)", letterSpacing: "-.5px" }}>
+                  {data.fulfilment.inRouteUnits.toLocaleString()}
+                </div>
+              }
+              segments={liveSegments}
+              footnote={`${money(data.capital.codFloat)} of stock value is sitting with the courier`}
+            />
+            <PipelineCard
+              title={`Outcomes · last ${data.range.days} days`}
+              subtitle={`Of ${resolved.toLocaleString()} resolved shipments`}
+              headerRight={
+                <button type="button" onClick={() => navigate("/app/returns")} style={ghostButton}>
+                  Returns →
+                </button>
+              }
+              segments={outcomeSegments}
+              footnote={
+                rtoTrend == null
+                  ? `Source: ${data.fulfilment.source === "courierify" ? "Courierify" : "Shopify carrier tracking"}`
+                  : `Return rate ${rtoTrend >= 0 ? "▲" : "▼"} ${Math.abs(rtoTrend).toFixed(1)}pt vs prior ${data.range.days} days${rtoTrend >= 1 ? " — worth a look at courier performance" : ""}`
+              }
+            />
+          </div>
+        )}
+
+        {data.capital.costCoverage < 0.99 && (
+          <CostPrompt
+            coverage={`${data.capital.pricedSkus} of ${data.totalSkus} SKUs have a unit cost (${Math.round(data.capital.costCoverage * 100)}%)`}
+            onAction={() => navigate("/app/settings")}
+          />
+        )}
+
+        <div id="needs-action">
+          {data.totalSkus === 0 ? (
+            <Card padding="40px 24px">
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>No products synced yet</div>
+                <div style={{ fontSize: "13px", color: "var(--inv-muted)", marginBottom: "16px" }}>
+                  Sync your Shopify inventory to get started.
+                </div>
                 <button
-                  onClick={() => navigate("/app/returns")}
-                  style={{ border: "1px solid var(--inv-input-border-2)", background: "#fff", color: "var(--inv-ink)", fontSize: "12px", fontWeight: 500, padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
+                  type="button"
+                  onClick={() => fetcher.submit({}, { method: "POST" })}
+                  style={{
+                    background: "var(--inv-ink)", color: "#fff", border: "none", fontSize: "13px",
+                    fontWeight: 500, padding: "9px 15px", borderRadius: "var(--inv-radius-control)", cursor: "pointer",
+                  }}
                 >
-                  Review returns →
+                  Sync Inventory
                 </button>
               </div>
-              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
-                {data.fulfilment.source === "courierify" ? "Courierify" : "Shopify carrier tracking"}
-                {" · "}{data.range.label}
-              </div>
-            </div>
-            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px", lineHeight: 1.5 }}>
-              <strong style={{ color: "var(--inv-text-2)" }}>{data.fulfilment.inRouteUnits.toLocaleString()}</strong> units
-              in route — dispatched and not yet resolved. These have already left stock, and a share will be
-              refused and come back.
-              {data.fulfilment.rtoRate != null && (
-                <> Of {data.fulfilment.resolvedUnits.toLocaleString()} resolved,{" "}
-                <strong style={{ color: data.fulfilment.rtoRate >= 0.3 ? "var(--inv-status-stockout-fg)" : "var(--inv-text-2)" }}>
-                  {(data.fulfilment.rtoRate * 100).toFixed(1)}%
-                </strong>{" "}were not delivered.</>
-              )}
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: "10px" }}>
-              {[
-                ...data.fulfilment.stages,
-                // Damage is Inventorify's own tally from stock adjustments and written-off
-                // returns, not a carrier status — but it belongs in the same picture of
-                // where units ended up.
-                { stage: "damaged" as const, label: "Damaged", units: data.pipeline.damaged },
-              ].map((st) => {
-                const terminal =
-                  st.stage === "delivered" || st.stage === "not_delivered" || st.stage === "damaged";
-                const bad = st.stage === "not_delivered" || st.stage === "damaged";
-                return (
-                  <div
-                    key={st.stage}
-                    style={{
-                      padding: "12px 13px",
-                      borderRadius: "11px",
-                      border: "1px solid var(--inv-divider)",
-                      background: terminal ? (bad ? "#fdf5f3" : "#f4f9f6") : "var(--inv-subtle)",
-                    }}
-                  >
-                    <div style={{ fontSize: "11.5px", color: "var(--inv-text-2)", marginBottom: "6px" }}>{st.label}</div>
-                    <div style={{ fontFamily: "var(--inv-font-mono)", fontSize: "19px", fontWeight: 600, color: bad ? "var(--inv-status-stockout-fg)" : terminal ? "var(--inv-status-healthy-fg)" : "var(--inv-ink)" }}>
-                      {st.units.toLocaleString()}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </Card>
-        )}
-
-        <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: "14px", marginBottom: "16px" }}>
-          <div
-            id="reorder-queue"
-            style={{ background: "#fff", border: "1px solid var(--inv-border)", borderRadius: "16px", overflow: "hidden" }}
-          >
-            <div
-              style={{
-                padding: "16px 18px",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                borderBottom: "1px solid var(--inv-divider-3)",
-              }}
-            >
-              <div>
-                <div style={{ fontSize: "15px", fontWeight: 600 }}>Reorder queue</div>
-                <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginTop: "2px" }}>
-                  Forecast-adjusted quantities · sorted by urgency
-                </div>
-              </div>
-              <span
-                style={{
-                  fontFamily: "var(--inv-font-mono)",
-                  fontSize: "11px",
-                  color: "#8b877d",
-                  background: "#f4f2ec",
-                  padding: "4px 9px",
-                  borderRadius: "7px",
-                }}
-              >
-                {data.reorderItems.length} shown
-              </span>
-            </div>
-            {data.reorderItems.length === 0 ? (
-              <div style={{ padding: "24px 18px", fontSize: "13px", color: "var(--inv-muted)" }}>
-                All your products are sufficiently stocked.
-              </div>
-            ) : (
-              data.reorderItems.map((item, i) => (
-                <ReorderRow
-                  key={item.productId}
-                  title={item.title}
-                  sub={`${item.sku ?? "—"} · ${item.currentStock <= 0 ? "out of stock" : `${item.currentStock} left`} · ${item.daysRemaining === null ? "no demand" : `${item.daysRemaining}d left`}`}
-                  suggestedQty={item.suggestedQty}
-                  status={item.status as StockStatus}
-                  createPoHref={`/app/purchase-orders/new?product=${item.productId}&qty=${item.suggestedQty}`}
-                  isFirst={i === 0}
+            </Card>
+          ) : (
+            <NeedsActionTable
+              rows={data.actionRows}
+              filters={
+                <Segmented
+                  label="Filter by stock status"
+                  tone="sunken"
+                  value={data.filter}
+                  onChange={(v) => setParam("status", v)}
+                  options={[
+                    { value: "all", label: "All", count: data.actionCounts.all },
+                    { value: "stockout", label: "Stockout", count: data.actionCounts.stockout },
+                    { value: "critical", label: "Critical", count: data.actionCounts.critical },
+                    { value: "low", label: "Low", count: data.actionCounts.low },
+                  ]}
                 />
-              ))
-            )}
-          </div>
-
-          <Card padding="17px 18px" style={{ marginBottom: "14px" }}>
-            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>Capital tied up</div>
-            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px" }}>
-              Cash locked in stock and with the courier
-            </div>
-            {data.capital.costCoverage === 0 ? (
-              <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>
-                Add unit costs (or connect Financify) to see inventory value.
-              </div>
-            ) : (
-              <>
-                <div style={{ display: "flex", flexDirection: "column", gap: "9px" }}>
-                  {[
-                    ["Stock at cost", data.capital.stockValue],
-                    ["Dead stock", data.capital.deadStockValue],
-                    ["With courier (COD float)", data.capital.codFloat],
-                  ].map(([label, value]) => (
-                    <div
-                      key={label as string}
-                      style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "12px" }}
-                    >
-                      <span style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>{label}</span>
-                      <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "13px", fontWeight: 600 }}>
-                        {formatCurrency(value as number, data.currency)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-                {data.capital.costCoverage < 0.99 && (
-                  <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginTop: "10px", lineHeight: 1.5 }}>
-                    Based on {data.capital.pricedSkus} of {data.totalSkus} SKUs that have a unit
-                    cost ({Math.round(data.capital.costCoverage * 100)}%) — the real figures are higher.
-                  </div>
-                )}
-              </>
-            )}
-          </Card>
-
-          <Card padding="17px 18px">
-            <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "4px" }}>Alerts</div>
-            <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px" }}>
-              Below reorder point or out of stock
-            </div>
-            {data.alerts.length === 0 ? (
-              <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>No active alerts.</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-                {data.alerts.slice(0, 6).map((a) => (
-                  <div
-                    key={a.id}
-                    style={{
-                      display: "flex",
-                      alignItems: "flex-start",
-                      gap: "9px",
-                      padding: "9px 10px",
-                      borderRadius: "9px",
-                      background: "var(--inv-subtle)",
-                      border: "1px solid var(--inv-divider)",
-                    }}
-                  >
-                    <span
-                      title={a.severity}
-                      style={{
-                        marginTop: "5px",
-                        width: "7px",
-                        height: "7px",
-                        flex: "0 0 7px",
-                        borderRadius: "50%",
-                        background:
-                          a.severity === "critical"
-                            ? "var(--inv-status-critical-dot)"
-                            : a.severity === "warning"
-                              ? "var(--inv-status-low-dot)"
-                              : "var(--inv-divider-3)",
-                      }}
-                    />
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.5 }}>
-                        {a.message}
-                      </div>
-                      {a.revenueAtRisk > 0 && (
-                        <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginTop: "2px" }}>
-                          ≈ {formatCurrency(a.revenueAtRisk, data.currency)} at risk
-                        </div>
-                      )}
-                    </div>
-                    <div style={{ display: "flex", gap: "4px", flexShrink: 0 }}>
-                      <button
-                        title="Snooze for 7 days"
-                        onClick={() =>
-                          fetcher.submit(
-                            { intent: "snooze_alert", alertId: a.id, days: "7" },
-                            { method: "POST" },
-                          )
-                        }
-                        style={alertActionStyle}
-                      >
-                        Snooze
-                      </button>
-                      <button
-                        title="Dismiss this alert"
-                        onClick={() =>
-                          fetcher.submit(
-                            { intent: "dismiss_alert", alertId: a.id },
-                            { method: "POST" },
-                          )
-                        }
-                        style={alertActionStyle}
-                      >
-                        Dismiss
-                      </button>
-                    </div>
-                  </div>
-                ))}
-                {data.alerts.length > 6 && (
-                  <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
-                    …and {data.alerts.length - 6} more
-                  </div>
-                )}
-              </div>
-            )}
-          </Card>
+              }
+              footer={
+                data.actionCounts.all === 0
+                  ? "Everything is sufficiently stocked."
+                  : `Showing ${data.actionRows.length} of ${
+                      data.filter === "all" ? data.actionCounts.all : data.actionCounts[data.filter]
+                    } — sorted by days of cover left`
+              }
+              actions={
+                <>
+                  <Link to="/app/inventory" style={ghostButton}>Full inventory →</Link>
+                  <Link to="/app/purchase-orders" style={ghostButton}>Purchase orders →</Link>
+                </>
+              }
+            />
+          )}
         </div>
-
-        {data.stockStatuses.length === 0 ? (
-          <Card padding="40px 24px">
-            <div style={{ textAlign: "center" }}>
-              <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>No products synced yet</div>
-              <div style={{ fontSize: "13px", color: "var(--inv-muted)", marginBottom: "16px" }}>
-                Sync your Shopify inventory to get started.
-              </div>
-              <button
-                onClick={() => fetcher.submit({}, { method: "POST" })}
-                style={{
-                  background: "var(--inv-ink)",
-                  color: "#fff",
-                  border: "none",
-                  fontSize: "13px",
-                  fontWeight: 500,
-                  padding: "9px 15px",
-                  borderRadius: "10px",
-                  cursor: "pointer",
-                }}
-              >
-                Sync Inventory
-              </button>
-            </div>
-          </Card>
-        ) : (
-          <Card padding="0">
-            <div
-              style={{
-                padding: "16px 18px 12px", display: "flex", alignItems: "baseline",
-                justifyContent: "space-between", gap: "12px", flexWrap: "wrap",
-              }}
-            >
-              <div style={{ fontSize: "15px", fontWeight: 600 }}>Stock Status</div>
-              <div style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
-                {data.stockStatusPage.total > data.stockStatusPage.preview
-                  ? `Showing the ${data.stockStatusPage.preview} most urgent of ${data.stockStatusPage.total.toLocaleString()}`
-                  : `${data.stockStatusPage.total} SKU${data.stockStatusPage.total === 1 ? "" : "s"}`}
-              </div>
-            </div>
-            <DataTable columns={columns} rows={rows} />
-            {data.stockStatusPage.total > data.stockStatusPage.preview && (
-              <div style={{ padding: "12px 18px", borderTop: "1px solid var(--inv-divider-3)" }}>
-                <Link to="/app/inventory" style={{ fontSize: "12.5px", color: "var(--inv-accent)" }}>
-                  View all inventory →
-                </Link>
-              </div>
-            )}
-          </Card>
-        )}
       </div>
 
       {toast && <Toast message={toast} onDismiss={() => setToast("")} />}
     </div>
   );
 }
-
-

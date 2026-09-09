@@ -417,8 +417,14 @@ export async function recomputeFulfilmentFromOutcomes(
  * Both describe the same parcel. A courier integration knows more (it distinguishes a
  * return in progress from one already back on the shelf), so it wins where both exist;
  * Shopify covers everything else, which for most shops is everything.
+ *
+ * Within one source the last row seen wins, so callers MUST pass `outcomes` ordered by
+ * `updatedAt` ascending — otherwise "last" means whatever order the database returned and
+ * an order with two rows classifies differently between calls. Every caller orders its
+ * query; one did not, and that was a real nondeterminism on shops where a parcel is
+ * reported by both feeds.
  */
-function resolveOutcomeByOrder(
+export function resolveOutcomeByOrder(
   outcomes: { orderName: string; status: string; source: string }[],
 ): Map<string, string> {
   const chosen = new Map<string, { status: string; source: string }>();
@@ -500,6 +506,12 @@ export async function getFulfilmentBreakdown(
     prisma.orderOutcome.findMany({
       where: { shop, updatedAt: { gte: range.from, lt: range.to } },
       select: { orderName: true, status: true, source: true },
+      // resolveOutcomeByOrder resolves ties by last-one-wins, so "last" has to mean
+      // "most recently updated" rather than whatever order the database happened to
+      // return. Without this, an order carrying both a Shopify and a courier row — 19 of
+      // them inside one live shop's 30-day window — could classify differently between
+      // two page loads, moving units between stages on the dashboard for no reason.
+      orderBy: { updatedAt: "asc" },
     }),
     prisma.orderLineItem.findMany({
       where: { shop, orderedAt: { gte: range.from, lt: range.to } },
@@ -590,6 +602,9 @@ export async function getRtoByCarrier(
         courier: { not: null },
       },
       select: { orderName: true, status: true, source: true, courier: true },
+      // Same last-one-wins rule as resolveOutcomeByOrder, inlined here to carry the
+      // courier through — so it needs the same ordering guarantee.
+      orderBy: { updatedAt: "asc" },
     }),
     prisma.orderLineItem.findMany({
       where: { shop, orderedAt: { gte: range.from, lt: range.to } },

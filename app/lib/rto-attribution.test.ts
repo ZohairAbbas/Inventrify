@@ -5,6 +5,7 @@ import {
   classifyFulfilmentStage,
   isResolvedStatus,
   isReturnedStatus,
+  resolveOutcomeByOrder,
   type OrderLineRow,
   type OrderOutcomeRow,
 } from "./rto-attribution.server";
@@ -256,5 +257,78 @@ describe("carrier normalisation feeds a usable breakdown", () => {
 
   it("keeps distinct carriers distinct", () => {
     expect(normalise("Trax")).not.toBe(normalise("Leopards"));
+  });
+});
+
+describe("resolveOutcomeByOrder", () => {
+  const row = (orderName: string, status: string, source: string) => ({
+    orderName,
+    status,
+    source,
+  });
+
+  it("returns the only status when an order has one row", () => {
+    const out = resolveOutcomeByOrder([row("#1001", "delivered", "shopify")]);
+    expect(out.get("#1001")).toBe("delivered");
+  });
+
+  it("keeps orders separate", () => {
+    const out = resolveOutcomeByOrder([
+      row("#1001", "delivered", "shopify"),
+      row("#1002", "not_delivered", "shopify"),
+    ]);
+    expect(out.get("#1001")).toBe("delivered");
+    expect(out.get("#1002")).toBe("not_delivered");
+  });
+
+  it("takes the last row within one source, i.e. the most recent update", () => {
+    // Callers pass rows ordered by updatedAt ascending, so later means newer. A parcel
+    // that was in transit and is now delivered must read as delivered.
+    const out = resolveOutcomeByOrder([
+      row("#1001", "in_transit", "shopify"),
+      row("#1001", "delivered", "shopify"),
+    ]);
+    expect(out.get("#1001")).toBe("delivered");
+  });
+
+  it("prefers the courier feed over Shopify tracking, whichever arrived last", () => {
+    const courierFirst = resolveOutcomeByOrder([
+      row("#1001", "returned", "courierify"),
+      row("#1001", "delivered", "shopify"),
+    ]);
+    expect(courierFirst.get("#1001")).toBe("returned");
+
+    const courierLast = resolveOutcomeByOrder([
+      row("#1001", "delivered", "shopify"),
+      row("#1001", "returned", "courierify"),
+    ]);
+    expect(courierLast.get("#1001")).toBe("returned");
+  });
+
+  it("still takes the newest courier row when there are several", () => {
+    const out = resolveOutcomeByOrder([
+      row("#1001", "in_transit", "courierify"),
+      row("#1001", "returned", "courierify"),
+    ]);
+    expect(out.get("#1001")).toBe("returned");
+  });
+
+  it("is order-dependent within a source, which is why callers must sort", () => {
+    // Documents the contract rather than endorsing it: the same two rows reversed give
+    // a different answer, so an unordered query produces nondeterministic stages.
+    const forwards = resolveOutcomeByOrder([
+      row("#1001", "in_transit", "shopify"),
+      row("#1001", "delivered", "shopify"),
+    ]);
+    const backwards = resolveOutcomeByOrder([
+      row("#1001", "delivered", "shopify"),
+      row("#1001", "in_transit", "shopify"),
+    ]);
+    expect(forwards.get("#1001")).toBe("delivered");
+    expect(backwards.get("#1001")).toBe("in_transit");
+  });
+
+  it("handles an empty input", () => {
+    expect(resolveOutcomeByOrder([]).size).toBe(0);
   });
 });

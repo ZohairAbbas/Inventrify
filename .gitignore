@@ -44,3 +44,6 @@ Thumbs.db
 # Misc
 *.local
 courierify-schema.prisma
+
+# Design prototypes exported from Claude Design — source of truth lives there
+*.dc.html

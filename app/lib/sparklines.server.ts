@@ -15,9 +15,21 @@ import { dayKey, densify, toSeries, utcDayStart, type Series } from "./sparkline
  */
 export type DashboardSparklines = {
   unitsSold: Series | null;
-  stockAtCost: Series | null;
+  /**
+   * Stock at cost *plus* COD float — the same sum the Capital KPI displays.
+   *
+   * Deliberately not the stock-at-cost series alone. A trend line that charts a different
+   * quantity from the figure above it is worse than no trend at all, because it still
+   * looks authoritative: the card would show total capital rising while the line beneath
+   * it fell, with nothing on screen explaining why.
+   */
+  capital: Series | null;
+  /**
+   * COD float, matching the In-transit card's headline figure — which is a currency
+   * amount, not the unit count in its caption. Same reasoning as `capital` above: the
+   * line has to chart the number it sits under.
+   */
   codFloat: Series | null;
-  inRouteUnits: Series | null;
   lowStock: Series | null;
   critical: Series | null;
 };
@@ -44,7 +56,9 @@ export async function getDashboardSparklines(
     }),
     prisma.shopDailySnapshot.findMany({
       where: { shop, date: { gte: from } },
-      select: { date: true, stockAtCost: true, codFloat: true, inRouteUnits: true },
+      // inRouteUnits is recorded daily but not read here: both cards that could show it
+      // lead with a currency figure, and their lines chart that instead.
+      select: { date: true, stockAtCost: true, codFloat: true },
       orderBy: { date: "asc" },
     }),
     // Reorder points are current-only; no history of them exists. See the type doc above.
@@ -66,9 +80,9 @@ export async function getDashboardSparklines(
   );
 
   // ---- capital and in-route: recorded daily, gaps carried forward.
-  const snapshotSeries = (key: "stockAtCost" | "codFloat" | "inRouteUnits") =>
+  const snapshotSeries = (value: (s: (typeof snapshots)[number]) => number) =>
     toSeries(
-      densify(new Map(snapshots.map((s) => [dayKey(s.date), s[key]])), days, {
+      densify(new Map(snapshots.map((s) => [dayKey(s.date), value(s)])), days, {
         carryForward: true,
       }),
       snapshots.length,
@@ -99,9 +113,9 @@ export async function getDashboardSparklines(
 
   return {
     unitsSold,
-    stockAtCost: snapshotSeries("stockAtCost"),
-    codFloat: snapshotSeries("codFloat"),
-    inRouteUnits: snapshotSeries("inRouteUnits"),
+    // Matches the Capital KPI's own arithmetic — see the type doc.
+    capital: snapshotSeries((s) => s.stockAtCost + s.codFloat),
+    codFloat: snapshotSeries((s) => s.codFloat),
     lowStock: toSeries(densify(lowByDay, days, { carryForward: false }), observedStockDays),
     critical: toSeries(densify(critByDay, days, { carryForward: false }), observedStockDays),
   };

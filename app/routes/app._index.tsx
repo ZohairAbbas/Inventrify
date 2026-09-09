@@ -434,7 +434,7 @@ export default function Dashboard() {
             label="Capital tied up"
             size="currency"
             value={money(data.capital.stockValue + data.capital.codFloat)}
-            series={data.sparklines.stockAtCost}
+            series={data.sparklines.capital}
             sub={`${money(data.capital.codFloat)} with courier`}
           />
           <KpiTile
@@ -442,7 +442,7 @@ export default function Dashboard() {
             size="currency"
             value={money(data.capital.codFloat)}
             valueColor="var(--inv-transit-value)"
-            series={data.sparklines.inRouteUnits}
+            series={data.sparklines.codFloat}
             sparkColor="var(--inv-transit-fg)"
             sub={`${data.fulfilment.inRouteUnits.toLocaleString()} units`}
             subColor="var(--inv-transit-fg)"

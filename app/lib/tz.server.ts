@@ -61,3 +61,29 @@ export function shopWeekStart(instant: Date, timeZone: string): Date {
   day.setUTCDate(day.getUTCDate() + diff);
   return day;
 }
+
+const hourCache = new Map<string, Intl.DateTimeFormat>();
+
+/**
+ * The hour of day (0-23) in the shop's timezone.
+ *
+ * Used to greet a merchant correctly. The server runs in UTC, so a Karachi merchant
+ * opening the dashboard at 9am local would otherwise be told "good evening" by a server
+ * whose clock reads 04:00 — the kind of detail that makes an app feel unmaintained.
+ *
+ * Falls back to UTC on an unknown IANA zone, matching `formatterFor` above: a bad
+ * timezone string should degrade the greeting, not throw on a page load.
+ */
+export function shopHour(instant: Date, timeZone: string): number {
+  let fmt = hourCache.get(timeZone);
+  if (!fmt) {
+    try {
+      fmt = new Intl.DateTimeFormat("en-GB", { timeZone, hour: "2-digit", hour12: false });
+    } catch {
+      fmt = new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", hour: "2-digit", hour12: false });
+    }
+    hourCache.set(timeZone, fmt);
+  }
+  // "24" is how en-GB renders midnight in some environments; normalise it to 0.
+  return Number(fmt.format(instant)) % 24;
+}

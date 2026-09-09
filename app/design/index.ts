@@ -31,3 +31,17 @@ export { ScanInput } from "./ScanInput";
 export type { ScannedProduct } from "./ScanInput";
 export { Barcode } from "./Barcode";
 export { PrintSheet } from "./PrintSheet";
+
+// Dashboard redesign. Deliberately separate from the components above rather than
+// replacing them: the other routes still render KpiCard, HeroBand and DataTable, and the
+// dashboard's layout should not be able to change how they look.
+export { Sparkline } from "./Sparkline";
+export { KpiTile } from "./KpiTile";
+export { Segmented } from "./Segmented";
+export type { SegmentOption } from "./Segmented";
+export { ActionBar } from "./ActionBar";
+export { PipelineCard } from "./PipelineCard";
+export type { PipelineSegment } from "./PipelineCard";
+export { CostPrompt } from "./CostPrompt";
+export { NeedsActionTable } from "./NeedsActionTable";
+export type { NeedsActionRow } from "./NeedsActionTable";

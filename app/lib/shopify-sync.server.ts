@@ -2,6 +2,12 @@ import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
 import { calculateReorderPoint } from "./forecast.server";
 import {
+  computeCodFloat,
+  computeInRouteUnits,
+  computeStockAtCost,
+} from "./capital.server";
+import {
+  describeError,
   graphqlWithRetry,
   isMissingScope,
   mapPool,
@@ -273,6 +279,36 @@ interface ShopifyVariant {
   } | null;
 }
 
+/**
+ * Record the store's own name, so the dashboard can greet a merchant by it.
+ *
+ * `session.shop` is only the *.myshopify.com domain, which is not what anyone calls their
+ * own store. This is cosmetic, so it must never be able to fail a sync: a shop whose token
+ * predates the read_products scope grant, or any other error on this one query, leaves the
+ * stored name as it was and the greeting falls back to the domain.
+ *
+ * Skipped entirely when the shop has no settings row yet — the row is created on first
+ * visit to the settings page, and creating one here purely to hold a display name would
+ * give every shop a settings record whose other columns are silently defaulted.
+ */
+async function refreshShopName(admin: AdminApiContext, shop: string): Promise<void> {
+  try {
+    const data = await graphqlWithRetry<{ shop: { name: string | null } }>(
+      admin,
+      `query shopName { shop { name } }`,
+      {},
+      // One retry, not the default five: nothing downstream depends on this, and a shop
+      // with a genuinely failing Admin API has more urgent problems than its greeting.
+      2,
+    );
+    const name = (data.shop?.name ?? "").trim();
+    if (!name) return;
+    await prisma.shopSettings.updateMany({ where: { shop }, data: { shopName: name } });
+  } catch (err) {
+    console.warn(`[inventorify] ${shop}: could not read store name (${describeError(err)})`);
+  }
+}
+
 export async function syncShopifyInventory(
   admin: AdminApiContext,
   shop: string,
@@ -283,6 +319,8 @@ export async function syncShopifyInventory(
 
   const settings = await prisma.shopSettings.findUnique({ where: { shop } });
   const defaultLeadTime = settings?.defaultLeadTime ?? 7;
+
+  await refreshShopName(admin, shop);
 
   // Sync locations first so per-location stock has stable FKs (shopifyLocationId → Location.id).
   // A shop whose token predates the read_locations scope still syncs, without per-location
@@ -523,7 +561,13 @@ export async function syncShopifyInventory(
   today.setUTCHours(0, 0, 0, 0);
   const allProducts = await prisma.product.findMany({
     where: { shop, isArchived: false },
-    select: { id: true, currentStock: true },
+    select: {
+      id: true,
+      currentStock: true,
+      unitCost: true,
+      avgMargin: true,
+      fulfilledInTransit: true,
+    },
   });
   await prisma.stockSnapshot.createMany({
     data: allProducts.map((p) => ({
@@ -533,6 +577,28 @@ export async function syncShopifyInventory(
       stock: p.currentStock,
     })),
     skipDuplicates: true,
+  });
+
+  // Shop-wide snapshot for the dashboard sparklines.
+  //
+  // Upserted rather than created: this cron runs hourly, so the day's row is written
+  // repeatedly and each pass should leave the latest reading, not the first. That also
+  // makes the figures end-of-day rather than midnight, which is what a merchant reading
+  // "capital tied up" expects.
+  //
+  // Deliberately outside the `completed` check that guards archiving: a partial catalogue
+  // walk still leaves Product rows in a consistent state (they are upserted one page at a
+  // time), so the snapshot is real, just possibly missing variants Shopify never returned.
+  // Skipping it would leave a hole in the series, and a gap reads as a dip on a sparkline.
+  const snapshot = {
+    inRouteUnits: computeInRouteUnits(allProducts),
+    codFloat: computeCodFloat(allProducts),
+    stockAtCost: computeStockAtCost(allProducts),
+  };
+  await prisma.shopDailySnapshot.upsert({
+    where: { shop_date: { shop, date: today } },
+    create: { shop, date: today, ...snapshot },
+    update: snapshot,
   });
 
   return { synced, errors, archived, completed, error: fatalError };

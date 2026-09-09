@@ -30,6 +30,10 @@ model Session {
 model ShopSettings {
   id                 String   @id @default(cuid())
   shop               String   @unique
+  // Merchant-facing store name, for greeting them by it. `shop` is only the
+  // *.myshopify.com domain, which is not what anyone calls their own store. Filled in on
+  // each sync from the Admin API; null until a shop has synced once.
+  shopName           String?
   courierifyApiKey   String?
   financifyApiKey    String?
   defaultLeadTime    Int      @default(7)
@@ -268,6 +272,33 @@ model StockSnapshot {
   createdAt DateTime @default(now())
 
   @@unique([productId, date])
+  @@index([shop, date])
+}
+
+// Daily shop-wide snapshot, for the dashboard's KPI sparklines.
+//
+// StockSnapshot next door is per-product and can reconstruct a stock history, but two
+// dashboard figures cannot be derived from it at all: units in route and COD float come
+// from Product.fulfilled*, which the Courierify sync overwrites in place, keeping no
+// history. Reconstructing them after the fact is impossible, so they are recorded daily.
+//
+// One row per shop per day — roughly 1/300th the write volume of StockSnapshot, which is
+// already written per-product on the same cron pass.
+model ShopDailySnapshot {
+  id           String   @id @default(cuid())
+  shop         String
+  date         DateTime // midnight UTC
+  // Dispatched + in transit + out for delivery + attempted: stock that has left the
+  // building and not yet resolved.
+  inRouteUnits Int
+  // Retail value of in-route units — cash sitting with the courier, not yet collected.
+  codFloat     Float
+  // On-hand stock valued at unit cost. Negative stock is an oversell, not negative-value
+  // inventory, so it is floored at zero before costing.
+  stockAtCost  Float
+  createdAt    DateTime @default(now())
+
+  @@unique([shop, date])
   @@index([shop, date])
 }
 

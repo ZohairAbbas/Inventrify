@@ -55,6 +55,7 @@ export async function purgeShopData(
   await prisma.alert.deleteMany({ where: { shop } });
   await prisma.seasonalEvent.deleteMany({ where: { shop } });
   await prisma.webhookEvent.deleteMany({ where: { shop } });
+  await prisma.shopDailySnapshot.deleteMany({ where: { shop } });
 
   // Parents.
   await prisma.product.deleteMany({ where: { shop } });

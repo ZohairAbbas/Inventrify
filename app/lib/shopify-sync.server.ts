@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
 import { calculateReorderPoint } from "./forecast.server";
@@ -44,9 +45,13 @@ const PRIMARY_LOCATION_QUERY = `
   }
 `;
 
+// From API 2026-04 Shopify rejects this mutation unless every change carries
+// `changeFromQuantity` and the call carries an `@idempotent` key. Moving the app to
+// 2026-04 without either meant every receipt, adjustment, transfer and count failed to
+// reach Shopify — and the hourly sync then overwrote the local figures with Shopify's.
 const INVENTORY_ADJUST_MUTATION = `
-  mutation adjustInventory($input: InventoryAdjustQuantitiesInput!) {
-    inventoryAdjustQuantities(input: $input) {
+  mutation adjustInventory($input: InventoryAdjustQuantitiesInput!, $idempotencyKey: String!) {
+    inventoryAdjustQuantities(input: $input) @idempotent(key: $idempotencyKey) {
       userErrors { field message }
     }
   }
@@ -147,8 +152,14 @@ export async function applyShopifyInventoryDelta(
       input: {
         reason: "correction",
         name: "available",
-        changes: [{ delta, inventoryItemId, locationId }],
+        // `null` opts out of compare-and-swap. This is a relative move of units that
+        // physically arrived or left; a sale landing between our read and this write
+        // should not make Shopify refuse the receipt.
+        changes: [{ delta, inventoryItemId, locationId, changeFromQuantity: null }],
       },
+      // Minted once per movement and reused by every retry inside graphqlWithRetry, so a
+      // request that timed out after Shopify applied it cannot be applied a second time.
+      idempotencyKey: randomUUID(),
     });
 
     const userErrors = data.inventoryAdjustQuantities?.userErrors ?? [];

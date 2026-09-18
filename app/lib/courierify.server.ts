@@ -296,18 +296,24 @@ export async function syncCourierifyReturns(
 /**
  * One shipment's outcome, keyed to a Shopify order rather than to a SKU.
  *
- * Contract for `GET /api/external/inventrify/order-outcomes` — NOT YET IMPLEMENTED on
- * Courierify. Until it exists this pull is inert: the endpoint 404s (or is plan-gated) and
- * syncCourierifyOrderOutcomes reports unavailable without touching any data.
+ * Contract for `GET /api/external/inventrify/order-outcomes`. If the endpoint 404s (or is
+ * plan-gated) syncCourierifyOrderOutcomes reports unavailable without touching any data.
  *
- * Expected shape, mirroring the sibling ungated endpoints:
+ * Shape, mirroring the sibling ungated endpoints:
  *   { timestamp, rows: [{ shipmentId, shopifyOrderName, status, updatedAt, courier? }] }
  *   Query: ?shop=<domain>[&updatedSince=<ISO>]
- *   Scope: analytics:read - ungated - non-billable
+ *   Rows come oldest-first by updatedAt, at most 5,000 per response.
  *
  * Every field already exists on Courierify's Shipment table, and shopifyOrderName is
  * populated on 100% of rows sampled, so no backfill is required to serve this.
  */
+/** Courierify's order-outcomes page size; a page this long may have more behind it. */
+const OUTCOMES_PAGE_LIMIT = 5000;
+/** Pages per run. A 60k-shipment backfill finishes in two runs rather than a day. */
+const OUTCOMES_MAX_PAGES_PER_RUN = 10;
+/** Cursor step-back, so a row committed with a slightly earlier timestamp is re-read. */
+const OUTCOMES_OVERLAP_MS = 60_000;
+
 export interface OrderOutcomeEntry {
   shipmentId: string;
   shopifyOrderName?: string | null;
@@ -329,72 +335,110 @@ export interface OrderOutcomeEntry {
 export async function syncCourierifyOrderOutcomes(
   shop: string,
   apiKey: string,
-): Promise<{ stored: number; available: boolean; error?: string }> {
+): Promise<{ stored: number; available: boolean; missingTimestamp?: number; error?: string }> {
+  let stored = 0;
+  let missingTimestamp = 0;
+  const summary = () => (missingTimestamp ? { missingTimestamp } : {});
+
   try {
     const settings = await prisma.shopSettings.findUnique({ where: { shop } });
-    const cursor = settings?.courierifyOutcomesCursor;
+    let cursor = settings?.courierifyOutcomesCursor ?? null;
 
-    const params: Record<string, string> = { shop };
-    if (cursor) params.updatedSince = cursor.toISOString();
+    for (let page = 0; page < OUTCOMES_MAX_PAGES_PER_RUN; page++) {
+      const params: Record<string, string> = { shop };
+      if (cursor) params.updatedSince = cursor.toISOString();
 
-    const result = await fetchExternal<OrderOutcomeEntry>(
-      "/inventrify/order-outcomes",
-      apiKey,
-      params,
-    );
+      const result = await fetchExternal<OrderOutcomeEntry>(
+        "/inventrify/order-outcomes",
+        apiKey,
+        params,
+      );
 
-    if (result.error) {
-      // The endpoint not existing yet, or being gated, is not a failure worth surfacing
-      // to the merchant — it simply means this capability is not switched on.
-      const unavailable = /404|not found|plan|scope|denied/i.test(result.error);
-      return {
-        stored: 0,
-        available: !unavailable,
-        error: unavailable ? undefined : result.error,
-      };
-    }
+      if (result.error) {
+        // A later page failing leaves the cursor where the last good page put it; the
+        // next run resumes from there.
+        if (page > 0) return { stored, available: true, error: result.error, ...summary() };
+        // The endpoint not existing yet, or being gated, is not a failure worth surfacing
+        // to the merchant — it simply means this capability is not switched on.
+        const unavailable = /404|not found|plan|scope|denied/i.test(result.error);
+        return {
+          stored: 0,
+          available: !unavailable,
+          error: unavailable ? undefined : result.error,
+        };
+      }
 
-    const rows = result.rows ?? [];
-    let stored = 0;
-    let maxUpdatedAt: Date | null = null;
+      const rows = result.rows ?? [];
+      let maxUpdatedAt: Date | null = null;
 
-    for (const row of rows) {
-      if (!row.shipmentId || !row.shopifyOrderName || !row.status) continue;
-      const updatedAt = row.updatedAt ? new Date(row.updatedAt) : new Date();
-      if (!maxUpdatedAt || updatedAt > maxUpdatedAt) maxUpdatedAt = updatedAt;
+      for (const row of rows) {
+        if (!row.shipmentId || !row.shopifyOrderName || !row.status) continue;
+        // No usable timestamp means no honest place for the row. Stamping it "now" used to
+        // drag an old outcome into the last-7/30-day windows and push the cursor past
+        // older rows not yet pulled, so it is skipped and counted instead.
+        const updatedAt = row.updatedAt ? new Date(row.updatedAt) : null;
+        if (!updatedAt || Number.isNaN(updatedAt.getTime())) {
+          missingTimestamp += 1;
+          continue;
+        }
+        if (!maxUpdatedAt || updatedAt > maxUpdatedAt) maxUpdatedAt = updatedAt;
 
-      await prisma.orderOutcome.upsert({
-        where: { shop_shipmentId: { shop, shipmentId: row.shipmentId } },
-        create: {
-          shop,
-          shipmentId: row.shipmentId,
-          orderName: row.shopifyOrderName,
-          status: row.status,
-          courier: row.courier ?? null,
-          updatedAt,
-        },
-        // A shipment's status changes over its life; the latest wins.
-        update: { status: row.status, courier: row.courier ?? null, updatedAt },
-      });
-      stored += 1;
-    }
+        await prisma.orderOutcome.upsert({
+          where: { shop_shipmentId: { shop, shipmentId: row.shipmentId } },
+          create: {
+            shop,
+            shipmentId: row.shipmentId,
+            orderName: row.shopifyOrderName,
+            status: row.status,
+            courier: row.courier ?? null,
+            updatedAt,
+          },
+          // A shipment's status changes over its life; the latest wins.
+          update: { status: row.status, courier: row.courier ?? null, updatedAt },
+        });
+        stored += 1;
+      }
 
-    // Same cursor rules as the returns pull: advance only to what was actually seen,
-    // with an overlap buffer, never on an empty page, never backwards.
-    if (maxUpdatedAt) {
-      const OVERLAP_MS = 60_000;
-      const next = new Date(maxUpdatedAt.getTime() - OVERLAP_MS);
+      // Same cursor rules as the returns pull: advance only to what was actually seen,
+      // with an overlap buffer, never on an empty page, never backwards.
+      if (!maxUpdatedAt) break;
+      const full = rows.length >= OUTCOMES_PAGE_LIMIT;
+      let next = new Date(maxUpdatedAt.getTime() - OUTCOMES_OVERLAP_MS);
+      // Courierify pages oldest-first, so a full page ends where the next one starts.
+      // If the whole page fell inside the overlap, stepping back would request the same
+      // page forever; step to its last timestamp instead. Rows sharing that timestamp are
+      // re-sent, which the upsert absorbs.
+      if (full && cursor && next <= cursor) next = maxUpdatedAt;
       const advanced = cursor && next < cursor ? cursor : next;
       await prisma.shopSettings.update({
         where: { shop },
         data: { courierifyOutcomesCursor: advanced },
       });
+
+      if (!full) break;
+      if (cursor && advanced <= cursor) {
+        // Over a page of rows share one timestamp: Courierify cannot page past them.
+        console.warn(
+          `[inventorify] ${shop}: Courierify outcomes stalled — ${rows.length} rows at ${maxUpdatedAt.toISOString()}`,
+        );
+        break;
+      }
+      console.warn(
+        `[inventorify] ${shop}: Courierify returned a full page of ${rows.length} outcomes; requesting the next`,
+      );
+      cursor = advanced;
     }
 
-    return { stored, available: true };
+    if (missingTimestamp > 0) {
+      console.warn(
+        `[inventorify] ${shop}: skipped ${missingTimestamp} Courierify outcome(s) with no updatedAt`,
+      );
+    }
+
+    return { stored, available: true, ...summary() };
   } catch (err) {
     return {
-      stored: 0,
+      stored,
       available: true,
       error: err instanceof Error ? err.message : "Unknown error",
     };

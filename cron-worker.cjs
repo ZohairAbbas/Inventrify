@@ -38,6 +38,16 @@ async function runJob(jobName, endpoint) {
     clearTimeout(timeout);
 
     const body = await response.text();
+    // Long jobs answer 202 and run on the server; their outcome is in the app's log as
+    // "[cron/<job>] completed in …". 409 means the server's previous run is still going.
+    if (response.status === 202) {
+      console.log(`[${new Date().toISOString()}] ${jobName}: Accepted, running on the server`);
+      return;
+    }
+    if (response.status === 409) {
+      console.log(`[${new Date().toISOString()}] ${jobName}: Skipped (server run still in progress)`, body);
+      return;
+    }
     if (!response.ok) {
       console.error(`[${new Date().toISOString()}] ${jobName}: HTTP ${response.status} -`, body);
       return;
@@ -67,7 +77,7 @@ cron.schedule('0 * * * *', () => {
 });
 
 // Shopify reconciliation - hourly at :15.
-// Pulls the catalogue, the 90-day order window, and Shopify's own carrier tracking
+// Pulls the catalogue, recent orders (60 days; 90 with read_all_orders), and Shopify's own carrier tracking
 // (DELIVERED / NOT_DELIVERED / IN_TRANSIT ...), which is what feeds the fulfilment
 // pipeline and per-SKU RTO for shops with no courier integration. Also refreshes reorder
 // points, which are derived from the demand this job rewrites.

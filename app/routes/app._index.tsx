@@ -199,8 +199,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     period: {
       soldUnits,
       priorUnits,
-      // Null rather than 0% when there is no prior window to compare against — at 90 days
-      // there is none, because only 90 days are retained.
+      // Null rather than 0% when there is no prior window to compare against. History is
+      // kept indefinitely, but it only starts 60 days before install (Shopify returns no
+      // older orders without read_all_orders), so a young shop has no prior 90 days.
       changePct: priorUnits > 0 ? ((soldUnits - priorUnits) / priorUnits) * 100 : null,
     },
     currency: settings?.currency ?? "USD",
@@ -472,6 +473,14 @@ export default function Dashboard() {
           <Card padding="12px 14px" style={{ marginBottom: "14px", borderColor: "var(--inv-status-low-dot)" }}>
             <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.5 }}>
               {data.rtoFreshness.warning}
+            </div>
+          </Card>
+        )}
+
+        {data.rtoFreshness.unrecognisedWarning && (
+          <Card padding="12px 14px" style={{ marginBottom: "14px", borderColor: "var(--inv-status-low-dot)" }}>
+            <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.5 }}>
+              {data.rtoFreshness.unrecognisedWarning}
             </div>
           </Card>
         )}

@@ -78,3 +78,27 @@ export function decryptSecret(stored: string | null | undefined): string | null 
     return null;
   }
 }
+
+/** True when a stored value predates encryption and is still plaintext. */
+export function isLegacyPlaintext(stored: string | null | undefined): boolean {
+  return !!stored && !stored.startsWith(PREFIX);
+}
+
+/**
+ * The encrypted form of a legacy plaintext value, or null when it needs no upgrade.
+ *
+ * Throws rather than returning plaintext when ENCRYPTION_KEY is missing, and checks the
+ * result decrypts back to the original before handing it over: a migration that
+ * silently wrote an unreadable key would disconnect the merchant's integration.
+ */
+export function upgradeLegacySecret(stored: string | null | undefined): string | null {
+  if (!isLegacyPlaintext(stored)) return null;
+  if (!isEncryptionConfigured()) {
+    throw new Error("ENCRYPTION_KEY is not set — refusing to rewrite integration keys");
+  }
+  const encrypted = encryptSecret(stored);
+  if (!encrypted || decryptSecret(encrypted) !== stored) {
+    throw new Error("re-encrypted integration key did not decrypt to the original");
+  }
+  return encrypted;
+}

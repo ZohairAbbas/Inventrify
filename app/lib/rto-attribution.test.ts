@@ -3,9 +3,11 @@ import {
   RTO_STALE_AFTER_DAYS,
   attributeRto,
   classifyFulfilmentStage,
+  isRecognisedStatus,
   isResolvedStatus,
   isReturnedStatus,
   resolveOutcomeByOrder,
+  summariseUnrecognised,
   type OrderLineRow,
   type OrderOutcomeRow,
 } from "./rto-attribution.server";
@@ -213,6 +215,49 @@ describe("classifyFulfilmentStage", () => {
     expect(classifyFulfilmentStage("returned")).toBe("not_delivered");
     expect(classifyFulfilmentStage("delivered")).toBe("delivered");
   });
+
+  it("maps every Courierify status to its stage", () => {
+    const expected: Record<string, string | null> = {
+      delivered: "delivered",
+      returned: "not_delivered",
+      cancelled: null,
+      out_for_delivery: "out_for_delivery",
+      // The same failed attempt Shopify calls ATTEMPTED_DELIVERY.
+      attempted: "attempted",
+      in_transit: "in_transit",
+      picked_up: "in_transit",
+      // Courierify's pre-pickup states: booked, not yet collected.
+      booked: "dispatched",
+      pending: "dispatched",
+    };
+    for (const [status, stage] of Object.entries(expected)) {
+      expect(classifyFulfilmentStage(status), status).toBe(stage);
+      expect(isRecognisedStatus(status), status).toBe(true);
+    }
+  });
+
+  it("recognises every Shopify status seen in production", () => {
+    for (const s of [
+      "DELIVERED",
+      "NOT_DELIVERED",
+      "CANCELED",
+      "IN_TRANSIT",
+      "FULFILLED",
+      "OUT_FOR_DELIVERY",
+      "ATTEMPTED_DELIVERY",
+      "CONFIRMED",
+    ]) {
+      expect(isRecognisedStatus(s), s).toBe(true);
+    }
+  });
+
+  it("keeps unknown statuses out of the ratio but flags them", () => {
+    for (const s of ["unknown", "RTO Initiated", "Consignee refused"]) {
+      expect(isRecognisedStatus(s), s).toBe(false);
+      expect(isResolvedStatus(s), s).toBe(false);
+      expect(classifyFulfilmentStage(s), s).toBe("dispatched");
+    }
+  });
 });
 
 describe("Shopify statuses feed the RTO rate", () => {
@@ -330,5 +375,25 @@ describe("resolveOutcomeByOrder", () => {
 
   it("handles an empty input", () => {
     expect(resolveOutcomeByOrder([]).size).toBe(0);
+  });
+});
+
+describe("summariseUnrecognised", () => {
+  it("counts only unrecognised statuses, most frequent first", () => {
+    expect(
+      summariseUnrecognised([
+        { status: "delivered", count: 50 },
+        { status: "unknown", count: 2 },
+        { status: "RTO Initiated", count: 7 },
+        { status: "booked", count: 3 },
+      ]),
+    ).toEqual({ count: 9, examples: ["RTO Initiated", "unknown"] });
+  });
+
+  it("is empty when every status is known", () => {
+    expect(summariseUnrecognised([{ status: "DELIVERED", count: 4 }])).toEqual({
+      count: 0,
+      examples: [],
+    });
   });
 });

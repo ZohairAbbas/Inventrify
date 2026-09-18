@@ -477,6 +477,14 @@ export default function Dashboard() {
           </Card>
         )}
 
+        {data.rtoFreshness.unrecognisedWarning && (
+          <Card padding="12px 14px" style={{ marginBottom: "14px", borderColor: "var(--inv-status-low-dot)" }}>
+            <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", lineHeight: 1.5 }}>
+              {data.rtoFreshness.unrecognisedWarning}
+            </div>
+          </Card>
+        )}
+
         {(data.fulfilment.inRouteUnits > 0 || resolved > 0) && (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(320px,1fr))", gap: "14px", marginBottom: "16px" }}>
             <PipelineCard

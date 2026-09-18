@@ -294,6 +294,10 @@ export interface RtoFreshness {
   isStale: boolean;
   /** Merchant-facing explanation, or null when the data is current. */
   warning: string | null;
+  /** Outcomes in the last 90 days whose status is not recognised, so not in the ratio. */
+  unrecognisedOutcomes: number;
+  /** Merchant-facing explanation of those, or null when there are none. */
+  unrecognisedWarning: string | null;
 }
 
 /**
@@ -310,10 +314,37 @@ export async function getRtoFreshness(shop: string): Promise<RtoFreshness> {
     select: { rtoDataThrough: true, rtoOrdersAttributed: true },
   });
 
+  const byStatus = await prisma.orderOutcome.groupBy({
+    by: ["status"],
+    where: { shop, updatedAt: { gte: new Date(Date.now() - 90 * 86400000) } },
+    _count: { _all: true },
+  });
+  const unrecognised = summariseUnrecognised(
+    byStatus.map((g) => ({ status: g.status, count: g._count._all })),
+  );
+  const coverage = {
+    unrecognisedOutcomes: unrecognised.count,
+    unrecognisedWarning: unrecognised.count
+      ? `${unrecognised.count} shipment${unrecognised.count === 1 ? " has" : "s have"} a ` +
+        `courier status Inventorify does not recognise (${unrecognised.examples
+          .map((e) => `"${e}"`)
+          .join(", ")}), so ${unrecognised.count === 1 ? "it is" : "they are"} left out ` +
+        `of return rates. If any of these mean the parcel was returned, return rates are ` +
+        `understated.`
+      : null,
+  };
+
   const dataThrough = settings?.rtoDataThrough ?? null;
   const ordersAttributed = settings?.rtoOrdersAttributed ?? 0;
   if (!dataThrough) {
-    return { dataThrough: null, ordersAttributed, ageDays: null, isStale: false, warning: null };
+    return {
+      dataThrough: null,
+      ordersAttributed,
+      ageDays: null,
+      isStale: false,
+      warning: null,
+      ...coverage,
+    };
   }
 
   const ageDays = Math.floor((Date.now() - dataThrough.getTime()) / 86400000);
@@ -324,6 +355,7 @@ export async function getRtoFreshness(shop: string): Promise<RtoFreshness> {
     ordersAttributed,
     ageDays,
     isStale,
+    ...coverage,
     warning: isStale
       ? `Return rates are based on courier data up to ${dataThrough.toISOString().slice(0, 10)} ` +
         `(${ageDays} days ago). If shipments moved to another carrier, these rates describe ` +
@@ -471,12 +503,71 @@ export function classifyFulfilmentStage(status: string): FulfilmentStage | null 
   if (isTerminalNonJourney(s)) return null;
   if (RETURNED.has(s)) return "not_delivered";
   if (DELIVERED.has(s)) return "delivered";
-  if (s === "out_for_delivery") return "out_for_delivery";
-  if (s === "attempted_delivery") return "attempted";
-  if (s === "in_transit" || s === "picked_up") return "in_transit";
-  // fulfilled, marked_as_fulfilled, submitted, confirmed, label_printed, label_purchased,
-  // ready_for_pickup — handed over, nothing back from the carrier yet.
+  if (OUT_FOR_DELIVERY.has(s)) return "out_for_delivery";
+  if (ATTEMPTED.has(s)) return "attempted";
+  if (IN_TRANSIT.has(s)) return "in_transit";
+  // DISPATCHED, and anything unrecognised: nothing usable back from the carrier yet.
+  // Unrecognised statuses are counted separately; see isRecognisedStatus.
   return "dispatched";
+}
+
+// Stage vocabularies. Shopify's FulfillmentDisplayStatus values are lower-cased here;
+// Courierify's are already lower-case.
+const OUT_FOR_DELIVERY = new Set(["out_for_delivery"]);
+// Shopify says attempted_delivery, Courierify says attempted: the same failed attempt.
+const ATTEMPTED = new Set(["attempted_delivery", "attempted"]);
+const IN_TRANSIT = new Set(["in_transit", "picked_up"]);
+/**
+ * Handed over, but no carrier scan yet. Courierify's pending and booked are its
+ * pre-pickup states: a booking exists, the courier has not collected the parcel.
+ */
+const DISPATCHED = new Set([
+  "fulfilled",
+  "marked_as_fulfilled",
+  "submitted",
+  "confirmed",
+  "label_printed",
+  "label_purchased",
+  "ready_for_pickup",
+  "booked",
+  "pending",
+]);
+
+/**
+ * Whether a status belongs to a vocabulary this module understands.
+ *
+ * An unrecognised status still lands in "dispatched" and stays out of the RTO ratio, as
+ * an unresolved journey should. What it must not do is disappear silently: if a courier
+ * starts sending a raw "RTO" string, every return behind it would be missing from the
+ * rate. Callers count these so the gap is visible.
+ */
+export function isRecognisedStatus(status: string): boolean {
+  const s = status.trim().toLowerCase();
+  return (
+    DELIVERED.has(s) ||
+    RETURNED.has(s) ||
+    TERMINAL_NON_JOURNEY.has(s) ||
+    OUT_FOR_DELIVERY.has(s) ||
+    ATTEMPTED.has(s) ||
+    IN_TRANSIT.has(s) ||
+    DISPATCHED.has(s)
+  );
+}
+
+/**
+ * Summarise outcome rows whose status is not recognised, from per-status counts.
+ * `examples` holds up to three of the statuses, most frequent first.
+ */
+export function summariseUnrecognised(
+  byStatus: { status: string; count: number }[],
+): { count: number; examples: string[] } {
+  const unknown = byStatus
+    .filter((g) => !isRecognisedStatus(g.status))
+    .sort((a, b) => b.count - a.count);
+  return {
+    count: unknown.reduce((sum, g) => sum + g.count, 0),
+    examples: unknown.slice(0, 3).map((g) => g.status),
+  };
 }
 
 export interface FulfilmentBreakdown {

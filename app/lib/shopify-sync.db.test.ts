@@ -338,6 +338,8 @@ describe("syncShopifyInventory", () => {
     let variantCalls = 0;
     const { admin } = mockAdmin((q) => {
       if (isLocations(q)) return { body: locationsBody };
+      // Count catalogue pages only; the sync also asks for the shop's name.
+      if (!q.includes("getProductVariants")) return { body: { data: { shop: { name: "Test" } } } };
       variantCalls++;
       // First attempt throttled, second succeeds.
       if (variantCalls === 1) return { status: 429, body: {} };

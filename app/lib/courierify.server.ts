@@ -329,7 +329,7 @@ export interface OrderOutcomeEntry {
 export async function syncCourierifyOrderOutcomes(
   shop: string,
   apiKey: string,
-): Promise<{ stored: number; available: boolean; error?: string }> {
+): Promise<{ stored: number; available: boolean; missingTimestamp?: number; error?: string }> {
   try {
     const settings = await prisma.shopSettings.findUnique({ where: { shop } });
     const cursor = settings?.courierifyOutcomesCursor;
@@ -356,11 +356,19 @@ export async function syncCourierifyOrderOutcomes(
 
     const rows = result.rows ?? [];
     let stored = 0;
+    let missingTimestamp = 0;
     let maxUpdatedAt: Date | null = null;
 
     for (const row of rows) {
       if (!row.shipmentId || !row.shopifyOrderName || !row.status) continue;
-      const updatedAt = row.updatedAt ? new Date(row.updatedAt) : new Date();
+      // No usable timestamp means no honest place for the row. Stamping it "now" used to
+      // drag an old outcome into the last-7/30-day windows and push the cursor past
+      // older rows not yet pulled, so it is skipped and counted instead.
+      const updatedAt = row.updatedAt ? new Date(row.updatedAt) : null;
+      if (!updatedAt || Number.isNaN(updatedAt.getTime())) {
+        missingTimestamp += 1;
+        continue;
+      }
       if (!maxUpdatedAt || updatedAt > maxUpdatedAt) maxUpdatedAt = updatedAt;
 
       await prisma.orderOutcome.upsert({
@@ -391,7 +399,13 @@ export async function syncCourierifyOrderOutcomes(
       });
     }
 
-    return { stored, available: true };
+    if (missingTimestamp > 0) {
+      console.warn(
+        `[inventorify] ${shop}: skipped ${missingTimestamp} Courierify outcome(s) with no updatedAt`,
+      );
+    }
+
+    return { stored, available: true, ...(missingTimestamp ? { missingTimestamp } : {}) };
   } catch (err) {
     return {
       stored: 0,

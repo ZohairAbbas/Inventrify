@@ -3,6 +3,7 @@ import { json } from "@remix-run/node";
 import { unauthenticated } from "../shopify.server";
 import { listSyncableShops, standDownIfUninstalled } from "../lib/active-shops.server";
 import { isAuthorisedCronRequest } from "../lib/cron-auth.server";
+import { startBackgroundJob } from "../lib/background-job.server";
 import { describeError } from "../lib/shopify-graphql.server";
 import { syncShopifyInventory } from "../lib/shopify-sync.server";
 import { syncOrderHistory } from "../lib/order-sync.server";
@@ -24,12 +25,27 @@ import {
  *
  * POST /api/cron/sync
  * Header: x-cron-secret: <CRON_SECRET env var>
+ *
+ * Answers 202 immediately and runs in the background; the per-shop outcome is logged
+ * when the run finishes. A trigger that arrives while a run is in progress gets 409 and
+ * starts nothing.
  */
 export const action = async ({ request }: ActionFunctionArgs) => {
   if (!isAuthorisedCronRequest(request)) {
     return json({ error: "Unauthorized" }, { status: 401 });
   }
 
+  const start = startBackgroundJob("sync", runShopifySync);
+  if (!start.started) {
+    return json(
+      { status: "already_running", runningSince: start.runningSince.toISOString() },
+      { status: 409 },
+    );
+  }
+  return json({ status: "started" }, { status: 202 });
+};
+
+async function runShopifySync() {
   const shops = await listSyncableShops();
 
   const results: {
@@ -133,8 +149,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     }
   }
 
-  return json({ shops: shops.length, results });
-};
+  return { shops: shops.length, results };
+}
 
 // GET: healthcheck — returns 200 so uptime monitors can ping it
 export const loader = async (_args: LoaderFunctionArgs) => {

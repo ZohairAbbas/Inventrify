@@ -199,8 +199,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     period: {
       soldUnits,
       priorUnits,
-      // Null rather than 0% when there is no prior window to compare against — at 90 days
-      // there is none, because only 90 days are retained.
+      // Null rather than 0% when there is no prior window to compare against. History is
+      // kept indefinitely, but it only starts 60 days before install (Shopify returns no
+      // older orders without read_all_orders), so a young shop has no prior 90 days.
       changePct: priorUnits > 0 ? ((soldUnits - priorUnits) / priorUnits) * 100 : null,
     },
     currency: settings?.currency ?? "USD",

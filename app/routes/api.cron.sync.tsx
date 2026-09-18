@@ -37,6 +37,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     synced: number;
     archived: number;
     records: number;
+    /** SalesRecord rows removed while rebuilding the reconciled days. */
+    deleted: number;
     completed: boolean;
     error?: string;
     skipped?: string;
@@ -58,6 +60,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           synced: inventory.synced,
           archived: 0,
           records: 0,
+          deleted: 0,
           completed: false,
           skipped: "uninstalled",
         });
@@ -71,6 +74,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           synced: inventory.synced,
           archived: inventory.archived,
           records: orders.recordsSynced,
+          deleted: orders.recordsDeleted,
           completed: false,
           skipped: "uninstalled",
         });
@@ -92,6 +96,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         synced: inventory.synced,
         archived: inventory.archived,
         records: orders.recordsSynced,
+        deleted: orders.recordsDeleted,
         // Either half failing makes the run partial; the caller should be able to see
         // that rather than reading the counts as a complete picture.
         completed: inventory.completed && orders.completed,
@@ -108,6 +113,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           synced: 0,
           archived: 0,
           records: 0,
+          deleted: 0,
           completed: false,
           skipped: "uninstalled",
         });
@@ -120,6 +126,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         synced: 0,
         archived: 0,
         records: 0,
+        deleted: 0,
         completed: false,
         error: message,
       });

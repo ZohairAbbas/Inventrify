@@ -70,17 +70,78 @@ interface OrdersResponse {
 const SYNC_WINDOW_DAYS = 90;
 
 /**
- * Rebuild the trailing-90-day demand history from Shopify.
+ * How far back Shopify returns orders to an app without `read_all_orders`: 60 days.
+ * One day is kept in hand so the boundary day is never treated as complete.
+ */
+const DEFAULT_ORDER_ACCESS_DAYS = 59;
+
+const DAY_MS = 86400000;
+
+const ACCESS_SCOPES_QUERY = `
+  query accessScopes {
+    currentAppInstallation { accessScopes { handle } }
+  }
+`;
+
+/**
+ * Whether this installation can read orders older than 60 days.
  *
- * This is a reconciliation pass: ORDERS_CREATE keeps demand current in real time, and
- * this re-derives the window from the source of truth to repair anything missed while
- * the app was down or webhooks were failing.
+ * Asked of Shopify rather than read from the stored session, because the granted scopes
+ * are what bound the order walk. Any failure answers false: assuming the shorter window
+ * only means reconciling fewer days, whereas wrongly assuming the longer one deletes
+ * history the walk never re-read.
+ */
+async function canReadAllOrders(admin: AdminApiContext): Promise<boolean> {
+  try {
+    const data = await graphqlWithRetry<{
+      currentAppInstallation: { accessScopes: { handle: string }[] } | null;
+    }>(admin, ACCESS_SCOPES_QUERY, {}, 2);
+    return (data.currentAppInstallation?.accessScopes ?? []).some(
+      (s) => s.handle === "read_all_orders",
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The first shop-local day this walk is guaranteed to have seen in full.
+ *
+ * Only days on or after this are rebuilt. Anything earlier is outside what Shopify
+ * returned — without `read_all_orders` that is everything past 60 days — so it must be
+ * left exactly as stored. The day containing the window's edge is skipped as well,
+ * because the walk saw only part of it.
+ */
+export function reconcileFloor(
+  now: Date,
+  hasAllOrders: boolean,
+  timezone: string,
+): Date {
+  const days = hasAllOrders ? SYNC_WINDOW_DAYS : DEFAULT_ORDER_ACCESS_DAYS;
+  const edge = shopDateKey(new Date(now.getTime() - days * DAY_MS), timezone);
+  return new Date(edge.getTime() + DAY_MS);
+}
+
+/**
+ * Reconcile recent demand history against Shopify.
+ *
+ * ORDERS_CREATE keeps demand current in real time; this re-derives the days Shopify
+ * actually returns to repair anything missed while the app was down or webhooks were
+ * failing. That is the last 60 days, or 90 with `read_all_orders`. Older rows are
+ * never touched: they are the only record of that demand.
  */
 export async function syncOrderHistory(
   admin: AdminApiContext,
   shop: string,
-): Promise<{ recordsSynced: number; variantsSeen: number; completed: boolean; error?: string }> {
-  const since = new Date(Date.now() - SYNC_WINDOW_DAYS * 86400000);
+): Promise<{
+  recordsSynced: number;
+  recordsDeleted: number;
+  variantsSeen: number;
+  completed: boolean;
+  error?: string;
+}> {
+  const now = new Date();
+  const since = new Date(now.getTime() - SYNC_WINDOW_DAYS * DAY_MS);
   const sinceStr = since.toISOString().split("T")[0];
 
   const settings = await prisma.shopSettings.findUnique({
@@ -88,6 +149,7 @@ export async function syncOrderHistory(
     select: { timezone: true, codGateways: true, confirmedOrderTag: true },
   });
   const timezone = settings?.timezone ?? "UTC";
+  const floor = reconcileFloor(now, await canReadAllOrders(admin), timezone);
   const codGateways = parseCodGateways(settings?.codGateways);
   const confirmedTag = (settings?.confirmedOrderTag ?? "").trim().toLowerCase();
 
@@ -251,13 +313,20 @@ export async function syncOrderHistory(
     console.error(`[inventorify] order sync aborted for ${shop}: ${fatalError}`);
   }
 
-  // A partial fetch must never be written as if it were the whole window: replacing
-  // 90 days of history from an aborted walk would delete real demand.
+  // A partial fetch must never be written as if it were the whole window: rebuilding
+  // days from an aborted walk would delete real demand.
   if (!completed) {
-    return { recordsSynced: 0, variantsSeen: salesMap.size, completed, error: fatalError };
+    return {
+      recordsSynced: 0,
+      recordsDeleted: 0,
+      variantsSeen: salesMap.size,
+      completed,
+      error: fatalError,
+    };
   }
 
   let recordsSynced = 0;
+  let recordsDeleted = 0;
   const variantsSeen = salesMap.size;
 
   // Only variants we track, resolved in one query rather than one per variant.
@@ -265,6 +334,22 @@ export async function syncOrderHistory(
     where: { shop, id: { in: [...salesMap.keys()] } },
     select: { id: true, firstSoldAt: true },
   });
+
+  // Stored history from the part of the demand window this walk did not rebuild. The
+  // estimate below needs it: estimating from the walk alone treats those days as zero.
+  const olderRows = await prisma.salesRecord.findMany({
+    where: {
+      shop,
+      productId: { in: tracked.map((t) => t.id) },
+      date: { gte: since, lt: floor },
+    },
+    select: { productId: true, date: true, quantity: true },
+  });
+  const olderByVariant = new Map<string, Map<number, number>>();
+  for (const row of olderRows) {
+    if (!olderByVariant.has(row.productId)) olderByVariant.set(row.productId, new Map());
+    olderByVariant.get(row.productId)!.set(row.date.getTime(), row.quantity);
+  }
 
   for (const { id: variantId, firstSoldAt: knownFirstSold } of tracked) {
     const dayMap = salesMap.get(variantId);
@@ -279,13 +364,30 @@ export async function syncOrderHistory(
 
     // Delete-then-insert is only safe inside a transaction. Previously a crash between
     // the two statements left the product with no demand history at all.
-    await prisma.$transaction([
+    //
+    // The delete covers only days the walk saw in full. Days before `floor` are
+    // inserted only where no row exists yet (skipDuplicates), which backfills a fresh
+    // install without overwriting a complete day with the partial count the walk saw.
+    const [deleted] = await prisma.$transaction([
       prisma.salesRecord.deleteMany({
-        where: { productId: variantId, date: { gte: since } },
+        where: { shop, productId: variantId, date: { gte: floor } },
       }),
       prisma.salesRecord.createMany({ data: records, skipDuplicates: true }),
     ]);
     recordsSynced += records.length;
+    recordsDeleted += deleted.count;
+
+    // What is now stored for the window: the untouched older days, then the rebuilt
+    // ones, plus any older day this walk has just created.
+    const stored = new Map(olderByVariant.get(variantId) ?? []);
+    for (const r of records) {
+      const t = r.date.getTime();
+      if (r.date >= floor || !stored.has(t)) stored.set(t, r.quantity);
+    }
+    const history = [...stored.entries()].map(([t, quantity]) => ({
+      date: new Date(t),
+      quantity,
+    }));
 
     const firstInWindow = records.reduce<Date | null>(
       (min, r) => (min === null || r.date < min ? r.date : min),
@@ -295,9 +397,9 @@ export async function syncOrderHistory(
     // firstSoldAt only ever moves earlier.
     //
     // `firstInWindow` is the earliest sale in *this sync window*, which is not the
-    // earliest sale full stop: the delete above only clears rows from `since` onward, so
-    // older history survives, and a shop that has been selling for a year has a first
-    // sale far outside the window. Writing the window's minimum unconditionally pushed
+    // earliest sale full stop: the delete above only clears recent days, so older
+    // history survives, and a shop that has been selling for a year has a first sale
+    // far outside the window. Writing the window's minimum unconditionally pushed
     // firstSoldAt forward every sync. That matters because this bounds the demand-
     // variance window — moving it later shortens the window and understates sigma, the
     // mirror image of the padding problem the field was added to prevent.
@@ -309,7 +411,7 @@ export async function syncOrderHistory(
     // One estimator for the whole app: the cached avgDailySales that drives reorder
     // points is now the same number the forecast uses, rather than a second, slightly
     // different moving average maintained in parallel here.
-    const { dailyRate } = estimateDemand(records, {
+    const { dailyRate } = estimateDemand(history, {
       windowStart: since,
       firstSoldAt: firstSold,
     });
@@ -328,21 +430,24 @@ export async function syncOrderHistory(
 
     // Backfill the COD order counts that form the RTO denominator. Without this a
     // fresh install had no return-rate history until a week of webhooks accumulated.
+    // A week that starts before `floor` was only partly walked, so an existing count
+    // for it is kept rather than overwritten with the partial one.
     const weekMap = codMap.get(variantId);
     if (weekMap) {
       for (const [weekIso, orderCount] of weekMap) {
+        const weekStart = new Date(weekIso);
         await prisma.returnRateHistory.upsert({
           where: {
-            productId_weekStart: { productId: variantId, weekStart: new Date(weekIso) },
+            productId_weekStart: { productId: variantId, weekStart },
           },
           create: {
             shop,
             productId: variantId,
-            weekStart: new Date(weekIso),
+            weekStart,
             returnRate: 0,
             orderCount,
           },
-          update: { orderCount },
+          update: weekStart >= floor ? { orderCount } : {},
         });
       }
     }
@@ -408,7 +513,7 @@ export async function syncOrderHistory(
     });
   }
 
-  return { recordsSynced, variantsSeen, completed };
+  return { recordsSynced, recordsDeleted, variantsSeen, completed };
 }
 
 /**

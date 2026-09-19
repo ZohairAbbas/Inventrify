@@ -224,9 +224,15 @@ describe("receivePurchaseOrder", () => {
     const after = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
     expect(after.currentStock).toBe(15);
 
-    // And Shopify was actually told.
+    // And Shopify was actually told. `changeFromQuantity: null` is required from API
+    // 2026-04 and opts out of compare-and-swap; see applyShopifyInventoryDelta.
     expect(pushed).toEqual([
-      { inventoryItemId: "gid://shopify/InventoryItem/po-1", locationId: "gid://shopify/Location/1", delta: 10 },
+      {
+        inventoryItemId: "gid://shopify/InventoryItem/po-1",
+        locationId: "gid://shopify/Location/1",
+        delta: 10,
+        changeFromQuantity: null,
+      },
     ]);
   });
 

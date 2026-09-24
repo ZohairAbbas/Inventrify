@@ -10,16 +10,17 @@ const locks = {
   shopifySync: false,
   planning: false,
   alertsDispatch: false,
+  growzarEvents: false,
 };
 
-async function runJob(jobName, endpoint) {
+async function runJob(jobName, endpoint, { quiet = false } = {}) {
   if (locks[jobName]) {
     console.log(`[${new Date().toISOString()}] ${jobName}: Skipped (previous run still in progress)`);
     return;
   }
 
   locks[jobName] = true;
-  console.log(`[${new Date().toISOString()}] ${jobName}: Starting...`);
+  if (!quiet) console.log(`[${new Date().toISOString()}] ${jobName}: Starting...`);
 
   try {
     const controller = new AbortController();
@@ -52,7 +53,7 @@ async function runJob(jobName, endpoint) {
       console.error(`[${new Date().toISOString()}] ${jobName}: HTTP ${response.status} -`, body);
       return;
     }
-    console.log(`[${new Date().toISOString()}] ${jobName}: Completed`, body);
+    if (!quiet) console.log(`[${new Date().toISOString()}] ${jobName}: Completed`, body);
   } catch (error) {
     if (error.name === 'AbortError') {
       console.error(`[${new Date().toISOString()}] ${jobName}: Timeout after 2 minutes`);
@@ -111,6 +112,18 @@ cron.schedule('30 6 * * *', () => {
   timezone: TIMEZONE,
 });
 
+// Growzar event retries - every minute.
+// Events (app.uninstalled) are queued on disk and retried on the contract's backoff
+// (1m, 5m, 30m, 2h, 6h, 12h); this only picks up the ones that are due. Quiet on
+// success so it does not write two log lines a minute; failures are still logged, and
+// the app's own log records every delivery and retry.
+cron.schedule('* * * * *', () => {
+  runJob('growzarEvents', '/api/cron/growzar-events', { quiet: true });
+}, {
+  scheduled: true,
+  timezone: TIMEZONE,
+});
+
 // ============================================
 // STARTUP
 // ============================================
@@ -130,6 +143,7 @@ console.log('  - Courierify sync: Hourly (:00)');
 console.log('  - Shopify sync:    Hourly (:15)');
 console.log('  - Planning:        Daily at 05:45');
 console.log('  - Stock alerts: Daily at 06:30');
+console.log('  - Growzar events:  Every minute (retries only)');
 console.log('========================================');
 
 process.on('SIGINT', () => {

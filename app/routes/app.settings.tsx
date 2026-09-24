@@ -16,6 +16,7 @@ import { syncFinancifyMargins } from "../lib/financify.server";
 import { decryptSecret, encryptSecret } from "../lib/crypto.server";
 import { recomputeReorderPoints } from "../lib/planning-job.server";
 import { Button, Card, FilterChips, FormField, PageHead, TextInput } from "../design";
+import { OpenInGrowzar } from "../lib/growzar/open-in-growzar";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -625,6 +626,14 @@ export default function Settings() {
               onDisconnect={() => fetcher.submit({ intent: "disconnect_financify" }, { method: "POST" })}
             />
           </div>
+        </Card>
+
+        <Card style={{ marginTop: "14px" }}>
+          <div style={{ fontSize: "15px", fontWeight: 600, marginBottom: "8px" }}>Growzar</div>
+          <div style={{ fontSize: "13px", color: "var(--inv-text-2)", marginBottom: "14px" }}>
+            See this store alongside your other Growzar apps. Opens Growzar in a new tab, signed in as you — nothing to copy or paste.
+          </div>
+          <OpenInGrowzar />
         </Card>
       </div>
     </div>

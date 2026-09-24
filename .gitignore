@@ -23,6 +23,9 @@ database.sqlite
 *.sqlite
 *.sqlite-journal
 
+# Growzar event outbox (runtime state, see app/lib/growzar/events.server.ts)
+/data/growzar-outbox/
+
 # Logs
 logs/
 *.log

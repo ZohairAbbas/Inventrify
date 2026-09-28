@@ -5,6 +5,7 @@ import { isCodOrder, parseCodGateways } from "../lib/cod.server";
 import { shopDateKey, shopWeekStart } from "../lib/tz.server";
 import { purgeShopData } from "../lib/shop-purge.server";
 import { applyInventoryLevelUpdate } from "../lib/stock.server";
+import { queueUninstallEvent } from "../lib/growzar/events.server";
 
 interface OrderPayload {
   id: number;
@@ -89,7 +90,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   try {
-    await handleTopic({ topic, shop, payload });
+    await handleTopic({
+      topic,
+      shop,
+      payload,
+      webhookId,
+      triggeredAt: request.headers.get("x-shopify-triggered-at"),
+    });
   } catch (err) {
     // Hand the claim back before failing, so Shopify's retry is actually processed
     // instead of being deduped away as "already handled" — for the topics where a
@@ -105,10 +112,14 @@ async function handleTopic({
   topic,
   shop,
   payload,
+  webhookId,
+  triggeredAt,
 }: {
   topic: string;
   shop: string;
   payload: unknown;
+  webhookId: string | null;
+  triggeredAt: string | null;
 }) {
   switch (topic) {
     case "ORDERS_CREATE": {
@@ -281,6 +292,11 @@ async function handleTopic({
       //
       // purgeShopData is idempotent and scoped to this shop, so running it without a
       // session is safe; SHOP_REDACT below has always done exactly that.
+      //
+      // Growzar is told first (API-CONTRACT §7, D-17), so a purge that fails and is
+      // retried by Shopify still announces the uninstall. The event is queued on disk and
+      // delivered in the background; this call never throws and never waits on Growzar.
+      await queueUninstallEvent({ shop, webhookId, triggeredAt });
       await purgeShopData(shop);
       break;
     }

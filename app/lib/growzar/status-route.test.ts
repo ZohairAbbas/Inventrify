@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { sign, signingPayload } from "../lib/growzar/signing.server";
+import { sign, signingPayload } from "./signing.server";
 
 const count = vi.fn();
-vi.mock("../db.server", () => ({ default: { session: { count: (...args: unknown[]) => count(...args) } } }));
+vi.mock("../../db.server", () => ({ default: { session: { count: (...args: unknown[]) => count(...args) } } }));
 
-const { loader } = await import("./api.v1.growzar.status");
+const { loader } = await import("../../routes/api.v1.growzar.status");
 
 const SHOP = "acme.myshopify.com";
 const PATH = `/api/v1/growzar/status?shop=${SHOP}`;

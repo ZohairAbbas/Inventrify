@@ -1,3 +1,4 @@
+import { json } from "@remix-run/node";
 import { getGrowzarConfig, normaliseShopDomain, type GrowzarConfig } from "./config.server";
 import { safeEqual, verifySignature } from "./signing.server";
 
@@ -16,7 +17,7 @@ export type PlatformRequest = { shop: string; config: GrowzarConfig };
 
 /** §9 error shape. */
 export function growzarError(status: number, errorType: string, error: string): Response {
-  return Response.json(
+  return json(
     { error, errorType },
     { status, headers: { "Cache-Control": "no-store" } },
   );

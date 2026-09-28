@@ -1,4 +1,4 @@
-import type { ActionFunctionArgs } from "@remix-run/node";
+import { json, type ActionFunctionArgs } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import { mintClaimTokenFromEnv } from "../lib/growzar/claim-token.server";
 import { resolveClaimIdentity, type IdentityFailure } from "../lib/growzar/shopify-user.server";
@@ -22,7 +22,7 @@ const FAILURE_MESSAGES: Record<IdentityFailure, string> = {
 
 export const action = async ({ request }: ActionFunctionArgs) => {
   if (request.method !== "POST") {
-    return Response.json({ error: "Use POST." }, { status: 405 });
+    return json({ error: "Use POST." }, { status: 405 });
   }
 
   const { session, sessionToken } = await authenticate.admin(request);
@@ -33,7 +33,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     request.headers.get("authorization")?.replace("Bearer ", "") ||
     new URL(request.url).searchParams.get("id_token");
   if (!sessionToken || !rawToken) {
-    return Response.json(
+    return json(
       { error: "Open Inventorify from your Shopify admin to use this." },
       { status: 400, headers: { "Cache-Control": "no-store" } },
     );
@@ -48,7 +48,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   });
   if (!identity.ok) {
     console.warn(`[growzar] claim token not minted for ${session.shop}: ${identity.reason}`);
-    return Response.json(
+    return json(
       { error: FAILURE_MESSAGES[identity.reason] },
       { status: 403, headers: { "Cache-Control": "no-store" } },
     );
@@ -57,13 +57,13 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const minted = mintClaimTokenFromEnv(identity.identity);
   if (!minted) {
     console.error("[growzar] claim token requested but the Growzar integration is not configured");
-    return Response.json(
+    return json(
       { error: "Growzar is not available yet." },
       { status: 503, headers: { "Cache-Control": "no-store" } },
     );
   }
 
-  return Response.json({ url: minted.url }, { headers: { "Cache-Control": "no-store" } });
+  return json({ url: minted.url }, { headers: { "Cache-Control": "no-store" } });
 };
 
-export const loader = () => Response.json({ error: "Use POST." }, { status: 405 });
+export const loader = () => json({ error: "Use POST." }, { status: 405 });

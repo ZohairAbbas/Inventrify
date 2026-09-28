@@ -1,4 +1,4 @@
-import type { LoaderFunctionArgs } from "@remix-run/node";
+import { json, type LoaderFunctionArgs } from "@remix-run/node";
 import prisma from "../db.server";
 import { appVersion } from "../lib/growzar/config.server";
 import { authenticatePlatformRequest, growzarError } from "../lib/growzar/platform-auth.server";
@@ -23,7 +23,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   try {
     const offlineSessions = await prisma.session.count({ where: { shop, isOnline: false } });
-    return Response.json(
+    return json(
       {
         installed: offlineSessions > 0,
         appVersion: appVersion(),

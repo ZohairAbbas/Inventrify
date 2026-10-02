@@ -102,6 +102,7 @@ model Supplier {
 
   products       Product[]
   purchaseOrders PurchaseOrder[]
+  claims         SupplierClaim[]
 
   @@index([shop])
 }
@@ -194,6 +195,7 @@ model Product {
   transferItems    StockTransferItem[]
   returnItems      ReturnItem[]
   countItems       StockCountItem[]
+  claimLines       SupplierClaimLine[]
 
   forecastAccuracy ForecastAccuracy[]
 
@@ -235,6 +237,11 @@ model ProductLocationStock {
   location   Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
   onHand     Int      @default(0)
   reserved   Int      @default(0) // available = onHand - reserved
+  // Units held in Shopify's `damaged` state here — quarantined supplier defects that are
+  // physically on the premises but must never be sold. Deliberately NOT part of onHand:
+  // Shopify's on_hand includes them, but every consumer of onHand here (currentStock,
+  // planning, valuation, counts) means sellable physical stock, so the sync subtracts them.
+  damaged    Int      @default(0)
   // Free-text bin / shelf / aisle within the location — "A-12", "Rack 3 / Shelf B".
   // Answers "where is it" on the shelf, which is the question a picker or a counter
   // actually has. Deliberately not a modelled bin master with its own coordinates: that
@@ -436,6 +443,7 @@ model PurchaseOrder {
 
   items    PurchaseOrderItem[]
   receipts PurchaseOrderReceipt[]
+  claims   SupplierClaim[]
 
   @@index([shop])
   @@index([shop, status])
@@ -455,6 +463,7 @@ model PurchaseOrderItem {
   unitCost        Float         @default(0)
 
   receiptLines PurchaseOrderReceiptLine[]
+  claimLines   SupplierClaimLine[]
 }
 
 // One physical delivery against a PO. A PO can now arrive in several deliveries, and
@@ -483,6 +492,8 @@ model PurchaseOrderReceiptLine {
   purchaseOrderItemId String
   purchaseOrderItem   PurchaseOrderItem    @relation(fields: [purchaseOrderItemId], references: [id], onDelete: Cascade)
   quantity            Int                  // units that arrived in this delivery; always > 0
+  // Of `quantity`, how many arrived damaged and went straight into quarantine.
+  quantityDamaged     Int                  @default(0)
 
   @@index([receiptId])
   @@index([purchaseOrderItemId])
@@ -742,4 +753,75 @@ model OrderOutcome {
   @@index([shop, status])
   @@index([shop, updatedAt])
   @@index([shop, source])
+}
+
+// What a supplier owes the merchant for one purchase order: units that were missing,
+// damaged, defective or wrong. A claim records the problem and the physical state of the
+// affected stock; the money side (credits, refunds, balances) is the supplier ledger.
+model SupplierClaim {
+  id              String        @id @default(cuid())
+  shop            String
+  // PO number plus a sequence, e.g. "PO-1042-C1".
+  claimNumber     String        @unique
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  // Copied from the PO when the claim is opened. Nullable because deleting a supplier
+  // unlinks rather than deletes its history.
+  supplierId      String?
+  supplier        Supplier?     @relation(fields: [supplierId], references: [id])
+  status          String        @default("open") // open | submitted | resolved
+  notes           String?
+  submittedAt     DateTime?
+  resolvedAt      DateTime?
+  createdByUserId String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  lines SupplierClaimLine[]
+
+  @@index([shop, status])
+  @@index([purchaseOrderId])
+  @@index([supplierId])
+}
+
+model SupplierClaimLine {
+  id                  String            @id @default(cuid())
+  claimId             String
+  claim               SupplierClaim     @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  purchaseOrderItemId String
+  purchaseOrderItem   PurchaseOrderItem @relation(fields: [purchaseOrderItemId], references: [id], onDelete: Cascade)
+  productId           String
+  product             Product           @relation(fields: [productId], references: [id])
+  type                String // missing | damaged | defective | wrong_item
+  quantity            Int
+  // The PO line's unit cost when the claim was opened — what the merchant paid, not
+  // whatever Product.unitCost has drifted to since.
+  unitCost            Float
+  // Where the units were when the problem was found, which decides the stock movement:
+  //   receipt   arrived damaged; booked straight into quarantine, never sellable
+  //   on_hand   already in sellable stock; damaged ones move to quarantine, missing ones
+  //             are removed
+  //   none      no stock to move — never delivered (a short-closed remainder), or already
+  //             sold / with the customer
+  stockSource         String
+  locationId          String? // Location.id holding the quarantined / removed units
+
+  // What happened to quarantined units since. Quarantined now =
+  // quantity - writtenOff - returned - restocked, for non-missing lines that held stock.
+  quantityWrittenOff Int @default(0)
+  quantityReturned   Int @default(0) // sent back to the supplier
+  quantityRestocked  Int @default(0) // judged sellable after all
+  // Missing units that turned up after all; they reduce what is claimed.
+  quantityFound      Int @default(0)
+
+  // The supplier's answer.
+  decision         String @default("pending") // pending | accepted | partially_accepted | rejected
+  quantityAccepted Int    @default(0)
+  creditAmount     Float  @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@index([claimId])
+  @@index([purchaseOrderItemId])
+  @@index([productId])
 }

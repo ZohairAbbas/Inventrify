@@ -1,6 +1,7 @@
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
+import type { Prisma } from "@prisma/client";
 import prisma from "../db.server";
-import { applyShopifyInventoryDelta } from "./shopify-sync.server";
+import { applyShopifyInventoryDelta, applyShopifyStockStateChange } from "./shopify-sync.server";
 
 /**
  * A Prisma unique-constraint violation (P2002) naming a specific column.
@@ -219,6 +220,82 @@ export async function applyLocationDelta(
   );
 
   return { ok: true as const, shopifySynced: shopifySync.ok, shopifyError: shopifySync.error };
+}
+
+/** A movement between sellable stock and quarantine at one location. */
+export interface StockStateChange {
+  /** Sellable on-hand (ProductLocationStock.onHand). */
+  available: number;
+  /** Quarantined units (ProductLocationStock.damaged). */
+  damaged: number;
+}
+
+/**
+ * The local half of a quarantine movement, inside the caller's transaction.
+ *
+ * Supplier claims move stock as part of a larger write — the claim line and its counters
+ * must commit or roll back with the stock — so this takes the transaction rather than
+ * opening one. Returns an error message instead of writing when either state would go
+ * negative; the caller throws it to roll back everything.
+ *
+ * The row is locked first. The guard is a read-then-check, and without the lock two
+ * concurrent claims on the same shelf could both see 5 units and remove 5 each.
+ */
+export async function applyLocalStockState(
+  tx: Prisma.TransactionClient,
+  shop: string,
+  productId: string,
+  locationId: string,
+  change: StockStateChange,
+): Promise<string | null> {
+  await tx.$queryRaw`
+    SELECT id FROM "ProductLocationStock"
+    WHERE "productId" = ${productId} AND "locationId" = ${locationId}
+    FOR UPDATE`;
+  const level = await tx.productLocationStock.findUnique({
+    where: { productId_locationId: { productId, locationId } },
+    select: { onHand: true, damaged: true },
+  });
+  const onHand = level?.onHand ?? 0;
+  const damaged = level?.damaged ?? 0;
+  if (onHand + change.available < 0) {
+    return `Cannot remove ${-change.available} units — only ${onHand} in sellable stock at this location`;
+  }
+  if (damaged + change.damaged < 0) {
+    return `Cannot release ${-change.damaged} units — only ${damaged} in quarantine at this location`;
+  }
+
+  await tx.productLocationStock.upsert({
+    where: { productId_locationId: { productId, locationId } },
+    create: { shop, productId, locationId, onHand: change.available, damaged: change.damaged },
+    update: { onHand: { increment: change.available }, damaged: { increment: change.damaged } },
+  });
+  const agg = await tx.productLocationStock.aggregate({
+    where: { productId },
+    _sum: { onHand: true },
+  });
+  await tx.product.update({
+    where: { id: productId },
+    data: { currentStock: agg._sum.onHand ?? 0 },
+  });
+  return null;
+}
+
+/** The Shopify half of applyLocalStockState, run after the transaction commits. */
+export async function pushStockStateToShopify(
+  admin: AdminApiContext,
+  shop: string,
+  productId: string,
+  locationId: string,
+  change: StockStateChange,
+  opts: { reason: string; ledgerDocumentUri: string },
+): Promise<{ ok: boolean; error?: string }> {
+  const [product, location] = await Promise.all([
+    prisma.product.findFirst({ where: { id: productId, shop }, select: { inventoryItemId: true } }),
+    prisma.location.findFirst({ where: { id: locationId, shop }, select: { shopifyLocationId: true } }),
+  ]);
+  if (!product || !location) return { ok: false, error: "Product or location not found" };
+  return applyShopifyStockStateChange(admin, product.inventoryItemId, location.shopifyLocationId, change, opts);
 }
 
 /**

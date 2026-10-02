@@ -39,6 +39,12 @@ export async function purgeShopData(
   });
   await prisma.stockCount.deleteMany({ where: { shop } });
 
+  // Supplier claims: lines reference PO items and products, so they go before both.
+  await prisma.supplierClaimLine.deleteMany({
+    where: { claim: { shop } },
+  });
+  await prisma.supplierClaim.deleteMany({ where: { shop } });
+
   // Purchase orders: likewise. Receipt lines reference PO items, so receipts go first.
   await prisma.purchaseOrderReceiptLine.deleteMany({
     where: { receipt: { shop } },

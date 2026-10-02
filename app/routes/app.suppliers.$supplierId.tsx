@@ -5,6 +5,8 @@ import { TitleBar } from "@shopify/app-bridge-react";
 import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { formatCurrency } from "../lib/format";
+import { getSupplierClaimSummary } from "../lib/supplier-claim.server";
 import { Button, Card, FormField, POStatusPill, TextArea, TextInput } from "../design";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
@@ -18,7 +20,8 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   });
 
   if (!supplier) throw new Response("Not found", { status: 404 });
-  return { supplier };
+  const claims = await getSupplierClaimSummary(session.shop, supplier.id);
+  return { supplier, claims };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
@@ -45,8 +48,8 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 export default function EditSupplier() {
-  const { supplier } = useLoaderData<typeof loader>();
-  const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
+  const { supplier, claims } = useLoaderData<typeof loader>();
+  const { theme = "emerald", currency = "USD" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
 
@@ -143,6 +146,28 @@ export default function EditSupplier() {
                 </div>
               )}
             </Card>
+
+            {claims.unitsClaimed > 0 && (
+              <Card>
+                <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Claims</div>
+                {/* Who bore the cost of bad stock from this supplier. Absorbed units are the
+                    merchant's loss; accepted ones the supplier made good. */}
+                <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "6px 12px", fontSize: "12.5px" }}>
+                  <span>Open claims</span>
+                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.openClaims}</span>
+                  <span>Units claimed</span>
+                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.unitsClaimed}</span>
+                  <span>Accepted by supplier</span>
+                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.unitsAccepted}</span>
+                  <span>Damaged units you absorbed</span>
+                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.damagedAbsorbed}</span>
+                  <span>In quarantine now</span>
+                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.quarantined}</span>
+                  <span>Credit agreed</span>
+                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(claims.creditAgreed, currency)}</span>
+                </div>
+              </Card>
+            )}
 
             <Card>
               <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Recent POs</div>

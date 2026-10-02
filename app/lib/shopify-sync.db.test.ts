@@ -144,6 +144,28 @@ describe("syncShopifyInventory", () => {
     expect(levels).toBe(1);
   });
 
+  it("keeps Shopify's damaged units out of sellable on-hand and reserved", async () => {
+    // Shopify's on_hand includes the `damaged` state. Read naively, 3 quarantined units
+    // would surface as 3 "reserved" and still count in currentStock and inventory value.
+    const v = variant("1", { qty: 10 });
+    v.node.inventoryItem.inventoryLevels.edges[0].node.quantities = [
+      { name: "on_hand", quantity: 10 },
+      { name: "available", quantity: 5 },
+      { name: "damaged", quantity: 3 },
+    ];
+    const { admin } = mockAdmin((q) => (isLocations(q) ? { body: locationsBody } : { body: variantsBody([v]) }));
+
+    await syncShopifyInventory(admin, SHOP);
+
+    const level = await prisma.productLocationStock.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(level.damaged).toBe(3);
+    expect(level.onHand).toBe(7);
+    // 10 on hand = 5 available + 2 committed + 3 damaged; only the 2 are reserved.
+    expect(level.reserved).toBe(2);
+    const p = await prisma.product.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(p.currentStock).toBe(7);
+  });
+
   it("removes a per-location level Shopify no longer reports", async () => {
     // Regression: levels were upsert-only, so stock that moved off a location kept its
     // last known onHand forever and no re-sync could correct it. This is the shape of the

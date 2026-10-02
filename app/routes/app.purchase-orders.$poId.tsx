@@ -3,10 +3,10 @@ import { useLoaderData, useFetcher, useRouteLoaderData, Link } from "@remix-run/
 import type { loader as appLoader } from "./app";
 import { formatCurrency, formatDate } from "../lib/format";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { Button, Card, DataTable, PageHead, POStatusPill, PrintSheet, ProductCombobox, ProductThumb, ScanInput, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
+import { Button, Card, DataTable, PageHead, Pill, POStatusPill, PrintSheet, ProductCombobox, ProductThumb, ScanInput, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
 import {
   closePurchaseOrderRemainder,
   markPurchaseOrderSent,
@@ -16,6 +16,23 @@ import {
   validateSupplierId,
 } from "../lib/purchase-order.server";
 import { outstandingQuantity } from "../lib/purchase-order-status";
+import {
+  createSupplierClaim,
+  disposeClaimLine,
+  resolveClaim,
+  submitClaim,
+} from "../lib/supplier-claim.server";
+import {
+  CLAIM_STATUS_LABELS,
+  CLAIM_TYPE_LABELS,
+  CLAIM_TYPES,
+  DISPOSITION_LABELS,
+  effectiveClaimQuantity,
+  quarantinedQuantity,
+  type ClaimDisposition,
+  type ClaimStatus,
+  type ClaimType,
+} from "../lib/supplier-claim";
 import { parseFormDate } from "../lib/date-range";
 import { emailPurchaseOrderToSupplier } from "../lib/purchase-order-email.server";
 
@@ -27,8 +44,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       supplier: true,
       items: { include: { product: true } },
       receipts: {
-        include: { lines: { select: { purchaseOrderItemId: true, quantity: true } } },
+        include: { lines: { select: { purchaseOrderItemId: true, quantity: true, quantityDamaged: true } } },
         orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }],
+      },
+      claims: {
+        include: { lines: { orderBy: { createdAt: "asc" } } },
+        orderBy: { createdAt: "asc" },
       },
     },
   });
@@ -143,7 +164,14 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         po.items.map((i) => i.id),
       ),
       expectedVersion: parseVersion(formData.get("receiptVersion")),
+      damaged: Object.fromEntries(
+        po.items.map((i) => {
+          const raw = formData.get(`damaged_${i.id}`);
+          return [i.id, raw === null || raw === "" ? 0 : parseInt(String(raw), 10)];
+        }),
+      ),
       closeRemaining: formData.get("remainder") === "close",
+      claimMissing: formData.get("claimMissing") === "1",
       userId: sessionToken?.sub ?? null,
     });
 
@@ -157,10 +185,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       ...result.lines.filter((l) => l.error).map((l) => l.error as string),
       ...result.shopifyWarnings,
       ...(result.closeSkipped ? [result.closeSkipped] : []),
+      ...(result.claimError ? [result.claimError] : []),
     ];
     return {
       ok: true as const,
-      action: `received:${result.status ?? ""}`,
+      action: `received:${result.status ?? ""}${result.claimId ? ":claim" : ""}`,
       error: problems.length > 0 ? problems.join("; ") : "",
     };
   }
@@ -168,11 +197,73 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (intent === "close_remaining") {
     const result = await closePurchaseOrderRemainder(shop, po.id, {
       expectedVersion: parseVersion(formData.get("receiptVersion")),
+      claimMissing: formData.get("claimMissing") === "1",
+      userId: sessionToken?.sub ?? null,
     });
     if (!result.ok) {
       return { ok: false as const, error: result.error ?? "Could not close", action: "" };
     }
-    return { ok: true as const, action: "closed", error: "" };
+    return { ok: true as const, action: result.claimId ? "closed:claim" : "closed", error: "" };
+  }
+
+  if (intent === "create_claim") {
+    const result = await createSupplierClaim(admin, shop, po.id, {
+      lines: po.items.map((i) => {
+        const raw = formData.get(`claimQty_${i.id}`);
+        return {
+          purchaseOrderItemId: i.id,
+          type: String(formData.get(`claimType_${i.id}`) ?? "damaged"),
+          quantity: raw === null || raw === "" ? 0 : Number(raw),
+          stockSource: String(formData.get(`claimSource_${i.id}`) ?? "on_hand"),
+        };
+      }),
+      notes: (formData.get("notes") as string) || null,
+      userId: sessionToken?.sub ?? null,
+    });
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not open the claim", action: "" };
+    return { ok: true as const, action: "claim_opened", error: result.shopifyWarnings.join("; ") };
+  }
+
+  if (intent === "dispose_claim_line") {
+    const result = await disposeClaimLine(
+      admin,
+      shop,
+      String(formData.get("lineId") ?? ""),
+      String(formData.get("disposition") ?? ""),
+      Number(formData.get("quantity")),
+    );
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not update the claim", action: "" };
+    return { ok: true as const, action: `disposed:${formData.get("disposition")}`, error: result.shopifyWarning ?? "" };
+  }
+
+  if (intent === "submit_claim") {
+    const result = await submitClaim(shop, String(formData.get("claimId") ?? ""));
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not update the claim", action: "" };
+    return { ok: true as const, action: "claim_submitted", error: "" };
+  }
+
+  if (intent === "resolve_claim") {
+    const claimId = String(formData.get("claimId") ?? "");
+    const claim = await prisma.supplierClaim.findFirst({
+      where: { id: claimId, shop, purchaseOrderId: po.id },
+      select: { lines: { select: { id: true } } },
+    });
+    if (!claim) return { ok: false as const, error: "Claim not found", action: "" };
+    const result = await resolveClaim(
+      shop,
+      claimId,
+      claim.lines.map((l) => {
+        const credit = formData.get(`credit_${l.id}`);
+        return {
+          lineId: l.id,
+          quantityAccepted: Number(formData.get(`accepted_${l.id}`)),
+          // Blank means "accepted units at cost"; anything typed is taken as agreed.
+          creditAmount: credit === null || credit === "" ? null : Number(credit),
+        };
+      }),
+    );
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not resolve the claim", action: "" };
+    return { ok: true as const, action: "claim_resolved", error: "" };
   }
 
   return { ok: true as const, action: "", error: "" };
@@ -203,11 +294,17 @@ export default function PODetail() {
     Object.fromEntries(po.items.map((i) => [i.id, String(outstandingQuantity(i))]));
   const [receivedQtys, setReceivedQtys] = useState<Record<string, string>>(outstandingDefaults);
   const [remainder, setRemainder] = useState<"keep" | "close">("keep");
+  // Units of this delivery that arrived damaged, per line.
+  const [damagedQtys, setDamagedQtys] = useState<Record<string, string>>({});
+  // When closing short: were the undelivered units invoiced, so the supplier owes for them?
+  const [claimMissing, setClaimMissing] = useState(false);
   // A booked delivery bumps receiptVersion and the loader revalidates; start the next
   // delivery from the new outstanding figures rather than re-showing the last one.
   useEffect(() => {
     setReceivedQtys(outstandingDefaults());
     setRemainder("keep");
+    setDamagedQtys({});
+    setClaimMissing(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [po.receiptVersion]);
 
@@ -229,25 +326,31 @@ export default function PODetail() {
 
   useEffect(() => {
     if (fetcher.data?.ok) {
-      const action = fetcher.data.action;
+      const raw = fetcher.data.action;
+      // Receipts and closes append ":claim" when they opened a supplier claim.
+      const claimNote = raw.endsWith(":claim") ? " — supplier claim opened" : "";
+      const action = raw.replace(/:claim$/, "");
+      const messages: Record<string, string> = {
+        "received:received": "Delivery received — PO complete, stock updated",
+        "received:partially_received": "Delivery received — the rest stays on order",
+        "received:closed": "Delivery received — remainder cancelled, PO closed",
+        closed: "Remaining units cancelled — PO closed",
+        claim_opened: "Supplier claim opened",
+        claim_submitted: "Claim marked as sent to the supplier",
+        claim_resolved: "Supplier decision recorded",
+        draft_updated: "Draft PO updated",
+      };
       const msg = action.startsWith("emailed:")
         ? `Purchase order emailed to ${action.slice("emailed:".length)}`
-        : action === "received:received"
-          ? "Delivery received — PO complete, stock updated"
-          : action === "received:partially_received"
-            ? "Delivery received — the rest stays on order"
-            : action === "received:closed"
-              ? "Delivery received — remainder cancelled, PO closed"
-              : action.startsWith("received")
-                ? "Delivery received — stock updated"
-                : action === "closed"
-                  ? "Remaining units cancelled — PO closed"
-                  : action === "draft_updated"
-                    ? "Draft PO updated"
-                    : "PO updated";
-      // Line failures and Shopify warnings ride along on a successful receipt.
-      if (fetcher.data.error) shopify.toast.show(`${msg} — but: ${fetcher.data.error}`, { isError: true });
-      else shopify.toast.show(msg);
+        : (messages[action] ??
+          (action.startsWith("received")
+            ? "Delivery received — stock updated"
+            : action.startsWith("disposed:")
+              ? "Claim stock updated"
+              : "PO updated"));
+      // Line failures and Shopify warnings ride along on a successful action.
+      if (fetcher.data.error) shopify.toast.show(`${msg}${claimNote} — but: ${fetcher.data.error}`, { isError: true });
+      else shopify.toast.show(`${msg}${claimNote}`);
       if (fetcher.data.action === "draft_updated") setIsEditing(false);
     } else if (fetcher.data?.error) {
       shopify.toast.show(fetcher.data.error, { isError: true });
@@ -300,6 +403,12 @@ export default function PODetail() {
     return Number.isFinite(n) && n > 0 ? n : 0;
   };
   const deliveryUnits = po.items.reduce((s, i) => s + deliveryQty(i.id), 0);
+  const damagedQty = (itemId: string) => {
+    const n = parseInt(damagedQtys[itemId] ?? "0", 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  const damagedUnits = po.items.reduce((s, i) => s + damagedQty(i.id), 0);
+  const damagedOver = po.items.some((i) => damagedQty(i.id) > deliveryQty(i.id));
   // What would still be outstanding if this delivery is booked as entered.
   const shortUnits = po.items.reduce(
     (s, i) => s + Math.max(0, outstandingQuantity(i) - deliveryQty(i.id)),
@@ -313,7 +422,12 @@ export default function PODetail() {
     { header: "SKU", width: "1fr" },
     { header: "Qty ordered", width: "1fr", align: "right" },
     { header: "Qty received", width: "1.2fr", align: "right" },
-    ...(receivable ? [{ header: "This delivery", width: "1.2fr", align: "right" as const }] : []),
+    ...(receivable
+      ? [
+          { header: "This delivery", width: "1.2fr", align: "right" as const },
+          { header: "Damaged", width: "1fr", align: "right" as const },
+        ]
+      : []),
     { header: "Unit cost", width: "1fr", align: "right" },
     { header: "Line total", width: "1.1fr", align: "right" },
   ];
@@ -351,6 +465,20 @@ export default function PODetail() {
                 value={receivedQtys[item.id] ?? String(outstanding)}
                 onChange={(e) => setReceivedQtys((prev) => ({ ...prev, [item.id]: e.target.value }))}
                 style={{ height: "32px", textAlign: "right" }}
+              />,
+              <TextInput
+                key="damaged"
+                type="number"
+                min={0}
+                placeholder="0"
+                title="Of this delivery, units that arrived damaged. They go into quarantine, not sellable stock, and a supplier claim is opened."
+                value={damagedQtys[item.id] ?? ""}
+                onChange={(e) => setDamagedQtys((prev) => ({ ...prev, [item.id]: e.target.value }))}
+                style={{
+                  height: "32px",
+                  textAlign: "right",
+                  ...(damagedQty(item.id) > deliveryQty(item.id) ? { borderColor: "var(--inv-status-critical-dot)" } : {}),
+                }}
               />,
             ]
           : []),
@@ -675,24 +803,37 @@ export default function PODetail() {
                       cancelled and the PO is closed.
                     </span>
                   </label>
+                  {remainder === "close" && (
+                    <ClaimMissingCheckbox units={shortUnits} checked={claimMissing} onChange={setClaimMissing} />
+                  )}
+                </div>
+              )}
+
+              {damagedUnits > 0 && (
+                <div style={{ fontSize: "12px", marginBottom: "14px", color: damagedOver ? "var(--inv-status-critical-fg)" : "var(--inv-text-2)" }}>
+                  {damagedOver
+                    ? "Damaged units can't exceed what arrived in this delivery on that line."
+                    : `${damagedUnits} damaged unit${damagedUnits === 1 ? "" : "s"} will go into quarantine — counted as received, kept out of sellable stock in Shopify — and a supplier claim will be opened for them.`}
                 </div>
               )}
 
               <Button
                 variant="primary"
                 // A delivery of nothing that also keeps everything open would change nothing.
-                disabled={isBusy || (deliveryUnits === 0 && !(shortUnits > 0 && remainder === "close"))}
+                disabled={isBusy || damagedOver || (deliveryUnits === 0 && !(shortUnits > 0 && remainder === "close"))}
                 onClick={() => {
                   const data: Record<string, string> = {
                     intent: "mark_received",
                     actualDeliveryDate: actualDate,
                     receiptVersion: String(po.receiptVersion),
                     remainder: shortUnits > 0 ? remainder : "keep",
+                    claimMissing: shortUnits > 0 && remainder === "close" && claimMissing ? "1" : "0",
                   };
                   // The server takes running totals, so a repeated submit of this same
                   // form asks for nothing new instead of booking the delivery twice.
                   po.items.forEach((item) => {
                     data[`received_${item.id}`] = String(item.quantityReceived + deliveryQty(item.id));
+                    data[`damaged_${item.id}`] = String(damagedQty(item.id));
                   });
                   fetcher.submit(data, { method: "POST" });
                 }}
@@ -731,13 +872,16 @@ export default function PODetail() {
             <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
               {po.receipts.map((receipt, idx) => {
                 const units = receipt.lines.reduce((s, l) => s + l.quantity, 0);
+                const damaged = receipt.lines.reduce((s, l) => s + l.quantityDamaged, 0);
                 return (
                   <div key={receipt.id} style={{ display: "flex", justifyContent: "space-between", gap: "12px", fontSize: "12.5px" }}>
                     <span>
                       Delivery {idx + 1} · {formatDate(receipt.receivedAt, timezone)}
                     </span>
                     <span style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
-                      {units} unit{units === 1 ? "" : "s"} · {receipt.lines.length} line{receipt.lines.length === 1 ? "" : "s"}
+                      {units} unit{units === 1 ? "" : "s"}
+                      {damaged > 0 ? ` (${damaged} damaged)` : ""} · {receipt.lines.length} line
+                      {receipt.lines.length === 1 ? "" : "s"}
                     </span>
                   </div>
                 );
@@ -746,9 +890,22 @@ export default function PODetail() {
           </Card>
         )}
 
+        {!isEditing && (
+          <SupplierClaims
+            items={po.items}
+            claims={po.claims}
+            canReport={po.status === "partially_received" || po.status === "received" || po.status === "closed"}
+            fetcher={fetcher}
+            isBusy={isBusy}
+            currency={currency}
+            timezone={timezone}
+          />
+        )}
+
         {!isEditing && po.status === "partially_received" && (
           <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "18px", fontSize: "12px", color: "var(--inv-muted)" }}>
             <span>Supplier won't send the remaining {totalOutstanding} unit{totalOutstanding === 1 ? "" : "s"}?</span>
+            <ClaimMissingCheckbox units={totalOutstanding} checked={claimMissing} onChange={setClaimMissing} compact />
             <Button
               variant="ghost"
               disabled={isBusy}
@@ -759,7 +916,11 @@ export default function PODetail() {
                   )
                 ) {
                   fetcher.submit(
-                    { intent: "close_remaining", receiptVersion: String(po.receiptVersion) },
+                    {
+                      intent: "close_remaining",
+                      receiptVersion: String(po.receiptVersion),
+                      claimMissing: claimMissing ? "1" : "0",
+                    },
                     { method: "POST" },
                   );
                 }
@@ -821,6 +982,483 @@ function EmailSupplierButton({
             ? `Sent to ${po.emailedTo} on ${new Date(po.emailedAt).toISOString().slice(0, 10)}`
             : `Will send to ${email}`}
       </span>
+    </div>
+  );
+}
+
+/**
+ * Whether the undelivered units of a short-closed PO become a supplier claim.
+ *
+ * Off by default: most of the time a short close is just a smaller order nobody was
+ * billed for. It matters when the supplier invoiced the full quantity (or was paid in
+ * advance) and so owes for what never came.
+ */
+function ClaimMissingCheckbox({
+  units,
+  checked,
+  onChange,
+  compact = false,
+}: {
+  units: number;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  compact?: boolean;
+}) {
+  return (
+    <label
+      style={{
+        display: "flex",
+        gap: "8px",
+        alignItems: "flex-start",
+        fontSize: "12px",
+        cursor: "pointer",
+        ...(compact ? {} : { marginTop: "8px", paddingLeft: "22px" }),
+      }}
+    >
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+      <span>
+        Claim the {units} missing unit{units === 1 ? "" : "s"} from the supplier
+        {compact ? "" : " — they were invoiced or paid for but never sent"}
+      </span>
+    </label>
+  );
+}
+
+type ClaimFetcher = { submit: (data: Record<string, string>, opts: { method: "POST" }) => void };
+
+interface ClaimItem {
+  id: string;
+  quantityReceived: number;
+  quantityCancelled: number;
+  unitCost: number;
+  product: { title: string; variantTitle: string | null };
+}
+
+interface ClaimLineView {
+  id: string;
+  purchaseOrderItemId: string;
+  type: string;
+  quantity: number;
+  unitCost: number;
+  stockSource: string;
+  quantityWrittenOff: number;
+  quantityReturned: number;
+  quantityRestocked: number;
+  quantityFound: number;
+  decision: string;
+  quantityAccepted: number;
+  creditAmount: number;
+}
+
+interface ClaimView {
+  id: string;
+  claimNumber: string;
+  status: string;
+  notes: string | null;
+  createdAt: string | Date;
+  submittedAt: string | Date | null;
+  lines: ClaimLineView[];
+}
+
+const CLAIM_STATUS_COLORS: Record<ClaimStatus, { bg: string; fg: string }> = {
+  open: { bg: "var(--inv-status-low-bg)", fg: "var(--inv-status-low-fg)" },
+  submitted: { bg: "var(--inv-status-low-bg)", fg: "var(--inv-status-low-fg)" },
+  resolved: { bg: "var(--inv-status-healthy-bg)", fg: "var(--inv-status-healthy-fg)" },
+};
+
+const itemName = (item: ClaimItem | undefined) =>
+  !item ? "—" : item.product.variantTitle ? `${item.product.title} — ${item.product.variantTitle}` : item.product.title;
+
+const smallButton: React.CSSProperties = {
+  fontSize: "11.5px",
+  border: "1px solid var(--inv-input-border-2)",
+  background: "#fff",
+  padding: "5px 10px",
+  borderRadius: "8px",
+  cursor: "pointer",
+};
+
+/**
+ * What the supplier owes for this PO: open claims, the stock each one holds, and the
+ * supplier's answer. Claims for damage found while receiving, and for units missing on a
+ * short close, are opened by those flows; "Report a problem" covers everything found
+ * afterwards.
+ */
+function SupplierClaims({
+  items,
+  claims,
+  canReport,
+  fetcher,
+  isBusy,
+  currency,
+  timezone,
+}: {
+  items: ClaimItem[];
+  claims: ClaimView[];
+  canReport: boolean;
+  fetcher: ClaimFetcher;
+  isBusy: boolean;
+  currency: string;
+  timezone: string;
+}) {
+  const [reporting, setReporting] = useState(false);
+  const itemsById = new Map(items.map((i) => [i.id, i]));
+
+  // A submitted report leaves the form open on failure, so a typo is fixed in place.
+  const claimCount = claims.length;
+  useEffect(() => setReporting(false), [claimCount]);
+
+  if (!canReport && claims.length === 0) return null;
+
+  return (
+    <Card style={{ marginBottom: "18px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
+        <div style={{ fontSize: "13px", fontWeight: 600 }}>Supplier claims</div>
+        {canReport && !reporting && (
+          <Button variant="ghost" onClick={() => setReporting(true)}>
+            Report a problem
+          </Button>
+        )}
+      </div>
+
+      {claims.length === 0 && !reporting && (
+        <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>
+          Missing, damaged, defective or wrong items found after receiving can be claimed from the supplier here.
+        </div>
+      )}
+
+      {reporting && (
+        <ReportProblemForm items={items} fetcher={fetcher} isBusy={isBusy} onCancel={() => setReporting(false)} />
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "14px" }}>
+        {claims.map((claim) => (
+          <ClaimCard
+            key={claim.id}
+            claim={claim}
+            itemsById={itemsById}
+            fetcher={fetcher}
+            isBusy={isBusy}
+            currency={currency}
+            timezone={timezone}
+          />
+        ))}
+      </div>
+    </Card>
+  );
+}
+
+function ReportProblemForm({
+  items,
+  fetcher,
+  isBusy,
+  onCancel,
+}: {
+  items: ClaimItem[];
+  fetcher: ClaimFetcher;
+  isBusy: boolean;
+  onCancel: () => void;
+}) {
+  const [rows, setRows] = useState<Record<string, { type: ClaimType; qty: string; source: string }>>(() =>
+    Object.fromEntries(items.map((i) => [i.id, { type: "damaged" as ClaimType, qty: "", source: "on_hand" }])),
+  );
+  const [notes, setNotes] = useState("");
+  const set = (id: string, patch: Partial<{ type: ClaimType; qty: string; source: string }>) =>
+    setRows((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+  const anyQty = Object.values(rows).some((r) => parseInt(r.qty, 10) > 0);
+
+  return (
+    <div style={{ padding: "12px", background: "var(--inv-subtle)", borderRadius: "10px", marginBottom: "14px" }}>
+      <div style={{ fontSize: "12px", color: "var(--inv-text-2)", marginBottom: "10px" }}>
+        Enter a quantity on each line with a problem. Units still in sellable stock are taken out of it: damaged,
+        defective and wrong items go into quarantine; missing ones are removed.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 0.8fr 1.6fr", gap: "8px", alignItems: "center", fontSize: "12px" }}>
+        <span style={{ color: "var(--inv-muted)" }}>Product</span>
+        <span style={{ color: "var(--inv-muted)" }}>Problem</span>
+        <span style={{ color: "var(--inv-muted)" }}>Qty</span>
+        <span style={{ color: "var(--inv-muted)" }}>Where are the units?</span>
+        {items.map((item) => {
+          const row = rows[item.id];
+          return (
+            <Fragment key={item.id}>
+              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {itemName(item)}
+                <span style={{ color: "var(--inv-muted)" }}> · {item.quantityReceived} received</span>
+              </span>
+              <SelectInput value={row.type} onChange={(e) => set(item.id, { type: e.target.value as ClaimType })}>
+                {CLAIM_TYPES.map((t) => (
+                  <option key={t} value={t}>
+                    {CLAIM_TYPE_LABELS[t]}
+                  </option>
+                ))}
+              </SelectInput>
+              <TextInput type="number" min={0} placeholder="0" value={row.qty} onChange={(e) => set(item.id, { qty: e.target.value })} />
+              <SelectInput value={row.source} onChange={(e) => set(item.id, { source: e.target.value })}>
+                <option value="on_hand">In sellable stock — take them out</option>
+                <option value="none">
+                  {row.type === "missing" ? "Never delivered (short-closed)" : "Not in stock — sold or gone"}
+                </option>
+              </SelectInput>
+            </Fragment>
+          );
+        })}
+      </div>
+      <div style={{ marginTop: "10px" }}>
+        <TextArea placeholder="Notes for the claim (optional)" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} />
+      </div>
+      <div style={{ display: "flex", gap: "9px", justifyContent: "flex-end", marginTop: "10px" }}>
+        <Button variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button
+          variant="primary"
+          disabled={isBusy || !anyQty}
+          onClick={() => {
+            const data: Record<string, string> = { intent: "create_claim", notes };
+            for (const item of items) {
+              const row = rows[item.id];
+              data[`claimQty_${item.id}`] = row.qty || "0";
+              data[`claimType_${item.id}`] = row.type;
+              data[`claimSource_${item.id}`] = row.source;
+            }
+            fetcher.submit(data, { method: "POST" });
+          }}
+        >
+          Open claim
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ClaimCard({
+  claim,
+  itemsById,
+  fetcher,
+  isBusy,
+  currency,
+  timezone,
+}: {
+  claim: ClaimView;
+  itemsById: Map<string, ClaimItem>;
+  fetcher: ClaimFetcher;
+  isBusy: boolean;
+  currency: string;
+  timezone: string;
+}) {
+  const [deciding, setDeciding] = useState(false);
+  const status = (claim.status as ClaimStatus) in CLAIM_STATUS_COLORS ? (claim.status as ClaimStatus) : "open";
+  const resolved = status === "resolved";
+  const totalCredit = claim.lines.reduce((s, l) => s + l.creditAmount, 0);
+  const totalAccepted = claim.lines.reduce((s, l) => s + l.quantityAccepted, 0);
+  const totalClaimed = claim.lines.reduce((s, l) => s + effectiveClaimQuantity(l), 0);
+
+  return (
+    <div style={{ border: "1px solid var(--inv-divider)", borderRadius: "10px", padding: "12px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "10px" }}>
+        <span style={{ fontFamily: "var(--inv-font-mono)", fontSize: "12.5px", fontWeight: 600 }}>{claim.claimNumber}</span>
+        <Pill label={CLAIM_STATUS_LABELS[status]} bg={CLAIM_STATUS_COLORS[status].bg} fg={CLAIM_STATUS_COLORS[status].fg} />
+        <span style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
+          Opened {formatDate(claim.createdAt, timezone)}
+          {claim.submittedAt ? ` · sent ${formatDate(claim.submittedAt, timezone)}` : ""}
+        </span>
+      </div>
+      {claim.notes && <div style={{ fontSize: "12px", marginBottom: "10px" }}>{claim.notes}</div>}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+        {claim.lines.map((line) => (
+          <ClaimLineRow
+            key={line.id}
+            line={line}
+            name={itemName(itemsById.get(line.purchaseOrderItemId))}
+            resolved={resolved}
+            fetcher={fetcher}
+            isBusy={isBusy}
+            currency={currency}
+          />
+        ))}
+      </div>
+
+      {resolved ? (
+        <div style={{ fontSize: "12.5px", marginTop: "10px", color: "var(--inv-status-healthy-fg)", fontWeight: 500 }}>
+          Supplier accepted {totalAccepted} of {totalClaimed} unit{totalClaimed === 1 ? "" : "s"} · credit agreed{" "}
+          {formatCurrency(totalCredit, currency)}
+        </div>
+      ) : deciding ? (
+        <DecisionForm claim={claim} itemsById={itemsById} fetcher={fetcher} isBusy={isBusy} currency={currency} onCancel={() => setDeciding(false)} />
+      ) : (
+        <div style={{ display: "flex", gap: "8px", marginTop: "10px", flexWrap: "wrap" }}>
+          {status === "open" && (
+            <button
+              type="button"
+              style={smallButton}
+              disabled={isBusy}
+              onClick={() => fetcher.submit({ intent: "submit_claim", claimId: claim.id }, { method: "POST" })}
+            >
+              Mark sent to supplier
+            </button>
+          )}
+          <button type="button" style={smallButton} disabled={isBusy} onClick={() => setDeciding(true)}>
+            Record supplier decision
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ClaimLineRow({
+  line,
+  name,
+  resolved,
+  fetcher,
+  isBusy,
+  currency,
+}: {
+  line: ClaimLineView;
+  name: string;
+  resolved: boolean;
+  fetcher: ClaimFetcher;
+  isBusy: boolean;
+  currency: string;
+}) {
+  const held = quarantinedQuantity(line);
+  const effective = effectiveClaimQuantity(line);
+  const canFind = line.type === "missing" && line.stockSource === "on_hand" && !resolved && effective > 0;
+  const [qty, setQty] = useState(String(held || effective));
+  useEffect(() => setQty(String(held || effective)), [held, effective]);
+
+  const dispose = (disposition: ClaimDisposition) =>
+    fetcher.submit({ intent: "dispose_claim_line", lineId: line.id, disposition, quantity: qty }, { method: "POST" });
+
+  const history = [
+    line.quantityWrittenOff > 0 && `${line.quantityWrittenOff} written off`,
+    line.quantityReturned > 0 && `${line.quantityReturned} returned`,
+    line.quantityRestocked > 0 && `${line.quantityRestocked} restocked`,
+    line.quantityFound > 0 && `${line.quantityFound} found`,
+  ].filter(Boolean);
+
+  return (
+    <div style={{ fontSize: "12.5px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
+        <span>
+          <b>{effective}</b> × {name} · {CLAIM_TYPE_LABELS[line.type as ClaimType] ?? line.type}
+          <span style={{ color: "var(--inv-muted)" }}>
+            {" "}
+            · {formatCurrency(line.unitCost, currency)} each
+            {line.stockSource === "none" ? " · no stock held" : ""}
+            {history.length > 0 ? ` · ${history.join(", ")}` : ""}
+          </span>
+        </span>
+        <span style={{ color: "var(--inv-text-2)" }}>
+          {held > 0 && <span style={{ color: "var(--inv-status-critical-fg)" }}>{held} in quarantine · </span>}
+          {resolved
+            ? line.decision === "rejected"
+              ? "rejected"
+              : `${line.quantityAccepted} accepted · ${formatCurrency(line.creditAmount, currency)}`
+            : "awaiting supplier"}
+        </span>
+      </div>
+      {(held > 0 || canFind) && (
+        <div style={{ display: "flex", gap: "6px", alignItems: "center", marginTop: "6px", flexWrap: "wrap" }}>
+          <TextInput
+            type="number"
+            min={1}
+            max={held || effective}
+            value={qty}
+            onChange={(e) => setQty(e.target.value)}
+            style={{ width: "72px", height: "30px", textAlign: "right" }}
+          />
+          {held > 0 &&
+            (["return_to_vendor", "write_off", "restock"] as ClaimDisposition[]).map((d) => (
+              <button key={d} type="button" style={smallButton} disabled={isBusy} onClick={() => dispose(d)}>
+                {DISPOSITION_LABELS[d]}
+              </button>
+            ))}
+          {canFind && (
+            <button type="button" style={smallButton} disabled={isBusy} onClick={() => dispose("found")}>
+              Found — put back in stock
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DecisionForm({
+  claim,
+  itemsById,
+  fetcher,
+  isBusy,
+  currency,
+  onCancel,
+}: {
+  claim: ClaimView;
+  itemsById: Map<string, ClaimItem>;
+  fetcher: ClaimFetcher;
+  isBusy: boolean;
+  currency: string;
+  onCancel: () => void;
+}) {
+  const [values, setValues] = useState<Record<string, { accepted: string; credit: string }>>(() =>
+    Object.fromEntries(claim.lines.map((l) => [l.id, { accepted: String(effectiveClaimQuantity(l)), credit: "" }])),
+  );
+  const set = (id: string, patch: Partial<{ accepted: string; credit: string }>) =>
+    setValues((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+
+  return (
+    <div style={{ marginTop: "10px", padding: "10px", background: "var(--inv-subtle)", borderRadius: "9px" }}>
+      <div style={{ fontSize: "12px", color: "var(--inv-text-2)", marginBottom: "8px" }}>
+        How much did the supplier accept? Leave credit blank for accepted units at cost; enter an amount if you agreed
+        something else, or 0 if they are sending replacements instead.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 0.8fr 1fr", gap: "8px", alignItems: "center", fontSize: "12px" }}>
+        <span style={{ color: "var(--inv-muted)" }}>Line</span>
+        <span style={{ color: "var(--inv-muted)" }}>Accepted</span>
+        <span style={{ color: "var(--inv-muted)" }}>Credit</span>
+        {claim.lines.map((l) => {
+          const v = values[l.id];
+          const accepted = parseInt(v.accepted, 10);
+          const atCost = (Number.isFinite(accepted) ? accepted : 0) * l.unitCost;
+          return (
+            <Fragment key={l.id}>
+              <span>
+                {effectiveClaimQuantity(l)} × {itemName(itemsById.get(l.purchaseOrderItemId))}
+              </span>
+              <TextInput type="number" min={0} max={effectiveClaimQuantity(l)} value={v.accepted} onChange={(e) => set(l.id, { accepted: e.target.value })} />
+              <TextInput
+                type="number"
+                min={0}
+                step={0.01}
+                placeholder={formatCurrency(atCost, currency)}
+                value={v.credit}
+                onChange={(e) => set(l.id, { credit: e.target.value })}
+              />
+            </Fragment>
+          );
+        })}
+      </div>
+      <div style={{ display: "flex", gap: "9px", justifyContent: "flex-end", marginTop: "10px" }}>
+        <Button variant="ghost" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button
+          variant="primary"
+          disabled={isBusy}
+          onClick={() => {
+            const data: Record<string, string> = { intent: "resolve_claim", claimId: claim.id };
+            for (const l of claim.lines) {
+              data[`accepted_${l.id}`] = values[l.id].accepted;
+              data[`credit_${l.id}`] = values[l.id].credit;
+            }
+            fetcher.submit(data, { method: "POST" });
+          }}
+        >
+          Save decision
+        </Button>
+      </div>
     </div>
   );
 }

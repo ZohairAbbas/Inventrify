@@ -70,6 +70,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       where: { shop: session.shop, supplierId: supplier.id },
       data: { supplierId: null },
     }),
+    prisma.supplierClaim.updateMany({
+      where: { shop: session.shop, supplierId: supplier.id },
+      data: { supplierId: null },
+    }),
     prisma.supplier.delete({ where: { id: supplier.id } }),
   ]);
 

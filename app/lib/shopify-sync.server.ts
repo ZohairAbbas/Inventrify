@@ -58,6 +58,17 @@ const INVENTORY_ADJUST_MUTATION = `
   }
 `;
 
+// Moves units between quantity states at one location (available <-> damaged). A move,
+// not two adjustments, so on_hand never changes and no instant exists where the units
+// are counted in neither state — or sellable twice.
+const INVENTORY_MOVE_MUTATION = `
+  mutation moveInventory($input: InventoryMoveQuantitiesInput!, $idempotencyKey: String!) {
+    inventoryMoveQuantities(input: $input) @idempotent(key: $idempotencyKey) {
+      userErrors { field message }
+    }
+  }
+`;
+
 interface ShopifyLocation {
   id: string;
   name: string;
@@ -174,6 +185,107 @@ export async function applyShopifyInventoryDelta(
 }
 
 /**
+ * Push a change to the `available` and/or `damaged` quantities of one item at one
+ * location — the Shopify half of applyLocalStockState.
+ *
+ *   available -n, damaged +n   move into quarantine     (inventoryMoveQuantities)
+ *   available +n, damaged -n   release from quarantine  (inventoryMoveQuantities)
+ *   anything else              one adjustment per non-zero state
+ *
+ * Every quantity name except `available` requires a ledgerDocumentUri; it names the
+ * Inventorify record that caused the movement, so it also shows in the merchant's Shopify
+ * inventory history. Non-fatal, like applyShopifyInventoryDelta: local stock is the
+ * merchant's record of what physically happened.
+ */
+export async function applyShopifyStockStateChange(
+  admin: AdminApiContext,
+  inventoryItemId: string | null,
+  shopifyLocationId: string,
+  change: { available: number; damaged: number },
+  opts: { reason: string; ledgerDocumentUri: string },
+): Promise<{ ok: boolean; error?: string }> {
+  if (!inventoryItemId) return { ok: false, error: "Product not linked to a Shopify inventory item" };
+  const { available, damaged } = change;
+  if (available === 0 && damaged === 0) return { ok: true };
+
+  const errors: string[] = [];
+  const run = async (mutation: string, input: Record<string, unknown>, field: string) => {
+    try {
+      const data = await graphqlWithRetry<Record<string, { userErrors: { message: string }[] } | undefined>>(
+        admin,
+        mutation,
+        // Minted once per movement and reused by every retry inside graphqlWithRetry.
+        { input, idempotencyKey: randomUUID() },
+      );
+      for (const e of data[field]?.userErrors ?? []) errors.push(e.message);
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : "Unknown error");
+    }
+  };
+
+  if (available !== 0 && available === -damaged) {
+    const toDamaged = damaged > 0;
+    const terminal = (name: string) => ({
+      locationId: shopifyLocationId,
+      name,
+      ledgerDocumentUri: name === "available" ? null : opts.ledgerDocumentUri,
+      changeFromQuantity: null,
+    });
+    await run(
+      INVENTORY_MOVE_MUTATION,
+      {
+        reason: opts.reason,
+        referenceDocumentUri: opts.ledgerDocumentUri,
+        changes: [
+          {
+            inventoryItemId,
+            quantity: Math.abs(damaged),
+            from: terminal(toDamaged ? "available" : "damaged"),
+            to: terminal(toDamaged ? "damaged" : "available"),
+          },
+        ],
+      },
+      "inventoryMoveQuantities",
+    );
+  } else {
+    if (available !== 0) {
+      await run(
+        INVENTORY_ADJUST_MUTATION,
+        {
+          reason: opts.reason,
+          name: "available",
+          referenceDocumentUri: opts.ledgerDocumentUri,
+          changes: [{ delta: available, inventoryItemId, locationId: shopifyLocationId, changeFromQuantity: null }],
+        },
+        "inventoryAdjustQuantities",
+      );
+    }
+    if (damaged !== 0) {
+      await run(
+        INVENTORY_ADJUST_MUTATION,
+        {
+          reason: opts.reason,
+          name: "damaged",
+          referenceDocumentUri: opts.ledgerDocumentUri,
+          changes: [
+            {
+              delta: damaged,
+              inventoryItemId,
+              locationId: shopifyLocationId,
+              ledgerDocumentUri: opts.ledgerDocumentUri,
+              changeFromQuantity: null,
+            },
+          ],
+        },
+        "inventoryAdjustQuantities",
+      );
+    }
+  }
+
+  return errors.length > 0 ? { ok: false, error: errors.join(", ") } : { ok: true };
+}
+
+/**
  * Flat pagination over every variant in the shop.
  *
  * This deliberately does NOT nest variants under products. The old query asked for
@@ -207,7 +319,7 @@ const PRODUCT_VARIANTS_QUERY = `
               edges {
                 node {
                   location { id }
-                  quantities(names: ["available", "on_hand"]) { name quantity }
+                  quantities(names: ["available", "on_hand", "damaged"]) { name quantity }
                 }
               }
               pageInfo { hasNextPage endCursor }
@@ -258,7 +370,7 @@ const INVENTORY_LEVELS_QUERY = `
         edges {
           node {
             location { id }
-            quantities(names: ["available", "on_hand"]) { name quantity }
+            quantities(names: ["available", "on_hand", "damaged"]) { name quantity }
           }
         }
         pageInfo { hasNextPage endCursor }
@@ -408,17 +520,23 @@ export async function syncShopifyInventory(
             levelPage = page.pageInfo;
           }
 
-          const perLocation: { locationId: string; onHand: number; reserved: number }[] = [];
+          const perLocation: { locationId: string; onHand: number; reserved: number; damaged: number }[] = [];
           for (const level of levelNodes) {
             const localLocationId = locationMap.get(level.location.id);
             if (!localLocationId) continue;
             const qtyByName = new Map(level.quantities.map((q) => [q.name, q.quantity]));
-            const onHand = qtyByName.get("on_hand") ?? qtyByName.get("available") ?? 0;
-            const available = qtyByName.get("available") ?? onHand;
+            const shopifyOnHand = qtyByName.get("on_hand") ?? qtyByName.get("available") ?? 0;
+            const available = qtyByName.get("available") ?? shopifyOnHand;
+            // Shopify's on_hand includes units in the `damaged` state. Here onHand means
+            // sellable physical stock, so quarantined units are split out — otherwise they
+            // would be derived as "reserved" and still counted in currentStock and value.
+            const damaged = Math.max(0, qtyByName.get("damaged") ?? 0);
+            const onHand = Math.max(0, shopifyOnHand - damaged);
             perLocation.push({
               locationId: localLocationId,
               onHand,
               reserved: Math.max(0, onHand - available),
+              damaged,
             });
           }
 
@@ -475,8 +593,15 @@ export async function syncShopifyInventory(
           for (const l of perLocation) {
             await prisma.productLocationStock.upsert({
               where: { productId_locationId: { productId: variant.id, locationId: l.locationId } },
-              create: { shop, productId: variant.id, locationId: l.locationId, onHand: l.onHand, reserved: l.reserved },
-              update: { onHand: l.onHand, reserved: l.reserved },
+              create: {
+                shop,
+                productId: variant.id,
+                locationId: l.locationId,
+                onHand: l.onHand,
+                reserved: l.reserved,
+                damaged: l.damaged,
+              },
+              update: { onHand: l.onHand, reserved: l.reserved, damaged: l.damaged },
             });
           }
 
@@ -502,7 +627,7 @@ export async function syncShopifyInventory(
             };
             await prisma.productLocationStock.updateMany({
               where: { ...stale, binLocation: { not: null } },
-              data: { onHand: 0, reserved: 0 },
+              data: { onHand: 0, reserved: 0, damaged: 0 },
             });
             await prisma.productLocationStock.deleteMany({
               where: { ...stale, binLocation: null },

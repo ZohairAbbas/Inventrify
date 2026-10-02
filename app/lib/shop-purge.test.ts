@@ -37,6 +37,7 @@ const shopScopedModels = Prisma.dmmf.datamodel.models
 const RELATION_SCOPED = [
   "PurchaseOrderItem",
   "PurchaseOrderReceiptLine",
+  "SupplierClaimLine",
   "StockTransferItem",
   "StockCountItem",
 ];

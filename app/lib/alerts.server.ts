@@ -1,4 +1,5 @@
 import prisma from "../db.server";
+import { OPEN_PO_STATUSES, outstandingQuantity } from "./purchase-order-status";
 
 /**
  * Alert severity, highest first. Used for ordering and for deciding what is worth
@@ -150,12 +151,13 @@ export async function generateAlerts(
     }
   }
 
-  // Lead-time breach: POs sent but past their expected delivery date. The schema has
-  // always listed this alert type; nothing ever generated it.
+  // Lead-time breach: POs still expecting stock past their expected delivery date. The
+  // schema has always listed this alert type; nothing ever generated it. A partially
+  // received PO is still late for whatever has not arrived.
   const overduePos = await prisma.purchaseOrder.findMany({
     where: {
       shop,
-      status: "sent",
+      status: { in: OPEN_PO_STATUSES },
       expectedDeliveryDate: { lt: new Date() },
     },
     include: {
@@ -175,6 +177,9 @@ export async function generateAlerts(
     if (daysLate <= 0) continue;
     for (const item of po.items) {
       if (!item.product) continue;
+      // Lines that have arrived in full are not late, whatever the rest of the PO is.
+      const outstanding = outstandingQuantity(item);
+      if (outstanding === 0) continue;
       const name = item.product.variantTitle
         ? `${item.product.title} — ${item.product.variantTitle}`
         : item.product.title;
@@ -182,9 +187,9 @@ export async function generateAlerts(
         type: "lead_time_breach",
         productId: item.product.id,
         dedupeKey: `lead_time_breach:${po.id}:${item.product.id}`,
-        message: `${po.poNumber}${po.supplier ? ` (${po.supplier.name})` : ""} is ${daysLate} day${daysLate === 1 ? "" : "s"} late — ${item.quantityOrdered} × ${name} not received.`,
+        message: `${po.poNumber}${po.supplier ? ` (${po.supplier.name})` : ""} is ${daysLate} day${daysLate === 1 ? "" : "s"} late — ${outstanding} × ${name} not received.`,
         severity: daysLate >= 7 ? "critical" : "warning",
-        revenueAtRisk: item.quantityOrdered * item.unitCost,
+        revenueAtRisk: outstanding * item.unitCost,
       });
     }
   }

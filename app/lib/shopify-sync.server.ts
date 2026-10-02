@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
+import { RECEIVABLE_PO_STATUSES } from "./purchase-order-status";
 import { calculateReorderPoint } from "./forecast.server";
 import {
   computeCodFloat,
@@ -546,7 +547,7 @@ export async function syncShopifyInventory(
       const blocked = await prisma.purchaseOrderItem.findMany({
         where: {
           productId: { in: orphanIds },
-          purchaseOrder: { status: { in: ["draft", "sent"] } },
+          purchaseOrder: { status: { in: RECEIVABLE_PO_STATUSES } },
         },
         select: { productId: true },
         distinct: ["productId"],

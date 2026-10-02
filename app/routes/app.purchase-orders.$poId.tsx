@@ -8,12 +8,14 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { Button, Card, DataTable, PageHead, POStatusPill, PrintSheet, ProductCombobox, ProductThumb, ScanInput, SelectInput, TextArea, TextInput, type DataTableColumn } from "../design";
 import {
+  closePurchaseOrderRemainder,
   markPurchaseOrderSent,
   parseReceivedQuantities,
   receivePurchaseOrder,
   validateDraftLines,
   validateSupplierId,
 } from "../lib/purchase-order.server";
+import { outstandingQuantity } from "../lib/purchase-order-status";
 import { parseFormDate } from "../lib/date-range";
 import { emailPurchaseOrderToSupplier } from "../lib/purchase-order-email.server";
 
@@ -24,6 +26,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     include: {
       supplier: true,
       items: { include: { product: true } },
+      receipts: {
+        include: { lines: { select: { purchaseOrderItemId: true, quantity: true } } },
+        orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }],
+      },
     },
   });
   if (!po) throw new Response("Not found", { status: 404 });
@@ -38,8 +44,15 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   return { po, suppliers };
 };
 
+/** The receiptVersion the page was rendered with; null when absent or malformed. */
+function parseVersion(raw: FormDataEntryValue | null): number | null {
+  if (raw === null || raw === "") return null;
+  const n = parseInt(String(raw), 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 export const action = async ({ request, params }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
   const formData = await request.formData();
   const intent = formData.get("intent") as string;
@@ -129,6 +142,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         formData,
         po.items.map((i) => i.id),
       ),
+      expectedVersion: parseVersion(formData.get("receiptVersion")),
+      closeRemaining: formData.get("remainder") === "close",
+      userId: sessionToken?.sub ?? null,
     });
 
     if (!result.ok) {
@@ -140,12 +156,23 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     const problems = [
       ...result.lines.filter((l) => l.error).map((l) => l.error as string),
       ...result.shopifyWarnings,
+      ...(result.closeSkipped ? [result.closeSkipped] : []),
     ];
     return {
       ok: true as const,
-      action: "received",
+      action: `received:${result.status ?? ""}`,
       error: problems.length > 0 ? problems.join("; ") : "",
     };
+  }
+
+  if (intent === "close_remaining") {
+    const result = await closePurchaseOrderRemainder(shop, po.id, {
+      expectedVersion: parseVersion(formData.get("receiptVersion")),
+    });
+    if (!result.ok) {
+      return { ok: false as const, error: result.error ?? "Could not close", action: "" };
+    }
+    return { ok: true as const, action: "closed", error: "" };
   }
 
   return { ok: true as const, action: "", error: "" };
@@ -170,9 +197,19 @@ export default function PODetail() {
     po.expectedDeliveryDate ? new Date(po.expectedDeliveryDate).toISOString().slice(0, 10) : "",
   );
   const [actualDate, setActualDate] = useState(new Date().toISOString().slice(0, 10));
-  const [receivedQtys, setReceivedQtys] = useState<Record<string, string>>(
-    Object.fromEntries(po.items.map((i) => [i.id, String(i.quantityOrdered)])),
-  );
+  // Units arriving in THIS delivery, per line — not the running total. Defaults to what
+  // is still outstanding, so a complete delivery is one click.
+  const outstandingDefaults = () =>
+    Object.fromEntries(po.items.map((i) => [i.id, String(outstandingQuantity(i))]));
+  const [receivedQtys, setReceivedQtys] = useState<Record<string, string>>(outstandingDefaults);
+  const [remainder, setRemainder] = useState<"keep" | "close">("keep");
+  // A booked delivery bumps receiptVersion and the loader revalidates; start the next
+  // delivery from the new outstanding figures rather than re-showing the last one.
+  useEffect(() => {
+    setReceivedQtys(outstandingDefaults());
+    setRemainder("keep");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [po.receiptVersion]);
 
   const [isEditing, setIsEditing] = useState(false);
   const [draftSupplierId, setDraftSupplierId] = useState(po.supplierId ?? "");
@@ -195,12 +232,22 @@ export default function PODetail() {
       const action = fetcher.data.action;
       const msg = action.startsWith("emailed:")
         ? `Purchase order emailed to ${action.slice("emailed:".length)}`
-        : action === "received"
-          ? "PO marked as received — stock updated"
-          : action === "draft_updated"
-            ? "Draft PO updated"
-            : "PO updated";
-      shopify.toast.show(msg);
+        : action === "received:received"
+          ? "Delivery received — PO complete, stock updated"
+          : action === "received:partially_received"
+            ? "Delivery received — the rest stays on order"
+            : action === "received:closed"
+              ? "Delivery received — remainder cancelled, PO closed"
+              : action.startsWith("received")
+                ? "Delivery received — stock updated"
+                : action === "closed"
+                  ? "Remaining units cancelled — PO closed"
+                  : action === "draft_updated"
+                    ? "Draft PO updated"
+                    : "PO updated";
+      // Line failures and Shopify warnings ride along on a successful receipt.
+      if (fetcher.data.error) shopify.toast.show(`${msg} — but: ${fetcher.data.error}`, { isError: true });
+      else shopify.toast.show(msg);
       if (fetcher.data.action === "draft_updated") setIsEditing(false);
     } else if (fetcher.data?.error) {
       shopify.toast.show(fetcher.data.error, { isError: true });
@@ -245,17 +292,35 @@ export default function PODetail() {
     fetcher.submit(fd, { method: "POST" });
   };
 
+  const receivable = po.status === "sent" || po.status === "partially_received";
+
+  /** This-delivery quantity as entered; blank or unparseable counts as zero. */
+  const deliveryQty = (itemId: string) => {
+    const n = parseInt(receivedQtys[itemId] ?? "0", 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  const deliveryUnits = po.items.reduce((s, i) => s + deliveryQty(i.id), 0);
+  // What would still be outstanding if this delivery is booked as entered.
+  const shortUnits = po.items.reduce(
+    (s, i) => s + Math.max(0, outstandingQuantity(i) - deliveryQty(i.id)),
+    0,
+  );
+  const totalOutstanding = po.items.reduce((s, i) => s + outstandingQuantity(i), 0);
+  const totalCancelled = po.items.reduce((s, i) => s + i.quantityCancelled, 0);
+
   const columns: DataTableColumn[] = [
     { header: "Product", width: "2.2fr" },
     { header: "SKU", width: "1fr" },
     { header: "Qty ordered", width: "1fr", align: "right" },
     { header: "Qty received", width: "1.2fr", align: "right" },
+    ...(receivable ? [{ header: "This delivery", width: "1.2fr", align: "right" as const }] : []),
     { header: "Unit cost", width: "1fr", align: "right" },
     { header: "Line total", width: "1.1fr", align: "right" },
   ];
 
   const rows = po.items.map((item) => {
     const name = item.product.variantTitle ? `${item.product.title} — ${item.product.variantTitle}` : item.product.title;
+    const outstanding = outstandingQuantity(item);
     return {
       key: item.id,
       cells: [
@@ -269,18 +334,26 @@ export default function PODetail() {
           {item.product.sku ?? "—"}
         </span>,
         <span key="ord" style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantityOrdered}</span>,
-        po.status === "sent" ? (
-          <TextInput
-            key="recv"
-            type="number"
-            min={0}
-            value={receivedQtys[item.id] ?? String(item.quantityOrdered)}
-            onChange={(e) => setReceivedQtys((prev) => ({ ...prev, [item.id]: e.target.value }))}
-            style={{ height: "32px", textAlign: "right" }}
-          />
-        ) : (
-          <span key="recv" style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantityReceived ?? 0}</span>
-        ),
+        <div key="recv" style={{ textAlign: "right" }}>
+          <span style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantityReceived ?? 0}</span>
+          {item.quantityCancelled > 0 ? (
+            <div style={{ fontSize: "11px", color: "var(--inv-muted)" }}>{item.quantityCancelled} cancelled</div>
+          ) : receivable && item.quantityReceived > 0 && outstanding > 0 ? (
+            <div style={{ fontSize: "11px", color: "var(--inv-muted)" }}>{outstanding} still due</div>
+          ) : null}
+        </div>,
+        ...(receivable
+          ? [
+              <TextInput
+                key="delivery"
+                type="number"
+                min={0}
+                value={receivedQtys[item.id] ?? String(outstanding)}
+                onChange={(e) => setReceivedQtys((prev) => ({ ...prev, [item.id]: e.target.value }))}
+                style={{ height: "32px", textAlign: "right" }}
+              />,
+            ]
+          : []),
         <span key="cost" style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(item.unitCost, currency)}</span>,
         <span key="total" style={{ fontFamily: "var(--inv-font-mono)", fontWeight: 600 }}>
           {formatCurrency(item.quantityOrdered * item.unitCost, currency)}
@@ -303,7 +376,7 @@ export default function PODetail() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: "12px" }}>
             <div>
               <div style={{ fontSize: "18px", fontWeight: 700 }}>
-                {po.status === "sent" ? "Receiving sheet" : "Purchase order"} — {po.poNumber}
+                {receivable ? "Receiving sheet" : "Purchase order"} — {po.poNumber}
               </div>
               {po.supplier && (
                 <div style={{ fontSize: "12.5px", marginTop: "3px" }}>
@@ -322,10 +395,10 @@ export default function PODetail() {
               <tr>
                 <th style={{ width: "16%" }}>SKU</th>
                 <th>Product</th>
-                <th className="num" style={{ width: "10%" }}>Qty</th>
+                <th className="num" style={{ width: "10%" }}>{po.status === "partially_received" ? "Still due" : "Qty"}</th>
                 <th className="num" style={{ width: "14%" }}>Unit cost</th>
                 <th className="num" style={{ width: "14%" }}>Line total</th>
-                {po.status === "sent" && <th style={{ width: "12%" }}>Received</th>}
+                {receivable && <th style={{ width: "12%" }}>Received</th>}
               </tr>
             </thead>
             <tbody>
@@ -335,23 +408,25 @@ export default function PODetail() {
                   <tr key={item.id}>
                     <td style={{ fontFamily: "var(--inv-font-mono)" }}>{item.product.sku ?? "—"}</td>
                     <td>{name}</td>
-                    <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>{item.quantityOrdered}</td>
+                    <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>
+                      {po.status === "partially_received" ? outstandingQuantity(item) : item.quantityOrdered}
+                    </td>
                     <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(item.unitCost, currency)}</td>
                     <td className="num" style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(item.quantityOrdered * item.unitCost, currency)}</td>
-                    {po.status === "sent" && <td></td>}
+                    {receivable && <td></td>}
                   </tr>
                 );
               })}
               <tr>
                 <td colSpan={4} style={{ textAlign: "right", fontWeight: 700 }}>Total</td>
                 <td className="num" style={{ fontWeight: 700, fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(po.totalCost, currency)}</td>
-                {po.status === "sent" && <td></td>}
+                {receivable && <td></td>}
               </tr>
             </tbody>
           </table>
 
           {po.notes && <div style={{ marginTop: "12px", fontSize: "12px" }}><b>Notes:</b> {po.notes}</div>}
-          {po.status === "sent" && (
+          {receivable && (
             <div style={{ marginTop: "18px", fontSize: "11.5px", display: "flex", justifyContent: "space-between" }}>
               <span>Received by ______________________</span>
               <span>Date __________</span>
@@ -513,8 +588,14 @@ export default function PODetail() {
             </div>
           )}
 
-          {po.status === "sent" && (
+          {receivable && (
             <div>
+              {po.status === "partially_received" && (
+                <div style={{ fontSize: "12.5px", marginBottom: "14px" }}>
+                  <b>{totalOutstanding}</b> unit{totalOutstanding === 1 ? "" : "s"} still on order from earlier
+                  deliveries. Book the next delivery below when it arrives.
+                </div>
+              )}
               <div style={{ marginBottom: "14px" }}>
                 <EmailSupplierButton po={po} isBusy={isBusy} fetcher={fetcher} />
               </div>
@@ -533,7 +614,7 @@ export default function PODetail() {
                 </div>
                 <ScanInput
                   placeholder="Scan each item as you unpack, then press Enter"
-                  hint="Each scan adds 1 to that line's received quantity. Zero the counts first, scan a run of boxes, then confirm below."
+                  hint="Each scan adds 1 to that line's quantity in this delivery. Zero the counts first, scan a run of boxes, then confirm below."
                   onScan={(scanned) => {
                     // Match the scanned product to a line on this PO and tick it up. A
                     // scanned code that is a real product but not on this PO is a wrong
@@ -550,7 +631,7 @@ export default function PODetail() {
                       const target =
                         productLines.find((l) => {
                           const got = parseInt(prev[l.id] ?? "0", 10);
-                          return (Number.isFinite(got) ? got : 0) < l.quantityOrdered;
+                          return (Number.isFinite(got) ? got : 0) < outstandingQuantity(l);
                         }) ?? productLines[0];
                       const current = parseInt(prev[target.id] ?? "0", 10);
                       const next = (Number.isFinite(current) ? current : 0) + 1;
@@ -570,30 +651,123 @@ export default function PODetail() {
                 style={{ marginBottom: "8px", maxWidth: "240px" }}
               />
               <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "14px" }}>
-                Adjust received quantities above for partial delivery. Stock updates accordingly.
+                Enter what arrived in this delivery. Stock updates accordingly.
               </div>
+
+              {/* Only asked when the delivery as entered leaves something outstanding. The
+                  default keeps it on order: closing is the step that cannot be undone. */}
+              {shortUnits > 0 && (
+                <div style={{ marginBottom: "14px", padding: "10px 12px", background: "var(--inv-subtle)", borderRadius: "9px" }}>
+                  <div style={{ fontSize: "12.5px", fontWeight: 600, marginBottom: "8px" }}>
+                    {shortUnits} unit{shortUnits === 1 ? "" : "s"} will still be outstanding after this delivery
+                  </div>
+                  <label style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "12.5px", marginBottom: "6px", cursor: "pointer" }}>
+                    <input type="radio" name="remainder" checked={remainder === "keep"} onChange={() => setRemainder("keep")} />
+                    <span>
+                      <b>Keep on order</b> — the supplier will send the rest. The PO stays open and the units still
+                      count as incoming stock.
+                    </span>
+                  </label>
+                  <label style={{ display: "flex", gap: "8px", alignItems: "flex-start", fontSize: "12.5px", cursor: "pointer" }}>
+                    <input type="radio" name="remainder" checked={remainder === "close"} onChange={() => setRemainder("close")} />
+                    <span>
+                      <b>Close short</b> — the supplier won't send the rest. The {shortUnits} unit{shortUnits === 1 ? "" : "s"} are
+                      cancelled and the PO is closed.
+                    </span>
+                  </label>
+                </div>
+              )}
+
               <Button
                 variant="primary"
-                disabled={isBusy}
+                // A delivery of nothing that also keeps everything open would change nothing.
+                disabled={isBusy || (deliveryUnits === 0 && !(shortUnits > 0 && remainder === "close"))}
                 onClick={() => {
-                  const data: Record<string, string> = { intent: "mark_received", actualDeliveryDate: actualDate };
+                  const data: Record<string, string> = {
+                    intent: "mark_received",
+                    actualDeliveryDate: actualDate,
+                    receiptVersion: String(po.receiptVersion),
+                    remainder: shortUnits > 0 ? remainder : "keep",
+                  };
+                  // The server takes running totals, so a repeated submit of this same
+                  // form asks for nothing new instead of booking the delivery twice.
                   po.items.forEach((item) => {
-                    data[`received_${item.id}`] = receivedQtys[item.id] ?? String(item.quantityOrdered);
+                    data[`received_${item.id}`] = String(item.quantityReceived + deliveryQty(item.id));
                   });
                   fetcher.submit(data, { method: "POST" });
                 }}
               >
-                Confirm received — update stock
+                {deliveryUnits === 0
+                  ? "Close short — no delivery"
+                  : `Confirm ${deliveryUnits} unit${deliveryUnits === 1 ? "" : "s"} received — update stock`}
               </Button>
             </div>
           )}
 
           {po.status === "received" && (
             <div style={{ fontSize: "12.5px", color: "var(--inv-status-healthy-fg)", fontWeight: 500 }}>
-              ✓ Received on {po.actualDeliveryDate ? formatDate(po.actualDeliveryDate, timezone) : "—"}. Stock has been updated.
+              ✓ Received in full
+              {po.receipts.length > 1
+                ? ` across ${po.receipts.length} deliveries`
+                : po.actualDeliveryDate
+                  ? ` on ${formatDate(po.actualDeliveryDate, timezone)}`
+                  : ""}
+              . Stock has been updated.
+            </div>
+          )}
+
+          {po.status === "closed" && (
+            <div style={{ fontSize: "12.5px", color: "var(--inv-text-2)", fontWeight: 500 }}>
+              Closed short — {totalCancelled} unit{totalCancelled === 1 ? " was" : "s were"} never delivered and{" "}
+              {totalCancelled === 1 ? "is" : "are"} no longer expected. Everything that did arrive is in stock.
             </div>
           )}
         </Card>
+        )}
+
+        {!isEditing && po.receipts.length > 0 && (
+          <Card style={{ marginBottom: "18px" }}>
+            <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: "10px" }}>Deliveries</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+              {po.receipts.map((receipt, idx) => {
+                const units = receipt.lines.reduce((s, l) => s + l.quantity, 0);
+                return (
+                  <div key={receipt.id} style={{ display: "flex", justifyContent: "space-between", gap: "12px", fontSize: "12.5px" }}>
+                    <span>
+                      Delivery {idx + 1} · {formatDate(receipt.receivedAt, timezone)}
+                    </span>
+                    <span style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
+                      {units} unit{units === 1 ? "" : "s"} · {receipt.lines.length} line{receipt.lines.length === 1 ? "" : "s"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        )}
+
+        {!isEditing && po.status === "partially_received" && (
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "18px", fontSize: "12px", color: "var(--inv-muted)" }}>
+            <span>Supplier won't send the remaining {totalOutstanding} unit{totalOutstanding === 1 ? "" : "s"}?</span>
+            <Button
+              variant="ghost"
+              disabled={isBusy}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Close ${po.poNumber} short?\n\n${totalOutstanding} outstanding unit${totalOutstanding === 1 ? "" : "s"} will be cancelled and no longer count as incoming stock. This cannot be undone.`,
+                  )
+                ) {
+                  fetcher.submit(
+                    { intent: "close_remaining", receiptVersion: String(po.receiptVersion) },
+                    { method: "POST" },
+                  );
+                }
+              }}
+            >
+              Close remaining
+            </Button>
+          </div>
         )}
 
         <div style={{ display: "flex", gap: "9px" }}>

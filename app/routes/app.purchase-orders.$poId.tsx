@@ -15,7 +15,7 @@ import {
   validateDraftLines,
   validateSupplierId,
 } from "../lib/purchase-order.server";
-import { outstandingQuantity } from "../lib/purchase-order-status";
+import { outstandingQuantity, PO_STATUS_LABELS, type POStatus } from "../lib/purchase-order-status";
 import { getPoAccount, recordLedgerEntry } from "../lib/supplier-ledger.server";
 import {
   createSupplierClaim,
@@ -35,7 +35,7 @@ import {
   type ClaimType,
 } from "../lib/supplier-claim";
 import { parseFormDate } from "../lib/date-range";
-import { emailPurchaseOrderToSupplier } from "../lib/purchase-order-email.server";
+import { emailClaimToSupplier, emailPurchaseOrderToSupplier } from "../lib/purchase-order-email.server";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -49,8 +49,14 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
         orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }],
       },
       claims: {
-        include: { lines: { orderBy: { createdAt: "asc" } } },
+        include: {
+          lines: { orderBy: { createdAt: "asc" } },
+          replacementOrder: { select: { id: true, poNumber: true, status: true } },
+        },
         orderBy: { createdAt: "asc" },
+      },
+      replacesClaim: {
+        select: { claimNumber: true, purchaseOrder: { select: { id: true, poNumber: true } } },
       },
     },
   });
@@ -278,11 +284,27 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
           quantityAccepted: Number(formData.get(`accepted_${l.id}`)),
           // Blank means "accepted units at cost"; anything typed is taken as agreed.
           creditAmount: credit === null || credit === "" ? null : Number(credit),
+          remedy: String(formData.get(`remedy_${l.id}`) ?? "credit"),
         };
       }),
+      { userId: sessionToken?.sub ?? null },
     );
     if (!result.ok) return { ok: false as const, error: result.error ?? "Could not resolve the claim", action: "" };
-    return { ok: true as const, action: "claim_resolved", error: "" };
+    return {
+      ok: true as const,
+      action: result.replacementPoId ? "claim_resolved_replacement" : "claim_resolved",
+      error: "",
+    };
+  }
+
+  if (intent === "email_claim") {
+    const claimId = String(formData.get("claimId") ?? "");
+    // Scoped to this PO's claims, so the form cannot be pointed at another order's claim.
+    const owned = await prisma.supplierClaim.findFirst({ where: { id: claimId, shop, purchaseOrderId: po.id }, select: { id: true } });
+    if (!owned) return { ok: false as const, error: "Claim not found", action: "" };
+    const result = await emailClaimToSupplier(claimId, shop);
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not send the email", action: "" };
+    return { ok: true as const, action: `claim_emailed:${result.emailedTo}`, error: "" };
   }
 
   return { ok: true as const, action: "", error: "" };
@@ -357,11 +379,14 @@ export default function PODetail() {
         claim_opened: "Supplier claim opened",
         claim_submitted: "Claim marked as sent to the supplier",
         claim_resolved: "Supplier decision recorded — credit posted to the supplier's account",
+        claim_resolved_replacement: "Supplier decision recorded — replacement PO raised for the replacement units",
         payment_recorded: "Payment recorded on the supplier's account",
         draft_updated: "Draft PO updated",
       };
       const msg = action.startsWith("emailed:")
         ? `Purchase order emailed to ${action.slice("emailed:".length)}`
+        : action.startsWith("claim_emailed:")
+          ? `Claim emailed to ${action.slice("claim_emailed:".length)}`
         : (messages[action] ??
           (action.startsWith("received")
             ? "Delivery received — stock updated"
@@ -597,6 +622,19 @@ export default function PODetail() {
           }
         />
 
+        {po.replacesClaim && (
+          <Card padding="12px 16px" style={{ marginBottom: "16px" }}>
+            <span style={{ fontSize: "12.5px" }}>
+              Replacement goods for claim <b>{po.replacesClaim.claimNumber}</b> on{" "}
+              <Link to={`/app/purchase-orders/${po.replacesClaim.purchaseOrder.id}`} style={{ color: "var(--inv-accent)" }}>
+                {po.replacesClaim.purchaseOrder.poNumber}
+              </Link>
+              . Free of charge — the original delivery was already billed. Anything the supplier doesn&apos;t send is
+              credited at the original cost when you close this PO short.
+            </span>
+          </Card>
+        )}
+
         {fetcher.data?.error && (
           <Card padding="12px 16px" style={{ marginBottom: "16px", borderColor: "var(--inv-status-critical-dot)" }}>
             <span style={{ color: "var(--inv-status-critical-fg)", fontSize: "13px" }}>{fetcher.data.error}</span>
@@ -823,9 +861,14 @@ export default function PODetail() {
                       cancelled and the PO is closed.
                     </span>
                   </label>
-                  {remainder === "close" && (
-                    <ClaimMissingCheckbox units={shortUnits} checked={claimMissing} onChange={setClaimMissing} />
-                  )}
+                  {remainder === "close" &&
+                    (po.replacesClaim ? (
+                      <div style={{ fontSize: "12px", marginTop: "8px", paddingLeft: "22px", color: "var(--inv-text-2)" }}>
+                        The undelivered replacements will be credited to the supplier&apos;s account at the original cost.
+                      </div>
+                    ) : (
+                      <ClaimMissingCheckbox units={shortUnits} checked={claimMissing} onChange={setClaimMissing} />
+                    ))}
                 </div>
               )}
 
@@ -937,7 +980,11 @@ export default function PODetail() {
         {!isEditing && po.status === "partially_received" && (
           <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", marginBottom: "18px", fontSize: "12px", color: "var(--inv-muted)" }}>
             <span>Supplier won't send the remaining {totalOutstanding} unit{totalOutstanding === 1 ? "" : "s"}?</span>
-            <ClaimMissingCheckbox units={totalOutstanding} checked={claimMissing} onChange={setClaimMissing} compact />
+            {po.replacesClaim ? (
+              <span>They&apos;ll be credited at the original cost.</span>
+            ) : (
+              <ClaimMissingCheckbox units={totalOutstanding} checked={claimMissing} onChange={setClaimMissing} compact />
+            )}
             <Button
               variant="ghost"
               disabled={isBusy}
@@ -1079,6 +1126,7 @@ interface ClaimLineView {
   quantityFound: number;
   decision: string;
   quantityAccepted: number;
+  remedy: string;
   creditAmount: number;
 }
 
@@ -1089,7 +1137,10 @@ interface ClaimView {
   notes: string | null;
   createdAt: string | Date;
   submittedAt: string | Date | null;
+  emailedAt: string | Date | null;
+  emailedTo: string | null;
   lines: ClaimLineView[];
+  replacementOrder: { id: string; poNumber: string; status: string } | null;
 }
 
 const CLAIM_STATUS_COLORS: Record<ClaimStatus, { bg: string; fg: string }> = {
@@ -1294,6 +1345,7 @@ function ClaimCard({
         <span style={{ fontSize: "11.5px", color: "var(--inv-muted)" }}>
           Opened {formatDate(claim.createdAt, timezone)}
           {claim.submittedAt ? ` · sent ${formatDate(claim.submittedAt, timezone)}` : ""}
+          {claim.emailedTo ? ` · emailed to ${claim.emailedTo}` : ""}
         </span>
       </div>
       {claim.notes && <div style={{ fontSize: "12px", marginBottom: "10px" }}>{claim.notes}</div>}
@@ -1316,6 +1368,15 @@ function ClaimCard({
         <div style={{ fontSize: "12.5px", marginTop: "10px", color: "var(--inv-status-healthy-fg)", fontWeight: 500 }}>
           Supplier accepted {totalAccepted} of {totalClaimed} unit{totalClaimed === 1 ? "" : "s"} · credit agreed{" "}
           {formatCurrency(totalCredit, currency)}
+          {claim.replacementOrder && (
+            <>
+              {" · replacements on "}
+              <Link to={`/app/purchase-orders/${claim.replacementOrder.id}`} style={{ color: "var(--inv-accent)" }}>
+                {claim.replacementOrder.poNumber}
+              </Link>{" "}
+              ({PO_STATUS_LABELS[claim.replacementOrder.status as POStatus] ?? claim.replacementOrder.status})
+            </>
+          )}
         </div>
       ) : deciding ? (
         <DecisionForm claim={claim} itemsById={itemsById} fetcher={fetcher} isBusy={isBusy} currency={currency} onCancel={() => setDeciding(false)} />
@@ -1331,6 +1392,15 @@ function ClaimCard({
               Mark sent to supplier
             </button>
           )}
+          <button
+            type="button"
+            style={smallButton}
+            disabled={isBusy}
+            title={claim.emailedTo ? `Last emailed to ${claim.emailedTo}` : "Sends the claim to the supplier's email address"}
+            onClick={() => fetcher.submit({ intent: "email_claim", claimId: claim.id }, { method: "POST" })}
+          >
+            {claim.emailedAt ? "Email again" : "Email to supplier"}
+          </button>
           <button type="button" style={smallButton} disabled={isBusy} onClick={() => setDeciding(true)}>
             Record supplier decision
           </button>
@@ -1388,7 +1458,9 @@ function ClaimLineRow({
           {resolved
             ? line.decision === "rejected"
               ? "rejected"
-              : `${line.quantityAccepted} accepted · ${formatCurrency(line.creditAmount, currency)}`
+              : line.remedy === "replacement"
+                ? `${line.quantityAccepted} accepted · replacement`
+                : `${line.quantityAccepted} accepted · ${formatCurrency(line.creditAmount, currency)}`
             : "awaiting supplier"}
         </span>
       </div>
@@ -1434,21 +1506,24 @@ function DecisionForm({
   currency: string;
   onCancel: () => void;
 }) {
-  const [values, setValues] = useState<Record<string, { accepted: string; credit: string }>>(() =>
-    Object.fromEntries(claim.lines.map((l) => [l.id, { accepted: String(effectiveClaimQuantity(l)), credit: "" }])),
+  type Decision = { accepted: string; credit: string; remedy: "credit" | "replacement" };
+  const [values, setValues] = useState<Record<string, Decision>>(() =>
+    Object.fromEntries(
+      claim.lines.map((l) => [l.id, { accepted: String(effectiveClaimQuantity(l)), credit: "", remedy: "credit" as const }]),
+    ),
   );
-  const set = (id: string, patch: Partial<{ accepted: string; credit: string }>) =>
-    setValues((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+  const set = (id: string, patch: Partial<Decision>) => setValues((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
 
   return (
     <div style={{ marginTop: "10px", padding: "10px", background: "var(--inv-subtle)", borderRadius: "9px" }}>
       <div style={{ fontSize: "12px", color: "var(--inv-text-2)", marginBottom: "8px" }}>
-        How much did the supplier accept? Leave credit blank for accepted units at cost; enter an amount if you agreed
-        something else, or 0 if they are sending replacements instead.
+        How much did the supplier accept, and how will they make it good? A credit goes on their account (leave it
+        blank for accepted units at cost). Replacements raise a linked PO for the accepted units, at no cost.
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "2fr 0.8fr 1fr", gap: "8px", alignItems: "center", fontSize: "12px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 0.8fr 1.1fr 1fr", gap: "8px", alignItems: "center", fontSize: "12px" }}>
         <span style={{ color: "var(--inv-muted)" }}>Line</span>
         <span style={{ color: "var(--inv-muted)" }}>Accepted</span>
+        <span style={{ color: "var(--inv-muted)" }}>Remedy</span>
         <span style={{ color: "var(--inv-muted)" }}>Credit</span>
         {claim.lines.map((l) => {
           const v = values[l.id];
@@ -1460,12 +1535,17 @@ function DecisionForm({
                 {effectiveClaimQuantity(l)} × {itemName(itemsById.get(l.purchaseOrderItemId))}
               </span>
               <TextInput type="number" min={0} max={effectiveClaimQuantity(l)} value={v.accepted} onChange={(e) => set(l.id, { accepted: e.target.value })} />
+              <SelectInput value={v.remedy} onChange={(e) => set(l.id, { remedy: e.target.value as Decision["remedy"] })}>
+                <option value="credit">Credit</option>
+                <option value="replacement">Send replacements</option>
+              </SelectInput>
               <TextInput
                 type="number"
                 min={0}
                 step={0.01}
-                placeholder={formatCurrency(atCost, currency)}
-                value={v.credit}
+                placeholder={v.remedy === "replacement" ? "—" : formatCurrency(atCost, currency)}
+                disabled={v.remedy === "replacement"}
+                value={v.remedy === "replacement" ? "" : v.credit}
                 onChange={(e) => set(l.id, { credit: e.target.value })}
               />
             </Fragment>
@@ -1483,7 +1563,8 @@ function DecisionForm({
             const data: Record<string, string> = { intent: "resolve_claim", claimId: claim.id };
             for (const l of claim.lines) {
               data[`accepted_${l.id}`] = values[l.id].accepted;
-              data[`credit_${l.id}`] = values[l.id].credit;
+              data[`credit_${l.id}`] = values[l.id].remedy === "replacement" ? "" : values[l.id].credit;
+              data[`remedy_${l.id}`] = values[l.id].remedy;
             }
             fetcher.submit(data, { method: "POST" });
           }}

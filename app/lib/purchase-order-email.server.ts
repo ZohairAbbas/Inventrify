@@ -174,3 +174,129 @@ export async function emailPurchaseOrderToSupplier(
 
   return { ok: true, emailedTo: to };
 }
+
+const CLAIM_TYPE_TEXT: Record<string, string> = {
+  missing: "Missing",
+  damaged: "Damaged",
+  defective: "Defective",
+  wrong_item: "Wrong item",
+};
+
+/**
+ * Email a supplier claim to its supplier.
+ *
+ * Same contract as the PO email: the claim is marked emailed only once the provider has
+ * accepted the message. An open claim also moves to "sent to supplier", because emailing
+ * it IS sending it. A claim the merchant already marked sent another way keeps its date.
+ */
+export async function emailClaimToSupplier(claimId: string, shop: string): Promise<SendPoResult> {
+  const claim = await prisma.supplierClaim.findFirst({
+    where: { id: claimId, shop },
+    include: {
+      supplier: true,
+      purchaseOrder: { select: { poNumber: true } },
+      lines: {
+        include: { product: { select: { title: true, variantTitle: true, sku: true } } },
+        orderBy: { createdAt: "asc" },
+      },
+    },
+  });
+  if (!claim) return { ok: false, error: "Claim not found" };
+  if (claim.status === "resolved") return { ok: false, error: "This claim is already resolved" };
+  if (!claim.supplier) return { ok: false, error: "This claim has no supplier to send it to" };
+
+  const to = claim.supplier.email?.trim();
+  if (!to) return { ok: false, error: `${claim.supplier.name} has no email address on file` };
+  if (!isEmail(to)) return { ok: false, error: `${claim.supplier.name}'s email address looks invalid: ${to}` };
+
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) return { ok: false, error: "Email is not configured on this install (RESEND_API_KEY)" };
+
+  const settings = await prisma.shopSettings.findUnique({
+    where: { shop },
+    select: { currency: true, notificationEmail: true },
+  });
+  const currency = settings?.currency ?? "USD";
+
+  // Units the claim is still about: missing units that turned up are no longer owed.
+  const lines = claim.lines
+    .map((l) => ({ ...l, units: Math.max(0, l.quantity - l.quantityFound) }))
+    .filter((l) => l.units > 0);
+  if (lines.length === 0) return { ok: false, error: "Nothing is left to claim on this claim" };
+
+  const rows = lines
+    .map((l) => {
+      const name = l.product.variantTitle ? `${l.product.title} — ${l.product.variantTitle}` : l.product.title;
+      return `
+        <tr>
+          <td style="padding:8px 10px;border-bottom:1px solid #eee">${esc(name)}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #eee;font-family:monospace">${esc(l.product.sku ?? "—")}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #eee">${esc(CLAIM_TYPE_TEXT[l.type] ?? l.type)}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right;font-family:monospace">${l.units}</td>
+          <td style="padding:8px 10px;border-bottom:1px solid #eee;text-align:right;font-family:monospace">${esc(formatCurrency(l.units * l.unitCost, currency))}</td>
+        </tr>`;
+    })
+    .join("");
+  const totalUnits = lines.reduce((s, l) => s + l.units, 0);
+  const total = lines.reduce((s, l) => s + l.units * l.unitCost, 0);
+  const notes = claim.notes
+    ? `<p style="margin:14px 0 0"><strong>Notes:</strong><br>${esc(claim.notes).replace(/\n/g, "<br>")}</p>`
+    : "";
+  const greeting = claim.supplier.contactName ? `Hello ${esc(claim.supplier.contactName)},` : "Hello,";
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;color:#1b1a17;max-width:640px">
+      <p>${greeting}</p>
+      <p>We have a problem with goods received on purchase order <strong>${esc(claim.purchaseOrder.poNumber)}</strong>.
+      Our claim reference is <strong>${esc(claim.claimNumber)}</strong>.</p>
+      <table style="border-collapse:collapse;width:100%;margin:16px 0;font-size:14px">
+        <thead>
+          <tr style="background:#faf9f5">
+            <th style="padding:8px 10px;text-align:left">Product</th>
+            <th style="padding:8px 10px;text-align:left">SKU</th>
+            <th style="padding:8px 10px;text-align:left">Problem</th>
+            <th style="padding:8px 10px;text-align:right">Qty</th>
+            <th style="padding:8px 10px;text-align:right">Value</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+        <tfoot>
+          <tr>
+            <td colspan="3" style="padding:10px;font-weight:600">Total</td>
+            <td style="padding:10px;text-align:right;font-weight:600;font-family:monospace">${totalUnits}</td>
+            <td style="padding:10px;text-align:right;font-weight:600;font-family:monospace">${esc(formatCurrency(total, currency))}</td>
+          </tr>
+        </tfoot>
+      </table>
+      ${notes}
+      <p style="margin-top:18px">Please let us know whether you will credit these units or send replacements.</p>
+      <p style="color:#6f6c63;font-size:12px;margin-top:22px">
+        Sent by ${esc(shop)} via Inventorify.
+      </p>
+    </div>`;
+
+  try {
+    const resend = new Resend(apiKey);
+    const { error } = await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || "orders@inventorify.app",
+      to,
+      ...(settings?.notificationEmail ? { replyTo: settings.notificationEmail } : {}),
+      subject: `Claim ${claim.claimNumber} — ${totalUnits} unit${totalUnits === 1 ? "" : "s"} on ${claim.purchaseOrder.poNumber}`,
+      html,
+    });
+    if (error) return { ok: false, error: error.message || "The email provider rejected the message" };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Failed to send the email" };
+  }
+
+  const now = new Date();
+  await prisma.supplierClaim.update({
+    where: { id: claim.id },
+    data: {
+      emailedAt: now,
+      emailedTo: to,
+      ...(claim.status === "open" ? { status: "submitted", submittedAt: now } : {}),
+    },
+  });
+  return { ok: true, emailedTo: to };
+}

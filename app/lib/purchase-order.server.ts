@@ -1,4 +1,5 @@
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
+import type { Prisma } from "@prisma/client";
 import prisma from "../db.server";
 import {
   applyLocalStockState,
@@ -7,7 +8,7 @@ import {
   resolveDefaultLocationId,
 } from "./stock.server";
 import { ClaimError, openClaim, type NewClaimLine } from "./supplier-claim.server";
-import { postReceiptBill } from "./supplier-ledger.server";
+import { postReceiptBill, postReplacementShortfallCredit } from "./supplier-ledger.server";
 import { updateLeadTimeStats } from "./lead-time.server";
 import {
   OPEN_PO_STATUSES,
@@ -556,9 +557,16 @@ export async function receivePurchaseOrder(
     // One claim per delivery covers both what arrived damaged and, when closing short,
     // what never arrived. The stock is already where it belongs; if this fails the
     // merchant is told and can open the claim by hand from the PO page.
+    // A replacement PO's shortfall is credited rather than claimed: the supplier already
+    // accepted these units once.
+    if (po.replacesClaimId && cancelledLines.length > 0) {
+      await prisma.$transaction((tx) =>
+        creditUndeliveredReplacements(tx, shop, po, cancelledLines, options.userId),
+      );
+    }
     const claimLines: NewClaimLine[] = [
       ...damagedClaimLines,
-      ...(options.claimMissing
+      ...(options.claimMissing && !po.replacesClaimId
         ? cancelledLines.map((c) => ({
             purchaseOrderItemId: c.purchaseOrderItemId,
             type: "missing" as const,
@@ -601,7 +609,9 @@ export async function receivePurchaseOrder(
     // observation beats inventing a send date and poisoning the supplier's variance. Later
     // deliveries against the same PO are not new observations: counting a backorder as a
     // second lead time would weight one PO twice.
-    if (firstDelivery && po.supplierId && po.sentAt) {
+    // Replacement shipments are excluded: their clock starts when a claim was settled, not
+  // when goods were ordered, and they would skew the supplier's lead time.
+  if (firstDelivery && po.supplierId && po.sentAt && !po.replacesClaimId) {
       await recordSupplierLeadTime(shop, po.supplierId, po.sentAt, receivedAt);
     }
 
@@ -639,6 +649,40 @@ async function cancelOutstanding(
     cancelled.push({ purchaseOrderItemId: item.id, quantity: remaining });
   }
   return cancelled;
+}
+
+/**
+ * Credit the undelivered part of a replacement PO, at what the merchant originally paid.
+ *
+ * Every replacement line points at the claim line it replaces; that line's unitCost is
+ * the original price, since the replacement line itself costs nothing.
+ */
+async function creditUndeliveredReplacements(
+  tx: Prisma.TransactionClient,
+  shop: string,
+  po: { id: string; poNumber: string; supplierId: string | null; items: { id: string; replacesClaimLineId: string | null }[] },
+  cancelled: { purchaseOrderItemId: string; quantity: number }[],
+  userId?: string | null,
+): Promise<void> {
+  if (!po.supplierId) return;
+  const lineFor = new Map(po.items.map((i) => [i.id, i.replacesClaimLineId]));
+  const claimLines = await tx.supplierClaimLine.findMany({
+    where: { id: { in: po.items.map((i) => i.replacesClaimLineId).filter((id): id is string => !!id) } },
+    select: { id: true, unitCost: true },
+  });
+  const costOf = new Map(claimLines.map((l) => [l.id, l.unitCost]));
+  const credit = cancelled.reduce(
+    (s, c) => s + c.quantity * (costOf.get(lineFor.get(c.purchaseOrderItemId) ?? "") ?? 0),
+    0,
+  );
+  await postReplacementShortfallCredit(tx, {
+    shop,
+    supplierId: po.supplierId,
+    purchaseOrderId: po.id,
+    poNumber: po.poNumber,
+    credit,
+    userId,
+  });
 }
 
 /**
@@ -698,7 +742,9 @@ export async function closePurchaseOrderRemainder(
         data: { status: derivePoStatus(fresh, po.status as POStatus) },
       });
       let claimId: string | undefined;
-      if (options.claimMissing) {
+      if (po.replacesClaimId) {
+        await creditUndeliveredReplacements(tx, shop, po, cancelled, options.userId);
+      } else if (options.claimMissing) {
         const claim = await openClaim(
           tx,
           shop,

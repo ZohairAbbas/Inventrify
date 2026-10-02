@@ -170,6 +170,37 @@ export async function postClaimCredit(
   });
 }
 
+/**
+ * Credit replacement goods the supplier agreed to send but never did.
+ *
+ * The claim that raised the replacement PO posted no credit — goods were coming instead.
+ * When the merchant closes that PO short, the undelivered units fall back to a credit at
+ * what was originally paid for them.
+ */
+export async function postReplacementShortfallCredit(
+  db: Db,
+  args: {
+    shop: string;
+    supplierId: string;
+    purchaseOrderId: string;
+    poNumber: string;
+    credit: number;
+    userId?: string | null;
+  },
+): Promise<void> {
+  await postAutoEntry(db, {
+    shop: args.shop,
+    supplierId: args.supplierId,
+    type: "credit_note",
+    amount: args.credit,
+    occurredAt: new Date(),
+    sourceKey: `replacement:${args.purchaseOrderId}:credit`,
+    purchaseOrderId: args.purchaseOrderId,
+    note: `Replacements never delivered on ${args.poNumber}`,
+    userId: args.userId,
+  });
+}
+
 /** Ceiling on a single manual entry; anything above is almost certainly a typo. */
 const MAX_ENTRY = 1_000_000_000;
 

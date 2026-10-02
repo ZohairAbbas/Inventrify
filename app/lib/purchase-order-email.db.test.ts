@@ -93,6 +93,7 @@ beforeEach(async () => {
   await prisma.purchaseOrderItem.deleteMany({ where: { purchaseOrder: { shop: SHOP } } });
   await prisma.purchaseOrder.deleteMany({ where: { shop: SHOP } });
   await prisma.product.deleteMany({ where: { shop: SHOP } });
+  await prisma.supplierLedgerEntry.deleteMany({ where: { shop: SHOP } });
   await prisma.supplier.deleteMany({ where: { shop: SHOP } });
   await prisma.shopSettings.deleteMany({ where: { shop: SHOP } });
   await prisma.shopSettings.create({

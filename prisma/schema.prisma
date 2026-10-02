@@ -103,6 +103,7 @@ model Supplier {
   products       Product[]
   purchaseOrders PurchaseOrder[]
   claims         SupplierClaim[]
+  ledgerEntries  SupplierLedgerEntry[]
 
   @@index([shop])
 }
@@ -824,4 +825,46 @@ model SupplierClaimLine {
   @@index([claimId])
   @@index([purchaseOrderItemId])
   @@index([productId])
+}
+
+// The merchant's account with a supplier: an append-only list of money movements whose
+// sum is the balance. Positive = the merchant owes the supplier; negative = the supplier
+// owes the merchant (a payment in advance, or a credit not yet used up). Corrections are
+// reversal entries, never edits, so the history always explains the balance.
+//
+//   bill         +  goods received, at the PO line's unit cost (posted per receipt), and
+//                   units claimed as invoiced-but-never-sent (posted with the claim)
+//   payment      -  merchant paid the supplier
+//   credit_note  -  supplier credited the merchant (posted when a claim is resolved)
+//   refund       +  supplier paid money back, using up a credit
+//   adjustment   ±  anything else: opening balance, freight charged, a discount
+//   reversal     ±  the exact negation of one earlier entry
+model SupplierLedgerEntry {
+  id              String   @id @default(cuid())
+  shop            String
+  supplierId      String
+  supplier        Supplier @relation(fields: [supplierId], references: [id])
+  type            String
+  // Signed, in `currency`. Decimal, not Float: this column is summed into a balance, and
+  // binary floating point drifts by fractions of a paisa per entry.
+  amount          Decimal  @db.Decimal(14, 2)
+  // The store's currency when the entry was posted. One currency per shop for now; kept
+  // per row so supporting supplier currencies later needs no backfill.
+  currency        String
+  occurredAt      DateTime
+  reference       String?  // invoice, receipt or bank reference the merchant gave
+  note            String?
+  purchaseOrderId String?
+  claimId         String?
+  receiptId       String?
+  // What posted this entry automatically, e.g. "receipt:<id>". Unique, so a receipt or a
+  // claim resolution can never be billed or credited twice, however it is retried.
+  sourceKey       String?  @unique
+  // Set on a reversal, naming the entry it undoes. Unique: an entry is reversed once.
+  reversalOf      String?  @unique
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+
+  @@index([shop, supplierId, occurredAt])
+  @@index([purchaseOrderId])
 }

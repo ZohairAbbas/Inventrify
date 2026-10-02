@@ -2,6 +2,13 @@ import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
 import { applyLocationDelta, resolveDefaultLocationId } from "./stock.server";
 import { updateLeadTimeStats } from "./lead-time.server";
+import {
+  OPEN_PO_STATUSES,
+  RECEIVABLE_PO_STATUSES,
+  derivePoStatus,
+  outstandingQuantity,
+  type POStatus,
+} from "./purchase-order-status";
 
 /**
  * The purchase-order lifecycle, in one place.
@@ -20,6 +27,10 @@ import { updateLeadTimeStats } from "./lead-time.server";
  * Those are exactly the "legacy" oddities recorded in docs/data-audit.md; the list page
  * was still producing them. Both routes now call the functions below, so there is only
  * one definition of what "sent" and "received" mean.
+ *
+ * A PO can arrive in several deliveries. Each one is a PurchaseOrderReceipt; between
+ * them the PO is `partially_received` and the remainder stays on order, until either the
+ * rest arrives (`received`) or the merchant stops expecting it (`closed`).
  */
 
 export interface DraftLineInput {
@@ -89,7 +100,7 @@ export interface ReceiveLineResult {
   productId: string;
   /** Quantity now recorded as received on the line. */
   quantityReceived: number;
-  /** Units actually moved by this receipt (may be negative when correcting downward). */
+  /** Units moved by this receipt. Never negative: received quantities only go up. */
   delta: number;
   /** Set when the stock movement failed; the line's quantityReceived is left unchanged. */
   error?: string;
@@ -110,7 +121,18 @@ export interface ReceiveResult {
   shopifyWarnings: string[];
   /** True when the receipt was recorded against a location rather than the aggregate. */
   locationScoped: boolean;
+  /** The PO's status after this receipt. */
+  status?: POStatus;
+  /**
+   * Set when `closeRemaining` was asked for but not done. A line that failed to move may
+   * be stock that physically arrived; cancelling its remainder would write it off as
+   * never delivered.
+   */
+  closeSkipped?: string;
 }
+
+const STALE_ERROR =
+  "This purchase order changed since you opened it — reload the page and try again.";
 
 /**
  * Mark a draft PO as sent.
@@ -149,13 +171,54 @@ export async function markPurchaseOrderSent(
   return { ok: true };
 }
 
+/** Why a PO in this status cannot take a receipt or a close. */
+function closedStatusError(status: string): string {
+  if (status === "received") return "Already received";
+  if (status === "closed") return "This purchase order is closed";
+  return "This purchase order cannot be received";
+}
+
 /**
- * Receive a purchase order, moving stock through the audited per-location path.
+ * Claim the right to change a PO's receipt state.
  *
- * `quantities` maps PurchaseOrderItem.id -> the total quantity now received on that line.
- * Omitted lines default to the full ordered quantity, which is what the list page's
- * one-click "Mark received" wants. Only the not-yet-received remainder moves, so
- * re-confirming a partially received PO cannot double-count stock.
+ * A PO can be received in several deliveries now, so the old guard — flip the status to
+ * `received` before moving any stock — no longer works: the status after a delivery may
+ * well still be open. Instead every receipt and close bumps `receiptVersion` with a
+ * guarded `updateMany`, which is atomic: of two requests that read the same version,
+ * exactly one sees count === 1. That covers both a double-submit and a second browser tab
+ * that was opened before the first delivery was booked.
+ */
+async function claimReceiptVersion(
+  db: Pick<typeof prisma, "purchaseOrder">,
+  shop: string,
+  poId: string,
+  version: number,
+  statuses: POStatus[],
+): Promise<boolean> {
+  const { count } = await db.purchaseOrder.updateMany({
+    where: { id: poId, shop, receiptVersion: version, status: { in: statuses } },
+    data: { receiptVersion: { increment: 1 } },
+  });
+  return count === 1;
+}
+
+/**
+ * Book a delivery against a purchase order, moving stock through the audited
+ * per-location path.
+ *
+ * `quantities` maps PurchaseOrderItem.id -> the TOTAL quantity received on that line so
+ * far, including this delivery. Totals rather than increments make a repeated submit of
+ * the same form harmless: the second one asks for nothing new. Omitted lines default to
+ * the full ordered quantity, which is what the list page's one-click "Mark received"
+ * wants; on a partially received PO that means "the rest has arrived".
+ *
+ * Received quantities only go up. A delivery that turns out to be short or damaged after
+ * it was booked is a stock adjustment, not a rewrite of what the receipt said arrived.
+ *
+ * After the delivery the PO is `received` if nothing is outstanding, otherwise
+ * `partially_received` and the remainder stays on order — unless `closeRemaining` says
+ * the supplier will not send it, in which case the remainder is cancelled and the PO is
+ * `closed`.
  */
 export async function receivePurchaseOrder(
   admin: AdminApiContext,
@@ -165,6 +228,12 @@ export async function receivePurchaseOrder(
     actualDeliveryDate?: Date | null;
     locationId?: string | null;
     quantities?: Record<string, number | undefined>;
+    /** The receiptVersion the caller's page was rendered with, when it has one. */
+    expectedVersion?: number | null;
+    /** Cancel whatever is still outstanding once this delivery is booked. */
+    closeRemaining?: boolean;
+    /** Shopify staff user id (session token `sub`) of whoever booked the delivery. */
+    userId?: string | null;
   } = {},
 ): Promise<ReceiveResult> {
   const empty = {
@@ -180,35 +249,21 @@ export async function receivePurchaseOrder(
     include: { items: true },
   });
   if (!po) return { ok: false, error: "Purchase order not found", ...empty };
-  if (po.status === "received") return { ok: false, error: "Already received", ...empty };
+  if (!RECEIVABLE_PO_STATUSES.includes(po.status as POStatus)) {
+    return { ok: false, error: closedStatusError(po.status), ...empty };
+  }
   if (po.items.length === 0) {
     return { ok: false, error: "This purchase order has no line items to receive", ...empty };
   }
+  if (options.expectedVersion != null && options.expectedVersion !== po.receiptVersion) {
+    return { ok: false, error: STALE_ERROR, ...empty };
+  }
 
-  const receiptLocationId = await resolveDefaultLocationId(shop, options.locationId ?? null);
-  const receivedAt = options.actualDeliveryDate ?? new Date();
-
-  // Claim the PO before moving any stock.
-  //
-  // The status check above is a read, and a read cannot stop a second request that has
-  // already passed the same read — a double-submit would run the whole receipt twice and
-  // add the stock twice. Flipping the status in a guarded `updateMany` is atomic: exactly
-  // one caller sees count === 1. This is the same reasoning as the unique index that
-  // guards adjustment reversals.
-  //
-  // If nothing can then be received the claim is released below, so a failed attempt does
-  // not strand the PO in `received` with an empty receipt.
-  const claim = await prisma.purchaseOrder.updateMany({
-    where: { id: po.id, shop, status: { not: "received" } },
-    data: { status: "received", actualDeliveryDate: receivedAt },
-  });
-  if (claim.count === 0) return { ok: false, error: "Already received", ...empty };
-  const previousStatus = po.status;
-
+  // Work out every line's movement before touching anything, so a request that is wrong
+  // on every line is turned away without claiming the PO.
   const lines: ReceiveLineResult[] = [];
-  const shopifyWarnings: string[] = [];
+  const toMove: { item: (typeof po.items)[number]; delta: number }[] = [];
   let failed = 0;
-  let moved = 0;
 
   for (const item of po.items) {
     const requested = options.quantities?.[item.id];
@@ -216,35 +271,61 @@ export async function receivePurchaseOrder(
     // ordered quantity — leave the line exactly as it was and say so.
     const target =
       requested === undefined
-        ? item.quantityOrdered
+        ? Math.max(item.quantityReceived, item.quantityOrdered)
         : Number.isFinite(requested) && (requested as number) >= 0
           ? Math.floor(requested as number)
           : null;
 
-    if (target === null) {
+    const error =
+      target === null
+        ? "Invalid received quantity"
+        : target < item.quantityReceived
+          ? `Received quantity cannot go below the ${item.quantityReceived} already received — record missing or damaged units as a stock adjustment`
+          : null;
+
+    if (error !== null || target === null) {
       failed++;
       lines.push({
         itemId: item.id,
         productId: item.productId,
         quantityReceived: item.quantityReceived,
         delta: 0,
-        error: "Invalid received quantity",
+        error: error ?? "Invalid received quantity",
       });
-      continue;
+    } else if (target === item.quantityReceived) {
+      lines.push({ itemId: item.id, productId: item.productId, quantityReceived: target, delta: 0 });
+    } else {
+      toMove.push({ item, delta: target - item.quantityReceived });
     }
+  }
 
-    const delta = target - item.quantityReceived;
+  if (failed > 0 && toMove.length === 0) {
+    return {
+      ok: false,
+      error: lines.find((l) => l.error)?.error ?? "No stock could be received",
+      ...empty,
+      lines,
+      failed,
+    };
+  }
 
-    if (delta === 0) {
-      lines.push({
-        itemId: item.id,
-        productId: item.productId,
-        quantityReceived: target,
-        delta: 0,
-      });
-      continue;
-    }
+  const receiptLocationId = await resolveDefaultLocationId(shop, options.locationId ?? null);
+  const receivedAt = options.actualDeliveryDate ?? new Date();
 
+  if (!(await claimReceiptVersion(prisma, shop, po.id, po.receiptVersion, RECEIVABLE_PO_STATUSES))) {
+    const now = await prisma.purchaseOrder.findFirst({ where: { id: po.id }, select: { status: true } });
+    const error =
+      now && !RECEIVABLE_PO_STATUSES.includes(now.status as POStatus)
+        ? closedStatusError(now.status)
+        : STALE_ERROR;
+    return { ok: false, error, ...empty };
+  }
+
+  const shopifyWarnings: string[] = [];
+  const receiptLines: { purchaseOrderItemId: string; quantity: number }[] = [];
+  let moved = 0;
+
+  for (const { item, delta } of toMove) {
     let lineError: string | undefined;
     let lineShopifyError: string | undefined;
 
@@ -282,34 +363,27 @@ export async function receivePurchaseOrder(
       continue;
     }
 
+    // Incremented, not set: the database does the arithmetic, as for every other
+    // stock-bearing counter in the app.
     await prisma.purchaseOrderItem.update({
       where: { id: item.id },
-      data: { quantityReceived: target },
+      data: { quantityReceived: { increment: delta } },
     });
+    item.quantityReceived += delta;
+    receiptLines.push({ purchaseOrderItemId: item.id, quantity: delta });
     moved++;
     lines.push({
       itemId: item.id,
       productId: item.productId,
-      quantityReceived: target,
+      quantityReceived: item.quantityReceived,
       delta,
       shopifyError: lineShopifyError,
     });
   }
 
-  // Nothing was received but something went wrong: marking the PO received would record
-  // a delivery that did not happen and permanently close the receipt path.
-  //
-  // Keyed on `failed`, not on whether a movement was attempted — an unparseable quantity
-  // fails before any movement is tried, and an earlier version of this check missed that
-  // case and closed the PO anyway. A PO whose lines are all already at the right
-  // quantity has failed nothing and is legitimately closed out here.
-  if (failed > 0 && moved === 0) {
-    // Release the claim: the PO received nothing, so leaving it marked received would
-    // record a delivery that did not happen and close the receipt path for good.
-    await prisma.purchaseOrder.update({
-      where: { id: po.id },
-      data: { status: previousStatus, actualDeliveryDate: po.actualDeliveryDate },
-    });
+  // Lines that had stock to move and all failed: nothing arrived as far as the record
+  // goes, so the PO stays exactly where it was (bar the version bump, which is harmless).
+  if (moved === 0 && toMove.length > 0) {
     return {
       ok: false,
       error: lines.find((l) => l.error)?.error ?? "No stock could be received",
@@ -321,12 +395,48 @@ export async function receivePurchaseOrder(
     };
   }
 
-  // Status and delivery date were already set by the claim above.
+  if (receiptLines.length > 0) {
+    await prisma.purchaseOrderReceipt.create({
+      data: {
+        shop,
+        purchaseOrderId: po.id,
+        receivedAt,
+        locationId: receiptLocationId,
+        createdByUserId: options.userId ?? null,
+        lines: { create: receiptLines },
+      },
+    });
+  }
 
-  // Lead time is measured from when the PO was actually sent. A PO received without ever
-  // being marked sent contributes nothing — skipping the observation beats inventing a
-  // send date and poisoning the supplier's variance.
-  if (po.supplierId && po.sentAt) {
+  let closeSkipped: string | undefined;
+  if (options.closeRemaining) {
+    if (failed > 0) {
+      closeSkipped =
+        "The remainder was left on order because some lines could not be received — fix those first, then close it";
+    } else {
+      await cancelOutstanding(prisma, po.items);
+    }
+  }
+
+  const fresh = await prisma.purchaseOrderItem.findMany({
+    where: { purchaseOrderId: po.id },
+    select: { quantityOrdered: true, quantityReceived: true, quantityCancelled: true },
+  });
+  const status = derivePoStatus(fresh, po.status as POStatus);
+
+  // actualDeliveryDate is the FIRST delivery; a later top-up does not move it.
+  const firstDelivery = moved > 0 && po.actualDeliveryDate === null;
+  await prisma.purchaseOrder.update({
+    where: { id: po.id },
+    data: { status, ...(firstDelivery ? { actualDeliveryDate: receivedAt } : {}) },
+  });
+
+  // Lead time is measured from when the PO was actually sent to when stock first arrived.
+  // A PO received without ever being marked sent contributes nothing — skipping the
+  // observation beats inventing a send date and poisoning the supplier's variance. Later
+  // deliveries against the same PO are not new observations: counting a backorder as a
+  // second lead time would weight one PO twice.
+  if (firstDelivery && po.supplierId && po.sentAt) {
     await recordSupplierLeadTime(shop, po.supplierId, po.sentAt, receivedAt);
   }
 
@@ -337,7 +447,79 @@ export async function receivePurchaseOrder(
     moved,
     shopifyWarnings,
     locationScoped: !!receiptLocationId,
+    status,
+    closeSkipped,
   };
+}
+
+/** Cancel every line's outstanding remainder. */
+async function cancelOutstanding(
+  db: Pick<typeof prisma, "purchaseOrderItem">,
+  items: { id: string; quantityOrdered: number; quantityReceived: number; quantityCancelled: number }[],
+): Promise<number> {
+  let cancelled = 0;
+  for (const item of items) {
+    const remaining = outstandingQuantity(item);
+    if (remaining === 0) continue;
+    await db.purchaseOrderItem.update({
+      where: { id: item.id },
+      data: { quantityCancelled: { increment: remaining } },
+    });
+    cancelled += remaining;
+  }
+  return cancelled;
+}
+
+/**
+ * Stop expecting whatever is still outstanding on an open PO — the supplier has said the
+ * rest is not coming, or the merchant has given up on it.
+ *
+ * The cancelled units leave "on order" (so planning reorders them from someone else) and
+ * the PO becomes `closed`. Stock is not touched: cancelled units never arrived.
+ */
+export async function closePurchaseOrderRemainder(
+  shop: string,
+  poId: string,
+  options: { expectedVersion?: number | null } = {},
+): Promise<{ ok: boolean; error?: string; cancelled?: number }> {
+  const po = await prisma.purchaseOrder.findFirst({
+    where: { id: poId, shop },
+    include: { items: true },
+  });
+  if (!po) return { ok: false, error: "Purchase order not found" };
+  if (!OPEN_PO_STATUSES.includes(po.status as POStatus)) {
+    return {
+      ok: false,
+      error:
+        po.status === "draft"
+          ? "A draft has nothing on order — delete it instead"
+          : closedStatusError(po.status),
+    };
+  }
+  if (options.expectedVersion != null && options.expectedVersion !== po.receiptVersion) {
+    return { ok: false, error: STALE_ERROR };
+  }
+  if (po.items.every((i) => outstandingQuantity(i) === 0)) {
+    return { ok: false, error: "Nothing is outstanding on this purchase order" };
+  }
+
+  // No Shopify call is involved, so the claim, the cancellations and the status change
+  // can be one transaction.
+  return prisma.$transaction(async (tx) => {
+    if (!(await claimReceiptVersion(tx, shop, po.id, po.receiptVersion, OPEN_PO_STATUSES))) {
+      return { ok: false, error: STALE_ERROR };
+    }
+    const cancelled = await cancelOutstanding(tx, po.items);
+    const fresh = await tx.purchaseOrderItem.findMany({
+      where: { purchaseOrderId: po.id },
+      select: { quantityOrdered: true, quantityReceived: true, quantityCancelled: true },
+    });
+    await tx.purchaseOrder.update({
+      where: { id: po.id },
+      data: { status: derivePoStatus(fresh, po.status as POStatus) },
+    });
+    return { ok: true, cancelled };
+  });
 }
 
 /**

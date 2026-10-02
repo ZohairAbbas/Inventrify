@@ -39,7 +39,11 @@ export async function purgeShopData(
   });
   await prisma.stockCount.deleteMany({ where: { shop } });
 
-  // Purchase orders: likewise.
+  // Purchase orders: likewise. Receipt lines reference PO items, so receipts go first.
+  await prisma.purchaseOrderReceiptLine.deleteMany({
+    where: { receipt: { shop } },
+  });
+  await prisma.purchaseOrderReceipt.deleteMany({ where: { shop } });
   await prisma.purchaseOrderItem.deleteMany({
     where: { purchaseOrder: { shop } },
   });

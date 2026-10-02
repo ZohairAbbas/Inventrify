@@ -23,6 +23,7 @@ if (!/_test(\?|$)/.test(process.env.DATABASE_URL ?? "")) {
 }
 
 const {
+  closePurchaseOrderRemainder,
   markPurchaseOrderSent,
   receivePurchaseOrder,
   parseReceivedQuantities,
@@ -30,6 +31,7 @@ const {
   validateSupplierId,
 } = await import("./purchase-order.server");
 const { default: prisma } = await import("../db.server");
+const { getInventoryPositions } = await import("./planning.server");
 
 const SHOP = "po-test.myshopify.com";
 const OTHER_SHOP = "other-po-test.myshopify.com";
@@ -143,6 +145,7 @@ async function createPo(
 
 beforeEach(async () => {
   for (const shop of [SHOP, OTHER_SHOP]) {
+    await prisma.purchaseOrderReceipt.deleteMany({ where: { shop } });
     await prisma.purchaseOrderItem.deleteMany({ where: { purchaseOrder: { shop } } });
     await prisma.purchaseOrder.deleteMany({ where: { shop } });
     await prisma.stockAdjustment.deleteMany({ where: { shop } });
@@ -450,7 +453,7 @@ describe("receivePurchaseOrder", () => {
     expect(item.quantityReceived).toBe(10);
   });
 
-  it("releases the claim when nothing could be received", async () => {
+  it("leaves the PO untouched when nothing could be received", async () => {
     const { product } = await seed({ stock: 2 });
     const po = await createPo(product.id, { quantityOrdered: 10, status: "sent" });
     const { admin } = mockAdmin();
@@ -460,8 +463,8 @@ describe("receivePurchaseOrder", () => {
     });
     expect(result.ok).toBe(false);
 
-    // The PO must go back to `sent`, not sit in `received` with an empty receipt — that
-    // would close the receipt path permanently for a delivery that never happened.
+    // The PO must stay `sent`, not sit in `received` with an empty receipt — that would
+    // close the receipt path permanently for a delivery that never happened.
     const after = await prisma.purchaseOrder.findUniqueOrThrow({ where: { id: po.id } });
     expect(after.status).toBe("sent");
     expect(after.actualDeliveryDate).toBeNull();
@@ -481,6 +484,250 @@ describe("receivePurchaseOrder", () => {
     const result = await receivePurchaseOrder(admin, SHOP, po.id);
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/no line items/i);
+  });
+});
+
+describe("partial deliveries", () => {
+  async function onOrder(productId: string) {
+    const positions = await getInventoryPositions(SHOP, [productId]);
+    return positions.get(productId)?.onOrder;
+  }
+
+  it("keeps a short delivery open, with the remainder still on order", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    const { admin } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [po.items[0].id]: 6 },
+      actualDeliveryDate: new Date("2026-07-10T00:00:00Z"),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.status).toBe("partially_received");
+    const after = await prisma.purchaseOrder.findUniqueOrThrow({
+      where: { id: po.id },
+      include: { receipts: { include: { lines: true } } },
+    });
+    expect(after.status).toBe("partially_received");
+    expect(after.actualDeliveryDate?.toISOString()).toBe("2026-07-10T00:00:00.000Z");
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0].lines[0].quantity).toBe(6);
+    // The bug this replaces: the PO went to `received` and planning, which only counted
+    // `sent` POs, forgot the 4 units the supplier still owed.
+    expect(await onOrder(product.id)).toBe(4);
+  });
+
+  it("completes on a second delivery without moving the first-delivery date or lead time", async () => {
+    const { product, supplier } = await seed();
+    const po = await createPo(product.id, { supplierId: supplier.id, quantityOrdered: 10 });
+    const { admin, pushed } = mockAdmin();
+
+    await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [po.items[0].id]: 6 },
+      actualDeliveryDate: new Date("2026-07-09T00:00:00Z"),
+    });
+    const second = await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [po.items[0].id]: 10 },
+      actualDeliveryDate: new Date("2026-07-20T00:00:00Z"),
+    });
+
+    expect(second.ok).toBe(true);
+    expect(second.status).toBe("received");
+    expect(pushed.map((p) => p.delta)).toEqual([6, 4]);
+
+    const after = await prisma.purchaseOrder.findUniqueOrThrow({
+      where: { id: po.id },
+      include: { receipts: true },
+    });
+    expect(after.receipts).toHaveLength(2);
+    expect(after.actualDeliveryDate?.toISOString()).toBe("2026-07-09T00:00:00.000Z");
+    const stock = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    expect(stock.currentStock).toBe(10);
+
+    // One PO, one lead-time observation — the backorder is not a second sample.
+    const sup = await prisma.supplier.findUniqueOrThrow({ where: { id: supplier.id } });
+    expect(sup.totalPosReceived).toBe(1);
+    expect(sup.avgActualLeadTime).toBe(8);
+    expect(await onOrder(product.id)).toBe(0);
+  });
+
+  it("one-click receive on a partially received PO books only the remainder", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    const { admin, pushed } = mockAdmin();
+
+    await receivePurchaseOrder(admin, SHOP, po.id, { quantities: { [po.items[0].id]: 3 } });
+    const rest = await receivePurchaseOrder(admin, SHOP, po.id);
+
+    expect(rest.status).toBe("received");
+    expect(pushed.map((p) => p.delta)).toEqual([3, 7]);
+  });
+
+  it("closes short: cancels the remainder and takes it off order", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    const { admin } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [po.items[0].id]: 7 },
+      closeRemaining: true,
+    });
+
+    expect(result.status).toBe("closed");
+    const item = await prisma.purchaseOrderItem.findFirstOrThrow({ where: { purchaseOrderId: po.id } });
+    expect(item.quantityReceived).toBe(7);
+    expect(item.quantityCancelled).toBe(3);
+    expect(await onOrder(product.id)).toBe(0);
+
+    // Closed is final: nothing more can be booked against it.
+    const again = await receivePurchaseOrder(admin, SHOP, po.id);
+    expect(again.ok).toBe(false);
+    expect(again.error).toMatch(/closed/i);
+  });
+
+  it("is `received`, not `closed`, when the delivery was complete anyway", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    const { admin } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id, { closeRemaining: true });
+    expect(result.status).toBe("received");
+  });
+
+  it("does not close short when a line failed — that stock may have arrived", async () => {
+    const { product } = await seed();
+    const other = await prisma.product.create({
+      data: { id: "gid://shopify/ProductVariant/po-2", shop: SHOP, productGid: "gid://shopify/Product/po-2", title: "Shalwar" },
+    });
+    const po = await prisma.purchaseOrder.create({
+      data: {
+        shop: SHOP,
+        poNumber: "PO-TWO-LINES",
+        status: "sent",
+        items: {
+          create: [
+            { productId: product.id, quantityOrdered: 10 },
+            { productId: other.id, quantityOrdered: 5 },
+          ],
+        },
+      },
+      include: { items: true },
+    });
+    const [a, b] = po.items;
+    const { admin } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [a.id]: 4, [b.id]: NaN },
+      closeRemaining: true,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.failed).toBe(1);
+    expect(result.closeSkipped).toBeTruthy();
+    expect(result.status).toBe("partially_received");
+    const items = await prisma.purchaseOrderItem.findMany({ where: { purchaseOrderId: po.id } });
+    expect(items.every((i) => i.quantityCancelled === 0)).toBe(true);
+  });
+
+  it("refuses to lower a received quantity", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10, quantityReceived: 6, status: "partially_received" });
+    const { admin, pushed } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [po.items[0].id]: 2 },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/cannot go below/i);
+    expect(pushed).toHaveLength(0);
+  });
+
+  it("rejects a page rendered before the last delivery was booked", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    const { admin } = mockAdmin();
+
+    // Tab A books 6. Tab B was opened before that, still believes nothing has arrived,
+    // and books "4 in this delivery" as a running total of 4.
+    await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [po.items[0].id]: 6 },
+      expectedVersion: 0,
+    });
+    const stale = await receivePurchaseOrder(admin, SHOP, po.id, {
+      quantities: { [po.items[0].id]: 10 },
+      expectedVersion: 0,
+    });
+
+    expect(stale.ok).toBe(false);
+    expect(stale.error).toMatch(/reload/i);
+    const stock = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    expect(stock.currentStock).toBe(6);
+  });
+
+  it("books a delivery once when two submits of it race", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10, quantityReceived: 4, status: "partially_received" });
+    const { admin } = mockAdmin();
+
+    const opts = { quantities: { [po.items[0].id]: 7 }, expectedVersion: 0 };
+    const results = await Promise.all([
+      receivePurchaseOrder(admin, SHOP, po.id, opts),
+      receivePurchaseOrder(admin, SHOP, po.id, opts),
+    ]);
+
+    expect(results.filter((r) => r.ok)).toHaveLength(1);
+    const item = await prisma.purchaseOrderItem.findFirstOrThrow({ where: { purchaseOrderId: po.id } });
+    expect(item.quantityReceived).toBe(7);
+    expect(await prisma.purchaseOrderReceipt.count({ where: { purchaseOrderId: po.id } })).toBe(1);
+  });
+
+  it("treats a repeated identical submit as asking for nothing new", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    const { admin, pushed } = mockAdmin();
+
+    const opts = { quantities: { [po.items[0].id]: 5 } };
+    await receivePurchaseOrder(admin, SHOP, po.id, opts);
+    const again = await receivePurchaseOrder(admin, SHOP, po.id, opts);
+
+    expect(again.ok).toBe(true);
+    expect(again.moved).toBe(0);
+    expect(pushed).toHaveLength(1);
+    expect(await prisma.purchaseOrderReceipt.count({ where: { purchaseOrderId: po.id } })).toBe(1);
+  });
+});
+
+describe("closePurchaseOrderRemainder", () => {
+  it("cancels what is outstanding on a partially received PO", async () => {
+    const { product } = await seed({ stock: 0 });
+    const po = await createPo(product.id, { quantityOrdered: 10, quantityReceived: 6, status: "partially_received" });
+
+    const result = await closePurchaseOrderRemainder(SHOP, po.id, { expectedVersion: 0 });
+
+    expect(result).toEqual({ ok: true, cancelled: 4 });
+    const after = await prisma.purchaseOrder.findUniqueOrThrow({ where: { id: po.id }, include: { items: true } });
+    expect(after.status).toBe("closed");
+    expect(after.items[0].quantityCancelled).toBe(4);
+    // Cancelled units never arrived, so stock is untouched.
+    const stock = await prisma.product.findUniqueOrThrow({ where: { id: product.id } });
+    expect(stock.currentStock).toBe(0);
+  });
+
+  it("refuses drafts, finished POs, stale pages and other shops", async () => {
+    const { product } = await seed();
+    const draft = await createPo(product.id, { status: "draft", sentAt: null });
+    const done = await createPo(product.id, { quantityOrdered: 10, quantityReceived: 10, status: "received" });
+    const open = await createPo(product.id, { quantityOrdered: 10, quantityReceived: 6, status: "partially_received" });
+
+    expect((await closePurchaseOrderRemainder(SHOP, draft.id)).error).toMatch(/delete it/i);
+    expect((await closePurchaseOrderRemainder(SHOP, done.id)).error).toMatch(/already received/i);
+    expect((await closePurchaseOrderRemainder(SHOP, open.id, { expectedVersion: 3 })).error).toMatch(/reload/i);
+    expect((await closePurchaseOrderRemainder(OTHER_SHOP, open.id)).ok).toBe(false);
+
+    const untouched = await prisma.purchaseOrder.findUniqueOrThrow({ where: { id: open.id } });
+    expect(untouched.status).toBe("partially_received");
   });
 });
 

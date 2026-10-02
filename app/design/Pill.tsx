@@ -1,3 +1,7 @@
+import { PO_STATUS_LABELS, type POStatus } from "../lib/purchase-order-status";
+
+export type { POStatus };
+
 interface Props {
   label: string;
   bg: string;
@@ -22,12 +26,14 @@ export function Pill({ label, bg, fg }: Props) {
   );
 }
 
-export type POStatus = "draft" | "sent" | "received";
-
 const PO_STATUS: Record<POStatus, { bg: string; fg: string }> = {
   draft: { bg: "var(--inv-divider-3)", fg: "var(--inv-text-2)" },
   sent: { bg: "var(--inv-status-low-bg)", fg: "var(--inv-status-low-fg)" },
+  // Still waiting on the rest, so it reads as "in progress" like sent, not as done.
+  partially_received: { bg: "var(--inv-status-low-bg)", fg: "var(--inv-status-low-fg)" },
   received: { bg: "var(--inv-status-healthy-bg)", fg: "var(--inv-status-healthy-fg)" },
+  // Finished, but short — neutral rather than green so it is not mistaken for complete.
+  closed: { bg: "var(--inv-divider-3)", fg: "var(--inv-text-2)" },
 };
 
 export function poStatusMeta(status: string) {
@@ -36,7 +42,7 @@ export function poStatusMeta(status: string) {
 
 export function POStatusPill({ status }: { status: string }) {
   const s = poStatusMeta(status);
-  return <Pill label={status} bg={s.bg} fg={s.fg} />;
+  return <Pill label={PO_STATUS_LABELS[status as POStatus] ?? status} bg={s.bg} fg={s.fg} />;
 }
 
 export type TransferStatus = "draft" | "in-transit" | "received";

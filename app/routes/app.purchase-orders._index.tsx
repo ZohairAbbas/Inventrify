@@ -10,6 +10,7 @@ import { Button, Card, DataTable, FilterChips, PageHead, Pagination, POStatusPil
 import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
 import { useListParams } from "../lib/use-list-params";
 import { markPurchaseOrderSent, receivePurchaseOrder } from "../lib/purchase-order.server";
+import { outstandingQuantity } from "../lib/purchase-order-status";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -42,7 +43,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       // Only the quantities are read (line count, and the units in the receive
       // confirmation), so the product join is dropped — it fetched a title per line
       // that this page never rendered.
-      items: { select: { quantityOrdered: true } },
+      items: { select: { quantityOrdered: true, quantityReceived: true, quantityCancelled: true } },
     },
     orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     skip: page.skip,
@@ -53,7 +54,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { admin, session, sessionToken } = await authenticate.admin(request);
   const shop = session.shop;
   const formData = await request.formData();
   const intent = formData.get("intent") as string;
@@ -67,7 +68,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   // and recorded neither received quantities nor a delivery date — the receipt then
   // vanished at the next sync, which recomputes currentStock from per-location on-hand.
   if (intent === "mark_received") {
-    const result = await receivePurchaseOrder(admin, shop, poId);
+    // No quantities: every line is received up to what was ordered, so on a partially
+    // received PO this books only the remainder.
+    const result = await receivePurchaseOrder(admin, shop, poId, {
+      userId: sessionToken?.sub ?? null,
+    });
     if (!result.ok) {
       return { ok: false as const, error: result.error ?? "Could not receive", message: "" };
     }
@@ -79,7 +84,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     return {
       ok: true as const,
       error: problems.length > 0 ? problems.join("; ") : "",
-      message: "Received in full — stock updated",
+      message: "Remaining stock received — stock updated",
     };
   }
 
@@ -108,7 +113,9 @@ const STATUS_TABS = [
   { value: "all", label: "All" },
   { value: "draft", label: "Draft" },
   { value: "sent", label: "Sent" },
+  { value: "partially_received", label: "Partially received" },
   { value: "received", label: "Received" },
+  { value: "closed", label: "Closed short" },
 ];
 
 export default function PurchaseOrders() {
@@ -173,15 +180,17 @@ export default function PurchaseOrders() {
             Mark sent
           </button>
         )}
-        {po.status === "sent" && (
+        {(po.status === "sent" || po.status === "partially_received") && (
           <button
-            // Receives every line in full. Anything partial belongs on the detail page,
-            // where per-line quantities can be entered.
+            // Receives everything still outstanding. Anything partial belongs on the
+            // detail page, where per-line quantities can be entered.
             onClick={() => {
-              const units = po.items.reduce((s, i) => s + i.quantityOrdered, 0);
+              const open = po.items.filter((i) => outstandingQuantity(i) > 0);
+              const units = open.reduce((s, i) => s + outstandingQuantity(i), 0);
+              const what = po.status === "sent" ? "in full" : "the remaining units of";
               if (
                 window.confirm(
-                  `Receive ${po.poNumber} in full?\n\n${units} unit${units === 1 ? "" : "s"} across ${po.items.length} line${po.items.length === 1 ? "" : "s"} will be added to stock and pushed to Shopify.\n\nFor a partial delivery, open the PO instead.`,
+                  `Receive ${what} ${po.poNumber}?\n\n${units} unit${units === 1 ? "" : "s"} across ${open.length} line${open.length === 1 ? "" : "s"} will be added to stock and pushed to Shopify.\n\nFor a partial delivery, open the PO instead.`,
                 )
               ) {
                 submit({ intent: "mark_received", poId: po.id });
@@ -190,7 +199,7 @@ export default function PurchaseOrders() {
             disabled={fetcher.state !== "idle"}
             style={{ fontSize: "11.5px", border: "none", background: "var(--inv-ink)", color: "#fff", padding: "5px 10px", borderRadius: "8px", cursor: "pointer" }}
           >
-            Mark received
+            {po.status === "sent" ? "Mark received" : "Receive rest"}
           </button>
         )}
         {po.status === "draft" && (
@@ -215,7 +224,7 @@ export default function PurchaseOrders() {
       <TitleBar title="Purchase Orders" />
       <div style={{ maxWidth: "var(--inv-content-max)", margin: "0 auto", padding: "22px var(--inv-gutter) 80px" }}>
         <PageHead
-          eyebrow="draft → sent → received"
+          eyebrow="draft → sent → partially received → received"
           title="Purchase Orders"
           right={<Button variant="primary" onClick={() => navigate("/app/purchase-orders/new")}>+ Create PO</Button>}
         />

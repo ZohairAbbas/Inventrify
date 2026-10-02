@@ -1,4 +1,5 @@
 import prisma from "../db.server";
+import { OPEN_PO_STATUSES, outstandingQuantity } from "./purchase-order-status";
 
 /**
  * COD inventory planning.
@@ -152,13 +153,15 @@ export async function getInventoryPositions(
       where: { shop, ...idScope },
       _sum: { reserved: true },
     }),
-    // Outstanding = ordered minus already received, on POs that are sent.
+    // Outstanding = ordered minus received minus cancelled, on POs still expecting
+    // stock. Partially received POs count: a short delivery whose remainder is still on
+    // its way is supply, and dropping it would have planning reorder units already owed.
     prisma.purchaseOrderItem.findMany({
       where: {
         ...idScope,
-        purchaseOrder: { shop, status: "sent" },
+        purchaseOrder: { shop, status: { in: OPEN_PO_STATUSES } },
       },
-      select: { productId: true, quantityOrdered: true, quantityReceived: true },
+      select: { productId: true, quantityOrdered: true, quantityReceived: true, quantityCancelled: true },
     }),
   ]);
 
@@ -168,7 +171,7 @@ export async function getInventoryPositions(
 
   const onOrderById = new Map<string, number>();
   for (const item of onOrderRows) {
-    const outstanding = Math.max(0, item.quantityOrdered - item.quantityReceived);
+    const outstanding = outstandingQuantity(item);
     onOrderById.set(item.productId, (onOrderById.get(item.productId) ?? 0) + outstanding);
   }
 

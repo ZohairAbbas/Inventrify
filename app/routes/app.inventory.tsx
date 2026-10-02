@@ -162,6 +162,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           available: ls.onHand - ls.reserved,
           binLocation: ls.binLocation,
         })),
+        // Quarantined supplier defects. Not in stock or effectiveStock (onHand excludes
+        // them), but physically present, so the merchant should see where they went.
+        quarantined: p.locationStock
+          .filter((ls) => locationFilter === "all" || ls.locationId === locationFilter)
+          .reduce((s, ls) => s + ls.damaged, 0),
         // Status is judged on inventory position (on-hand less reserved, plus stock
         // already on order and coming back from RTO) rather than raw on-hand, so a SKU
         // that was reordered yesterday stops being flagged as critical today.
@@ -986,6 +991,13 @@ export default function Inventory() {
                 </div>
               )}
             </div>
+            {drawerProduct.quarantined > 0 && (
+              <div style={{ fontSize: "12px", marginBottom: "18px", padding: "9px 12px", background: "var(--inv-status-stockout-bg)", color: "var(--inv-status-stockout-fg)", borderRadius: "9px" }}>
+                {drawerProduct.quarantined} damaged unit{drawerProduct.quarantined === 1 ? " is" : "s are"} in quarantine for a
+                supplier claim — physically here, but not counted as stock and not for sale. Resolve{" "}
+                {drawerProduct.quarantined === 1 ? "it" : "them"} from the purchase order&apos;s claims.
+              </div>
+            )}
             {locations.length > 1 && drawerProduct.locationBreakdown.length > 0 && (
               <div style={{ marginBottom: "18px" }}>
                 <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginBottom: "8px" }}>Stock by location</div>

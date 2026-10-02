@@ -35,11 +35,18 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   // look rather than hunting the floor. One query keyed by (product, location).
   const bins = await prisma.productLocationStock.findMany({
     where: { locationId: count.locationId, productId: { in: count.items.map((i) => i.productId) } },
-    select: { productId: true, binLocation: true },
+    select: { productId: true, binLocation: true, damaged: true },
   });
   const binByProduct = Object.fromEntries(bins.map((b) => [b.productId, b.binLocation]));
+  // Quarantined supplier defects at this location. A count measures sellable stock (the
+  // snapshot is onHand, which excludes them), so a counter who includes them would post
+  // a phantom surplus — and that surplus would turn unsellable units back into sellable
+  // ones. The counter is told how many to leave out.
+  const quarantinedByProduct = Object.fromEntries(
+    bins.filter((b) => b.damaged > 0).map((b) => [b.productId, b.damaged]),
+  );
 
-  return { count, binByProduct };
+  return { count, binByProduct, quarantinedByProduct };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
@@ -103,7 +110,7 @@ function variance(item: Item): number | null {
 }
 
 export default function CountDetail() {
-  const { count, binByProduct } = useLoaderData<typeof loader>();
+  const { count, binByProduct, quarantinedByProduct } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const { timezone = "UTC", theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
@@ -238,6 +245,12 @@ export default function CountDetail() {
                     {binByProduct[item.productId] && (
                       <div style={{ fontSize: "11px", color: "var(--inv-accent)", fontFamily: "var(--inv-font-mono)" }}>
                         📍 {binByProduct[item.productId]}
+                      </div>
+                    )}
+                    {quarantinedByProduct[item.productId] > 0 && (
+                      <div style={{ fontSize: "11px", color: "var(--inv-status-critical-fg)" }}>
+                        Don&apos;t count the {quarantinedByProduct[item.productId]} quarantined (damaged) unit
+                        {quarantinedByProduct[item.productId] === 1 ? "" : "s"} held here for a supplier claim
                       </div>
                     )}
                   </div>

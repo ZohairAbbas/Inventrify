@@ -109,6 +109,18 @@ export async function openClaim(
     }
   }
 
+  // A replacement PO's lines cost nothing — the originals were billed — so a claim on
+  // replacement goods (the replacements arrived damaged too) is valued at what the
+  // merchant originally paid, taken from the claim line each one replaces.
+  const replacedIds = po.items.map((i) => i.replacesClaimLineId).filter((id): id is string => !!id);
+  const originalCost = new Map(
+    (
+      await tx.supplierClaimLine.findMany({ where: { id: { in: replacedIds } }, select: { id: true, unitCost: true } })
+    ).map((l) => [l.id, l.unitCost]),
+  );
+  const costOf = (item: (typeof po.items)[number]) =>
+    item.replacesClaimLineId ? (originalCost.get(item.replacesClaimLineId) ?? item.unitCost) : item.unitCost;
+
   const sequence = (await tx.supplierClaim.count({ where: { purchaseOrderId: po.id } })) + 1;
   const claim = await tx.supplierClaim.create({
     data: {
@@ -126,7 +138,7 @@ export async function openClaim(
             productId: item.productId,
             type: l.type,
             quantity: l.quantity,
-            unitCost: item.unitCost,
+            unitCost: costOf(item),
             stockSource: l.stockSource,
             locationId: l.locationId,
           };
@@ -346,28 +358,42 @@ export async function submitClaim(shop: string, claimId: string): Promise<{ ok: 
 /**
  * Record the supplier's answer, line by line, and resolve the claim.
  *
- * `creditAmount` defaults to accepted units at the PO line's unit cost — what the
- * merchant paid. It can be set to anything non-negative: suppliers negotiate (half off
- * for slightly damaged goods), and a replacement instead of a credit is a zero credit
- * with the units still accepted.
+ * Each line's accepted units are made good one of two ways:
+ *
+ *   credit       `creditAmount` goes on the supplier's account. It defaults to accepted
+ *                units at the PO line's unit cost — what the merchant paid — and can be
+ *                anything non-negative, because suppliers negotiate.
+ *   replacement  the supplier sends the goods again. A linked replacement PO is raised
+ *                for the accepted units at zero cost (the originals were already billed)
+ *                and they count as incoming stock until it is received. No credit.
  */
 export async function resolveClaim(
   shop: string,
   claimId: string,
-  decisions: { lineId: string; quantityAccepted: number; creditAmount?: number | null }[],
-): Promise<{ ok: boolean; error?: string }> {
+  decisions: {
+    lineId: string;
+    quantityAccepted: number;
+    creditAmount?: number | null;
+    remedy?: string | null;
+  }[],
+  opts: { userId?: string | null } = {},
+): Promise<{ ok: boolean; error?: string; replacementPoId?: string }> {
   try {
     return await prisma.$transaction(async (tx) => {
       // The lines are locked before they are read: accepted quantities are checked
       // against quantity minus found, and a `found` committing between that check and
       // this write would leave more accepted than is still claimed.
       await tx.$queryRaw`SELECT id FROM "SupplierClaimLine" WHERE "claimId" = ${claimId} FOR UPDATE`;
-      const claim = await tx.supplierClaim.findFirst({ where: { id: claimId, shop }, include: { lines: true } });
+      const claim = await tx.supplierClaim.findFirst({
+        where: { id: claimId, shop },
+        include: { lines: true, purchaseOrder: { select: { poNumber: true } } },
+      });
       if (!claim) throw new ClaimError("Claim not found");
       if (claim.status === "resolved") throw new ClaimError("This claim is already resolved");
 
       const byLine = new Map(decisions.map((d) => [d.lineId, d]));
       const updates: { id: string; data: Prisma.SupplierClaimLineUpdateInput }[] = [];
+      const replacements: { lineId: string; productId: string; quantity: number }[] = [];
       for (const line of claim.lines) {
         const d = byLine.get(line.id);
         if (!d) throw new ClaimError("Record a decision for every line");
@@ -375,12 +401,17 @@ export async function resolveClaim(
         if (!Number.isInteger(d.quantityAccepted) || d.quantityAccepted < 0 || d.quantityAccepted > effective) {
           throw new ClaimError(`Accepted quantity must be between 0 and ${effective}`);
         }
-        const credit = d.creditAmount ?? d.quantityAccepted * line.unitCost;
+        const remedy = d.remedy ?? "credit";
+        if (remedy !== "credit" && remedy !== "replacement") throw new ClaimError("Unknown remedy");
+        const replacing = remedy === "replacement" && d.quantityAccepted > 0;
+        const credit = replacing ? 0 : (d.creditAmount ?? d.quantityAccepted * line.unitCost);
         if (!Number.isFinite(credit) || credit < 0) throw new ClaimError("Credit must be zero or more");
+        if (replacing) replacements.push({ lineId: line.id, productId: line.productId, quantity: d.quantityAccepted });
         updates.push({
           id: line.id,
           data: {
             quantityAccepted: d.quantityAccepted,
+            remedy: replacing ? "replacement" : "credit",
             creditAmount: Math.round(credit * 100) / 100,
             decision: deriveDecision(d.quantityAccepted, effective),
           },
@@ -405,9 +436,37 @@ export async function resolveClaim(
           claimId: claim.id,
           claimNumber: claim.claimNumber,
           credit: updates.reduce((s, u) => s + Number(u.data.creditAmount ?? 0), 0),
+          userId: opts.userId,
         });
       }
-      return { ok: true };
+
+      let replacementPoId: string | undefined;
+      if (replacements.length > 0) {
+        // Raised as already sent: the supplier agreed to ship, so the units are on order
+        // from now, and planning should stop treating them as a gap to reorder.
+        const replacement = await tx.purchaseOrder.create({
+          data: {
+            shop,
+            poNumber: `${claim.claimNumber}-R`,
+            status: "sent",
+            sentAt: new Date(),
+            supplierId: claim.supplierId,
+            replacesClaimId: claim.id,
+            totalCost: 0,
+            notes: `Replacement goods for claim ${claim.claimNumber} on ${claim.purchaseOrder.poNumber}`,
+            items: {
+              create: replacements.map((r) => ({
+                productId: r.productId,
+                quantityOrdered: r.quantity,
+                unitCost: 0,
+                replacesClaimLineId: r.lineId,
+              })),
+            },
+          },
+        });
+        replacementPoId = replacement.id;
+      }
+      return { ok: true, replacementPoId };
     });
   } catch (err) {
     if (err instanceof ClaimError) return { ok: false, error: err.message };

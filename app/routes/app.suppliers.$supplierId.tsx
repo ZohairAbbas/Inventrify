@@ -7,6 +7,7 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { formatCurrency, formatDate } from "../lib/format";
 import { getSupplierClaimSummary } from "../lib/supplier-claim.server";
+import { getSupplierScorecard } from "../lib/supplier-scorecard.server";
 import { getSupplierStatement, recordLedgerEntry, reverseLedgerEntry } from "../lib/supplier-ledger.server";
 import { LEDGER_TYPE_LABELS, describeBalance } from "../lib/supplier-ledger";
 import { parseFormDate } from "../lib/date-range";
@@ -23,8 +24,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   });
 
   if (!supplier) throw new Response("Not found", { status: 404 });
-  const [claims, statement, poOptions] = await Promise.all([
+  const [claims, scorecard, statement, poOptions] = await Promise.all([
     getSupplierClaimSummary(session.shop, supplier.id),
+    getSupplierScorecard(session.shop, supplier.id),
     getSupplierStatement(session.shop, supplier.id),
     // For linking a payment to the PO it pays for (an advance, say).
     prisma.purchaseOrder.findMany({
@@ -34,7 +36,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       take: 50,
     }),
   ]);
-  return { supplier, claims, statement, poOptions };
+  return { supplier, claims, scorecard, statement, poOptions };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
@@ -85,7 +87,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 export default function EditSupplier() {
-  const { supplier, claims, statement, poOptions } = useLoaderData<typeof loader>();
+  const { supplier, claims, scorecard, statement, poOptions } = useLoaderData<typeof loader>();
   const { theme = "emerald", currency = "USD", timezone = "UTC" } =
     useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
@@ -185,27 +187,7 @@ export default function EditSupplier() {
               )}
             </Card>
 
-            {claims.unitsClaimed > 0 && (
-              <Card>
-                <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Claims</div>
-                {/* Who bore the cost of bad stock from this supplier. Absorbed units are the
-                    merchant's loss; accepted ones the supplier made good. */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "6px 12px", fontSize: "12.5px" }}>
-                  <span>Open claims</span>
-                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.openClaims}</span>
-                  <span>Units claimed</span>
-                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.unitsClaimed}</span>
-                  <span>Accepted by supplier</span>
-                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.unitsAccepted}</span>
-                  <span>Damaged units you absorbed</span>
-                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.damagedAbsorbed}</span>
-                  <span>In quarantine now</span>
-                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{claims.quarantined}</span>
-                  <span>Credit agreed</span>
-                  <span style={{ fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(claims.creditAgreed, currency)}</span>
-                </div>
-              </Card>
-            )}
+            <PerformanceCard scorecard={scorecard} claims={claims} currency={currency} />
 
             <Card>
               <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Recent POs</div>
@@ -434,6 +416,76 @@ function SupplierAccount({
             </div>
           )}
         </div>
+      )}
+    </Card>
+  );
+}
+
+/** "92%" or "—" when there is nothing to measure. */
+const pct = (rate: number | null) => (rate === null ? "—" : `${Math.round(rate * 100)}%`);
+
+/**
+ * How this supplier has actually performed, from the merchant's own POs and claims, with
+ * who bore the cost of bad stock. Each figure carries its sample size: "100% on time" over
+ * one delivery is a different statement from the same over forty.
+ */
+function PerformanceCard({
+  scorecard,
+  claims,
+  currency,
+}: {
+  scorecard: SerializeFrom<typeof loader>["scorecard"];
+  claims: SerializeFrom<typeof loader>["claims"];
+  currency: string;
+}) {
+  if (scorecard.finishedPos === 0 && scorecard.onTimeSample === 0 && claims.unitsClaimed === 0) return null;
+
+  const row = (label: string, value: string, hint?: string) => (
+    <>
+      <span>
+        {label}
+        {hint && <span style={{ color: "var(--inv-muted)", fontSize: "11px" }}> · {hint}</span>}
+      </span>
+      <span style={{ fontFamily: "var(--inv-font-mono)", textAlign: "right" }}>{value}</span>
+    </>
+  );
+
+  return (
+    <Card>
+      <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px" }}>Performance</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "6px 12px", fontSize: "12.5px" }}>
+        {row("Fill rate", pct(scorecard.fillRate), `${scorecard.finishedPos} finished PO${scorecard.finishedPos === 1 ? "" : "s"}`)}
+        {row("On time", pct(scorecard.onTimeRate), `${scorecard.onTimeSample} with a due date`)}
+        {row(
+          "Lead time",
+          scorecard.actualLeadTimeDays === null
+            ? `${scorecard.quotedLeadTimeDays}d quoted`
+            : `${Math.round(scorecard.actualLeadTimeDays * 10) / 10}d`,
+          scorecard.actualLeadTimeDays === null ? undefined : `${scorecard.quotedLeadTimeDays}d quoted`,
+        )}
+        {row("Defect rate", pct(scorecard.defectRate), `${scorecard.unitsReceived} units received`)}
+      </div>
+
+      {claims.unitsClaimed > 0 && (
+        <>
+          <div style={{ height: "1px", background: "var(--inv-divider)", margin: "12px 0" }} />
+          {/* Who bore the cost of bad stock from this supplier. Absorbed units are the
+              merchant's loss; accepted ones the supplier made good. */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "6px 12px", fontSize: "12.5px" }}>
+            {row("Open claims", String(claims.openClaims))}
+            {row("Units claimed", String(claims.unitsClaimed))}
+            {row("Accepted by supplier", String(claims.unitsAccepted), pct(scorecard.acceptanceRate))}
+            {row("Damaged units you absorbed", String(claims.damagedAbsorbed))}
+            {row("In quarantine now", String(claims.quarantined))}
+            {scorecard.replacementsOutstanding > 0 && row("Replacements still due", String(scorecard.replacementsOutstanding))}
+            {row(
+              "Days to resolve a claim",
+              scorecard.avgDaysToResolve === null ? "—" : String(scorecard.avgDaysToResolve),
+              scorecard.resolvedClaims > 0 ? `${scorecard.resolvedClaims} resolved` : undefined,
+            )}
+            {row("Credit agreed", formatCurrency(claims.creditAgreed, currency))}
+          </div>
+        </>
       )}
     </Card>
   );

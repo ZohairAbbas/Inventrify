@@ -444,7 +444,14 @@ model PurchaseOrder {
 
   items    PurchaseOrderItem[]
   receipts PurchaseOrderReceipt[]
-  claims   SupplierClaim[]
+  claims   SupplierClaim[] @relation("PurchaseOrderClaims")
+
+  // Set when this PO is a supplier's replacement shipment for a resolved claim. Its lines
+  // cost nothing (the original delivery was already billed), it does not count toward
+  // the supplier's lead-time statistics, and closing it short can credit the undelivered
+  // replacements instead. Unique: one replacement order per claim.
+  replacesClaimId      String?        @unique
+  replacesClaim        SupplierClaim? @relation("ClaimReplacement", fields: [replacesClaimId], references: [id], onDelete: SetNull)
 
   @@index([shop])
   @@index([shop, status])
@@ -462,6 +469,10 @@ model PurchaseOrderItem {
   // order = ordered - received - cancelled, floored at zero.
   quantityCancelled Int         @default(0)
   unitCost        Float         @default(0)
+  // On a replacement PO: the SupplierClaimLine this line replaces. Its unitCost (what the
+  // merchant originally paid) is what an undelivered replacement is credited at, since
+  // this line's own cost is zero.
+  replacesClaimLineId String?
 
   receiptLines PurchaseOrderReceiptLine[]
   claimLines   SupplierClaimLine[]
@@ -765,7 +776,7 @@ model SupplierClaim {
   // PO number plus a sequence, e.g. "PO-1042-C1".
   claimNumber     String        @unique
   purchaseOrderId String
-  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  purchaseOrder   PurchaseOrder @relation("PurchaseOrderClaims", fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   // Copied from the PO when the claim is opened. Nullable because deleting a supplier
   // unlinks rather than deletes its history.
   supplierId      String?
@@ -773,12 +784,17 @@ model SupplierClaim {
   status          String        @default("open") // open | submitted | resolved
   notes           String?
   submittedAt     DateTime?
+  // When the claim was actually emailed, and to whom — separate from submittedAt for the
+  // same reason as on PurchaseOrder: a claim may go by phone, and "sent" is the merchant's.
+  emailedAt       DateTime?
+  emailedTo       String?
   resolvedAt      DateTime?
   createdByUserId String?
   createdAt       DateTime      @default(now())
   updatedAt       DateTime      @updatedAt
 
-  lines SupplierClaimLine[]
+  lines            SupplierClaimLine[]
+  replacementOrder PurchaseOrder?      @relation("ClaimReplacement")
 
   @@index([shop, status])
   @@index([purchaseOrderId])
@@ -818,6 +834,9 @@ model SupplierClaimLine {
   // The supplier's answer.
   decision         String @default("pending") // pending | accepted | partially_accepted | rejected
   quantityAccepted Int    @default(0)
+  // How the supplier makes good the accepted units: a credit on the account, or
+  // replacement goods (a linked replacement PO; creditAmount is then 0).
+  remedy           String @default("credit") // credit | replacement
   creditAmount     Float  @default(0)
 
   createdAt DateTime @default(now())

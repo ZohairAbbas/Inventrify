@@ -152,6 +152,7 @@ beforeEach(async () => {
     await prisma.productLocationStock.deleteMany({ where: { shop } });
     await prisma.product.deleteMany({ where: { shop } });
     await prisma.location.deleteMany({ where: { shop } });
+    await prisma.supplierLedgerEntry.deleteMany({ where: { shop } });
     await prisma.supplier.deleteMany({ where: { shop } });
   }
 });
@@ -696,6 +697,52 @@ describe("partial deliveries", () => {
     expect(again.moved).toBe(0);
     expect(pushed).toHaveLength(1);
     expect(await prisma.purchaseOrderReceipt.count({ where: { purchaseOrderId: po.id } })).toBe(1);
+  });
+});
+
+describe("receipt hold", () => {
+  it("turns a request away while another receipt is in progress", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    // An odd version is a hold, freshly taken (updatedAt is now).
+    await prisma.purchaseOrder.update({ where: { id: po.id }, data: { receiptVersion: 1 } });
+    const { admin, pushed } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/being booked/i);
+    expect(pushed).toHaveLength(0);
+  });
+
+  it("takes over a hold abandoned by a process that died mid-receipt", async () => {
+    const { product } = await seed();
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    await prisma.$executeRaw`UPDATE "PurchaseOrder" SET "receiptVersion" = 3, "updatedAt" = now() - interval '1 hour' WHERE id = ${po.id}`;
+    const { admin } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id);
+
+    expect(result.ok).toBe(true);
+    const after = await prisma.purchaseOrder.findUniqueOrThrow({ where: { id: po.id } });
+    expect(after.receiptVersion % 2).toBe(0);
+  });
+
+  it("releases the hold when the receipt fails", async () => {
+    const { product } = await seed({ stock: 0 });
+    const po = await createPo(product.id, { quantityOrdered: 10 });
+    // Make the stock write fail after the hold is taken: the product no longer belongs
+    // to this shop, so the per-location move refuses it.
+    await prisma.product.update({ where: { id: product.id }, data: { shop: OTHER_SHOP } });
+    const { admin } = mockAdmin();
+
+    const result = await receivePurchaseOrder(admin, SHOP, po.id);
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/not found/i);
+    const after = await prisma.purchaseOrder.findUniqueOrThrow({ where: { id: po.id } });
+    expect(after.receiptVersion % 2).toBe(0);
+    await prisma.product.update({ where: { id: product.id }, data: { shop: SHOP } });
   });
 });
 

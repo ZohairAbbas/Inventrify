@@ -58,6 +58,18 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   });
   if (!supplier) return { ok: false as const, error: "Supplier not found" };
 
+  // An account with history is a financial record: deleting the supplier would have to
+  // delete or orphan the entries that explain what was paid and owed.
+  const ledgerEntries = await prisma.supplierLedgerEntry.count({
+    where: { shop: session.shop, supplierId: supplier.id },
+  });
+  if (ledgerEntries > 0) {
+    return {
+      ok: false as const,
+      error: "This supplier has account history (bills, payments or credits) and can't be deleted",
+    };
+  }
+
   // Unlink first: products and POs reference the supplier, and the FK would otherwise
   // reject the delete. Wrapped so a failure part-way cannot leave products orphaned from
   // a supplier that still exists.

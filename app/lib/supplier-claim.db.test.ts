@@ -119,6 +119,7 @@ beforeEach(async () => {
     await prisma.productLocationStock.deleteMany({ where: { shop } });
     await prisma.product.deleteMany({ where: { shop } });
     await prisma.location.deleteMany({ where: { shop } });
+    await prisma.supplierLedgerEntry.deleteMany({ where: { shop } });
     await prisma.supplier.deleteMany({ where: { shop } });
   }
 });

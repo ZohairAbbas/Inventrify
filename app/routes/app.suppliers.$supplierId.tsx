@@ -1,13 +1,16 @@
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
+import type { ActionFunctionArgs, LoaderFunctionArgs, SerializeFrom } from "@remix-run/node";
 import { useLoaderData, useFetcher, useNavigate, useRouteLoaderData, Link } from "@remix-run/react";
 import type { loader as appLoader } from "./app";
-import { TitleBar } from "@shopify/app-bridge-react";
+import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useState, useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
-import { formatCurrency } from "../lib/format";
+import { formatCurrency, formatDate } from "../lib/format";
 import { getSupplierClaimSummary } from "../lib/supplier-claim.server";
-import { Button, Card, FormField, POStatusPill, TextArea, TextInput } from "../design";
+import { getSupplierStatement, recordLedgerEntry, reverseLedgerEntry } from "../lib/supplier-ledger.server";
+import { LEDGER_TYPE_LABELS, describeBalance } from "../lib/supplier-ledger";
+import { parseFormDate } from "../lib/date-range";
+import { Button, Card, FormField, POStatusPill, SelectInput, TextArea, TextInput } from "../design";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { session } = await authenticate.admin(request);
@@ -20,13 +23,47 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   });
 
   if (!supplier) throw new Response("Not found", { status: 404 });
-  const claims = await getSupplierClaimSummary(session.shop, supplier.id);
-  return { supplier, claims };
+  const [claims, statement, poOptions] = await Promise.all([
+    getSupplierClaimSummary(session.shop, supplier.id),
+    getSupplierStatement(session.shop, supplier.id),
+    // For linking a payment to the PO it pays for (an advance, say).
+    prisma.purchaseOrder.findMany({
+      where: { shop: session.shop, supplierId: supplier.id, status: { not: "draft" } },
+      select: { id: true, poNumber: true },
+      orderBy: { createdAt: "desc" },
+      take: 50,
+    }),
+  ]);
+  return { supplier, claims, statement, poOptions };
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { session, sessionToken } = await authenticate.admin(request);
   const formData = await request.formData();
+  const intent = formData.get("intent");
+  const userId = sessionToken?.sub ?? null;
+
+  if (intent === "record_entry") {
+    const rawDate = (formData.get("occurredAt") as string) || "";
+    const occurredAt = parseFormDate(rawDate);
+    if (rawDate && !occurredAt) return { ledger: true, error: "That date is not valid" };
+    const result = await recordLedgerEntry(session.shop, params.supplierId ?? "", {
+      type: String(formData.get("type") ?? ""),
+      amount: Number(formData.get("amount")),
+      direction: (formData.get("direction") as string) || null,
+      occurredAt,
+      reference: (formData.get("reference") as string) || null,
+      note: (formData.get("note") as string) || null,
+      purchaseOrderId: (formData.get("purchaseOrderId") as string) || null,
+      userId,
+    });
+    return result.ok ? { ledger: true, ok: true, message: "Entry recorded" } : { ledger: true, error: result.error };
+  }
+
+  if (intent === "reverse_entry") {
+    const result = await reverseLedgerEntry(session.shop, String(formData.get("entryId") ?? ""), { userId });
+    return result.ok ? { ledger: true, ok: true, message: "Entry reversed" } : { ledger: true, error: result.error };
+  }
 
   const name = (formData.get("name") as string)?.trim();
   if (!name) return { error: "Supplier name is required" };
@@ -48,8 +85,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
 };
 
 export default function EditSupplier() {
-  const { supplier, claims } = useLoaderData<typeof loader>();
-  const { theme = "emerald", currency = "USD" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
+  const { supplier, claims, statement, poOptions } = useLoaderData<typeof loader>();
+  const { theme = "emerald", currency = "USD", timezone = "UTC" } =
+    useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const navigate = useNavigate();
 
@@ -188,7 +226,215 @@ export default function EditSupplier() {
             </Card>
           </div>
         </div>
+
+        <SupplierAccount
+          supplierName={supplier.name}
+          statement={statement}
+          poOptions={poOptions}
+          currency={currency}
+          timezone={timezone}
+        />
       </div>
     </div>
+  );
+}
+
+// As serialised to the page: dates arrive as strings.
+type Statement = SerializeFrom<typeof loader>["statement"];
+type LedgerActionData = { ledger?: boolean; ok?: boolean; error?: string; message?: string };
+
+/**
+ * The merchant's running account with this supplier.
+ *
+ * Bills (per delivery) and claim credits post themselves; this is where the merchant
+ * records the rest — payments, refunds, and adjustments such as an opening balance —
+ * and reverses mistakes. Its own fetcher, so recording a payment does not trip the edit
+ * form's "saved, go back to the list" redirect.
+ */
+function SupplierAccount({
+  supplierName,
+  statement,
+  poOptions,
+  currency,
+  timezone,
+}: {
+  supplierName: string;
+  statement: Statement;
+  poOptions: { id: string; poNumber: string }[];
+  currency: string;
+  timezone: string;
+}) {
+  const fetcher = useFetcher<LedgerActionData>();
+  const shopify = useAppBridge();
+  const isBusy = fetcher.state !== "idle";
+  const [type, setType] = useState("payment");
+  const [direction, setDirection] = useState("owe_more");
+  const [amount, setAmount] = useState("");
+  const [occurredAt, setOccurredAt] = useState(new Date().toISOString().slice(0, 10));
+  const [reference, setReference] = useState("");
+  const [purchaseOrderId, setPurchaseOrderId] = useState("");
+  const [note, setNote] = useState("");
+
+  useEffect(() => {
+    const d = fetcher.data;
+    if (!d) return;
+    if (d.error) {
+      shopify.toast.show(d.error, { isError: true });
+    } else if (d.ok) {
+      shopify.toast.show(d.message ?? "Saved");
+      setAmount("");
+      setReference("");
+      setNote("");
+    }
+  }, [fetcher.data, shopify]);
+
+  const balance = statement.balance;
+  const balanceColor =
+    Math.abs(balance) < 0.005
+      ? "var(--inv-text-2)"
+      : balance > 0
+        ? "var(--inv-status-critical-fg)"
+        : "var(--inv-status-healthy-fg)";
+
+  return (
+    <Card style={{ marginTop: "14px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: "12px", flexWrap: "wrap", marginBottom: "4px" }}>
+        <div style={{ fontSize: "14px", fontWeight: 600 }}>Account</div>
+        <div style={{ fontSize: "16px", fontWeight: 700, color: balanceColor }}>
+          {describeBalance(balance, statement.currency ?? currency, supplierName)}
+        </div>
+      </div>
+      <div style={{ fontSize: "12px", color: "var(--inv-muted)", marginBottom: "14px" }}>
+        Deliveries are billed automatically at the PO's unit cost, and resolved claims are credited. Record payments,
+        refunds and anything else here. Starting out? Add an adjustment for the opening balance.
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px", alignItems: "end", marginBottom: "16px" }}>
+        <FormField label="Entry">
+          <SelectInput value={type} onChange={(e) => setType(e.target.value)}>
+            <option value="payment">Payment to supplier</option>
+            <option value="refund">Refund from supplier</option>
+            <option value="adjustment">Adjustment</option>
+          </SelectInput>
+        </FormField>
+        {type === "adjustment" && (
+          <FormField label="Effect">
+            <SelectInput value={direction} onChange={(e) => setDirection(e.target.value)}>
+              <option value="owe_more">I owe more (opening balance, charge)</option>
+              <option value="owe_less">I owe less (opening credit, discount)</option>
+            </SelectInput>
+          </FormField>
+        )}
+        <FormField label={`Amount (${currency})`}>
+          <TextInput type="number" min={0} step={0.01} value={amount} onChange={(e) => setAmount(e.target.value)} />
+        </FormField>
+        <FormField label="Date">
+          <TextInput type="date" value={occurredAt} onChange={(e) => setOccurredAt(e.target.value)} />
+        </FormField>
+        <FormField label="Reference">
+          <TextInput placeholder="Invoice / bank ref" value={reference} onChange={(e) => setReference(e.target.value)} />
+        </FormField>
+        <FormField label="For PO (optional)">
+          <SelectInput value={purchaseOrderId} onChange={(e) => setPurchaseOrderId(e.target.value)}>
+            <option value="">—</option>
+            {poOptions.map((po) => (
+              <option key={po.id} value={po.id}>
+                {po.poNumber}
+              </option>
+            ))}
+          </SelectInput>
+        </FormField>
+      </div>
+      <div style={{ display: "flex", gap: "10px", alignItems: "center", marginBottom: "18px" }}>
+        <TextInput placeholder="Note (optional)" value={note} onChange={(e) => setNote(e.target.value)} style={{ flex: 1 }} />
+        <Button
+          variant="primary"
+          disabled={isBusy || !(parseFloat(amount) > 0)}
+          onClick={() =>
+            fetcher.submit(
+              { intent: "record_entry", type, direction, amount, occurredAt, reference, purchaseOrderId, note },
+              { method: "POST" },
+            )
+          }
+        >
+          Record
+        </Button>
+      </div>
+
+      {statement.rows.length === 0 ? (
+        <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>No entries yet.</div>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "12.5px" }}>
+            <thead>
+              <tr style={{ color: "var(--inv-muted)", fontSize: "11px", textAlign: "left" }}>
+                <th style={{ padding: "6px 8px" }}>Date</th>
+                <th style={{ padding: "6px 8px" }}>Entry</th>
+                <th style={{ padding: "6px 8px" }}>Details</th>
+                <th style={{ padding: "6px 8px", textAlign: "right" }}>Amount</th>
+                <th style={{ padding: "6px 8px", textAlign: "right" }}>Balance</th>
+                <th style={{ padding: "6px 8px" }}></th>
+              </tr>
+            </thead>
+            <tbody>
+              {statement.rows.map((row) => (
+                <tr key={row.id} style={{ borderTop: "1px solid var(--inv-divider)", opacity: row.reversed ? 0.55 : 1 }}>
+                  <td style={{ padding: "7px 8px", whiteSpace: "nowrap" }}>{formatDate(row.occurredAt, timezone)}</td>
+                  <td style={{ padding: "7px 8px" }}>
+                    {LEDGER_TYPE_LABELS[row.type] ?? row.type}
+                    {row.reversed ? " (reversed)" : ""}
+                  </td>
+                  <td style={{ padding: "7px 8px", color: "var(--inv-text-2)" }}>
+                    {[
+                      row.poNumber,
+                      row.reference,
+                      row.note,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ") || "—"}
+                    {row.purchaseOrderId && (
+                      <>
+                        {" "}
+                        <Link to={`/app/purchase-orders/${row.purchaseOrderId}`} style={{ color: "var(--inv-accent)" }}>
+                          view
+                        </Link>
+                      </>
+                    )}
+                  </td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "var(--inv-font-mono)" }}>
+                    {row.amount > 0 ? "+" : ""}
+                    {formatCurrency(row.amount, row.currency)}
+                  </td>
+                  <td style={{ padding: "7px 8px", textAlign: "right", fontFamily: "var(--inv-font-mono)" }}>
+                    {formatCurrency(row.balance, row.currency)}
+                  </td>
+                  <td style={{ padding: "7px 8px", textAlign: "right" }}>
+                    {!row.reversed && !row.isReversal && (
+                      <button
+                        type="button"
+                        disabled={isBusy}
+                        onClick={() => {
+                          if (window.confirm("Reverse this entry? A matching opposite entry is added; nothing is deleted.")) {
+                            fetcher.submit({ intent: "reverse_entry", entryId: row.id }, { method: "POST" });
+                          }
+                        }}
+                        style={{ fontSize: "11px", border: "1px solid var(--inv-input-border-2)", background: "#fff", padding: "3px 8px", borderRadius: "7px", cursor: "pointer" }}
+                      >
+                        Reverse
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {statement.truncated && (
+            <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginTop: "8px" }}>
+              Showing the latest {statement.rows.length} entries. The balance includes all of them.
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
   );
 }

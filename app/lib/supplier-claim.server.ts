@@ -1,6 +1,7 @@
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import type { Prisma } from "@prisma/client";
 import prisma from "../db.server";
+import { postClaimCredit, postUndeliveredBill } from "./supplier-ledger.server";
 import { applyLocalStockState, pushStockStateToShopify, resolveDefaultLocationId, type StockStateChange } from "./stock.server";
 import {
   CLAIM_TYPES,
@@ -109,7 +110,7 @@ export async function openClaim(
   }
 
   const sequence = (await tx.supplierClaim.count({ where: { purchaseOrderId: po.id } })) + 1;
-  return tx.supplierClaim.create({
+  const claim = await tx.supplierClaim.create({
     data: {
       shop,
       claimNumber: `${po.poNumber}-C${sequence}`,
@@ -134,6 +135,22 @@ export async function openClaim(
     },
     include: { lines: true },
   });
+
+  // Units claimed as never delivered were never billed by a receipt; bill them now so
+  // the claim's eventual credit has something to offset. See postUndeliveredBill.
+  const undelivered = claim.lines.filter((l) => !countsAgainstReceived(l));
+  if (claim.supplierId && undelivered.length > 0) {
+    await postUndeliveredBill(tx, {
+      shop,
+      supplierId: claim.supplierId,
+      purchaseOrderId: po.id,
+      claimId: claim.id,
+      claimNumber: claim.claimNumber,
+      lines: undelivered.map((l) => ({ quantity: l.quantity, unitCost: l.unitCost })),
+      userId: opts.userId,
+    });
+  }
+  return claim;
 }
 
 /** The stock movement a new claim line makes, if any. */
@@ -377,6 +394,19 @@ export async function resolveClaim(
       });
       if (count === 0) throw new ClaimError("This claim is already resolved");
       for (const u of updates) await tx.supplierClaimLine.update({ where: { id: u.id }, data: u.data });
+
+      // The agreed credit goes on the supplier's account in the same transaction, so a
+      // resolved claim and its credit note can never disagree.
+      if (claim.supplierId) {
+        await postClaimCredit(tx, {
+          shop,
+          supplierId: claim.supplierId,
+          purchaseOrderId: claim.purchaseOrderId,
+          claimId: claim.id,
+          claimNumber: claim.claimNumber,
+          credit: updates.reduce((s, u) => s + Number(u.data.creditAmount ?? 0), 0),
+        });
+      }
       return { ok: true };
     });
   } catch (err) {

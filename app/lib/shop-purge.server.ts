@@ -70,6 +70,8 @@ export async function purgeShopData(
   // Parents.
   await prisma.product.deleteMany({ where: { shop } });
   await prisma.location.deleteMany({ where: { shop } });
+  // The ledger references suppliers, so it goes first.
+  await prisma.supplierLedgerEntry.deleteMany({ where: { shop } });
   await prisma.supplier.deleteMany({ where: { shop } });
   await prisma.shopSettings.deleteMany({ where: { shop } });
 

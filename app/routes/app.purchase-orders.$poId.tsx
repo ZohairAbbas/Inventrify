@@ -16,6 +16,7 @@ import {
   validateSupplierId,
 } from "../lib/purchase-order.server";
 import { outstandingQuantity } from "../lib/purchase-order-status";
+import { getPoAccount, recordLedgerEntry } from "../lib/supplier-ledger.server";
 import {
   createSupplierClaim,
   disposeClaimLine,
@@ -61,8 +62,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     where: { shop: session.shop },
     orderBy: { name: "asc" },
   });
+  const account = await getPoAccount(session.shop, po.id);
 
-  return { po, suppliers };
+  return { po, suppliers, account };
 };
 
 /** The receiptVersion the page was rendered with; null when absent or malformed. */
@@ -206,6 +208,23 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     return { ok: true as const, action: result.claimId ? "closed:claim" : "closed", error: "" };
   }
 
+  if (intent === "record_payment") {
+    if (!po.supplierId) return { ok: false as const, error: "Assign a supplier before recording payments", action: "" };
+    const rawDate = (formData.get("occurredAt") as string) || "";
+    const occurredAt = parseFormDate(rawDate);
+    if (rawDate && !occurredAt) return { ok: false as const, error: "That date is not valid", action: "" };
+    const result = await recordLedgerEntry(shop, po.supplierId, {
+      type: "payment",
+      amount: Number(formData.get("amount")),
+      occurredAt,
+      reference: (formData.get("reference") as string) || null,
+      purchaseOrderId: po.id,
+      userId: sessionToken?.sub ?? null,
+    });
+    if (!result.ok) return { ok: false as const, error: result.error ?? "Could not record the payment", action: "" };
+    return { ok: true as const, action: "payment_recorded", error: "" };
+  }
+
   if (intent === "create_claim") {
     const result = await createSupplierClaim(admin, shop, po.id, {
       lines: po.items.map((i) => {
@@ -278,7 +297,7 @@ interface DraftLine {
 }
 
 export default function PODetail() {
-  const { po, suppliers } = useLoaderData<typeof loader>();
+  const { po, suppliers, account } = useLoaderData<typeof loader>();
   const fetcher = useFetcher<typeof action>();
   const shopify = useAppBridge();
   const { timezone = "UTC", currency = "USD", theme = "emerald" } =
@@ -337,7 +356,8 @@ export default function PODetail() {
         closed: "Remaining units cancelled — PO closed",
         claim_opened: "Supplier claim opened",
         claim_submitted: "Claim marked as sent to the supplier",
-        claim_resolved: "Supplier decision recorded",
+        claim_resolved: "Supplier decision recorded — credit posted to the supplier's account",
+        payment_recorded: "Payment recorded on the supplier's account",
         draft_updated: "Draft PO updated",
       };
       const msg = action.startsWith("emailed:")
@@ -888,6 +908,18 @@ export default function PODetail() {
               })}
             </div>
           </Card>
+        )}
+
+        {!isEditing && po.status !== "draft" && (
+          <PoAccountCard
+            account={account}
+            orderedValue={po.totalCost}
+            receivedValue={po.items.reduce((s, i) => s + i.quantityReceived * i.unitCost, 0)}
+            supplier={po.supplier ? { id: po.supplier.id, name: po.supplier.name } : null}
+            fetcher={fetcher}
+            isBusy={isBusy}
+            currency={currency}
+          />
         )}
 
         {!isEditing && (
@@ -1460,5 +1492,131 @@ function DecisionForm({
         </Button>
       </div>
     </div>
+  );
+}
+
+/**
+ * Money on this PO, from the supplier ledger: what was billed as deliveries arrived, what
+ * claims credited back, and what was paid against it. The supplier page holds the whole
+ * account; this is the slice that explains one order.
+ */
+function PoAccountCard({
+  account,
+  orderedValue,
+  receivedValue,
+  supplier,
+  fetcher,
+  isBusy,
+  currency,
+}: {
+  account: { billed: number; credited: number; paid: number; net: number; entries: number };
+  orderedValue: number;
+  receivedValue: number;
+  supplier: { id: string; name: string } | null;
+  fetcher: ClaimFetcher;
+  isBusy: boolean;
+  currency: string;
+}) {
+  const [paying, setPaying] = useState(false);
+  const [amount, setAmount] = useState("");
+  const [occurredAt, setOccurredAt] = useState(new Date().toISOString().slice(0, 10));
+  const [reference, setReference] = useState("");
+  const entries = account.entries;
+  useEffect(() => {
+    setPaying(false);
+    setAmount("");
+    setReference("");
+  }, [entries]);
+
+  if (!supplier) {
+    return (
+      <Card style={{ marginBottom: "18px" }}>
+        <div style={{ fontSize: "13px", fontWeight: 600, marginBottom: "6px" }}>Payments</div>
+        <div style={{ fontSize: "12.5px", color: "var(--inv-muted)" }}>
+          This PO has no supplier, so nothing is billed or tracked on an account.
+        </div>
+      </Card>
+    );
+  }
+
+  const figure = (label: string, value: number, hint?: string) => (
+    <div>
+      <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "3px" }}>{label}</div>
+      <div style={{ fontSize: "13.5px", fontFamily: "var(--inv-font-mono)" }}>{formatCurrency(value, currency)}</div>
+      {hint && <div style={{ fontSize: "11px", color: "var(--inv-muted)" }}>{hint}</div>}
+    </div>
+  );
+
+  return (
+    <Card style={{ marginBottom: "18px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", marginBottom: "12px" }}>
+        <div style={{ fontSize: "13px", fontWeight: 600 }}>Payments</div>
+        <Link to={`/app/suppliers/${supplier.id}`} style={{ fontSize: "12px", color: "var(--inv-accent)" }}>
+          {supplier.name}&apos;s account →
+        </Link>
+      </div>
+      <div style={{ display: "flex", gap: "28px", flexWrap: "wrap", marginBottom: "12px" }}>
+        {figure("Ordered", orderedValue)}
+        {figure("Received", receivedValue)}
+        {figure("Billed", account.billed)}
+        {figure("Credited", account.credited)}
+        {figure("Paid", account.paid)}
+        <div>
+          <div style={{ fontSize: "11.5px", color: "var(--inv-muted)", marginBottom: "3px" }}>Net on this PO</div>
+          <div
+            style={{
+              fontSize: "13.5px",
+              fontWeight: 700,
+              fontFamily: "var(--inv-font-mono)",
+              color: account.net > 0.005 ? "var(--inv-status-critical-fg)" : "var(--inv-status-healthy-fg)",
+            }}
+          >
+            {account.net > 0.005
+              ? `${formatCurrency(account.net, currency)} due`
+              : account.net < -0.005
+                ? `${formatCurrency(-account.net, currency)} in credit`
+                : "Settled"}
+          </div>
+        </div>
+      </div>
+      {paying ? (
+        <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+          <TextInput
+            type="number"
+            min={0}
+            step={0.01}
+            placeholder={`Amount (${currency})`}
+            value={amount}
+            onChange={(e) => setAmount(e.target.value)}
+            style={{ width: "150px" }}
+          />
+          <TextInput type="date" value={occurredAt} onChange={(e) => setOccurredAt(e.target.value)} style={{ width: "160px" }} />
+          <TextInput placeholder="Reference" value={reference} onChange={(e) => setReference(e.target.value)} style={{ width: "180px" }} />
+          <Button
+            variant="primary"
+            disabled={isBusy || !(parseFloat(amount) > 0)}
+            onClick={() => fetcher.submit({ intent: "record_payment", amount, occurredAt, reference }, { method: "POST" })}
+          >
+            Record payment
+          </Button>
+          <Button variant="ghost" onClick={() => setPaying(false)}>
+            Cancel
+          </Button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          style={smallButton}
+          onClick={() => {
+            // Pre-fill what is due; an advance on an unreceived PO starts from the order value.
+            const due = account.net > 0.005 ? account.net : account.billed === 0 ? orderedValue - account.paid : 0;
+            setAmount(due > 0 ? due.toFixed(2) : "");
+            setPaying(true);
+          }}
+        >
+          Record a payment for this PO
+        </button>
+      )}
+    </Card>
   );
 }

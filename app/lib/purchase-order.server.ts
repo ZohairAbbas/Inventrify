@@ -7,6 +7,7 @@ import {
   resolveDefaultLocationId,
 } from "./stock.server";
 import { ClaimError, openClaim, type NewClaimLine } from "./supplier-claim.server";
+import { postReceiptBill } from "./supplier-ledger.server";
 import { updateLeadTimeStats } from "./lead-time.server";
 import {
   OPEN_PO_STATUSES,
@@ -189,27 +190,71 @@ function closedStatusError(status: string): string {
 }
 
 /**
- * Claim the right to change a PO's receipt state.
- *
- * A PO can be received in several deliveries now, so the old guard — flip the status to
- * `received` before moving any stock — no longer works: the status after a delivery may
- * well still be open. Instead every receipt and close bumps `receiptVersion` with a
- * guarded `updateMany`, which is atomic: of two requests that read the same version,
- * exactly one sees count === 1. That covers both a double-submit and a second browser tab
- * that was opened before the first delivery was booked.
+ * How long an in-progress receipt holds the PO before another request may take it over.
+ * Only reached if a process died mid-receipt; a live receipt of a large PO, with Shopify
+ * throttling every line, can legitimately take minutes, and a takeover while it is still
+ * running would book the delivery twice.
  */
-async function claimReceiptVersion(
+const RECEIPT_HOLD_MS = 15 * 60 * 1000;
+
+const BUSY_ERROR =
+  "Another delivery is being booked on this purchase order right now — wait a moment, then reload.";
+
+/**
+ * Take exclusive hold of a PO's receipt state for the length of one receipt or close.
+ *
+ * A PO can be received in several deliveries, so the original guard — flip the status to
+ * `received` before moving stock — no longer works. A compare-and-swap on the version at
+ * the START is not enough either: a second request that reads the PO after the bump but
+ * before the first has written its quantities sees the new version with the old
+ * quantities, wins its own swap, and books the same delivery again.
+ *
+ * So the version doubles as a lock. Even = idle; odd = a receipt is in progress. Taking
+ * the hold swaps even -> odd atomically (exactly one of two racers sees count === 1);
+ * releaseReceiptHold swaps it to the next even number when the work is done, failure
+ * included. A request that finds it odd is told to wait — unless the hold is older than
+ * RECEIPT_HOLD_MS, which only happens if the holder died, and then it may take over.
+ *
+ * Returns the held (odd) version, or null if the hold could not be taken.
+ */
+async function takeReceiptHold(
   db: Pick<typeof prisma, "purchaseOrder">,
   shop: string,
-  poId: string,
-  version: number,
+  po: { id: string; receiptVersion: number; updatedAt: Date },
   statuses: POStatus[],
-): Promise<boolean> {
+): Promise<number | null> {
+  const busy = po.receiptVersion % 2 === 1;
+  if (busy && Date.now() - po.updatedAt.getTime() < RECEIPT_HOLD_MS) return null;
+  const held = busy ? po.receiptVersion + 2 : po.receiptVersion + 1;
   const { count } = await db.purchaseOrder.updateMany({
-    where: { id: poId, shop, receiptVersion: version, status: { in: statuses } },
-    data: { receiptVersion: { increment: 1 } },
+    where: {
+      id: po.id,
+      shop,
+      receiptVersion: po.receiptVersion,
+      status: { in: statuses },
+      // A takeover must still find the abandoned hold abandoned.
+      ...(busy ? { updatedAt: { lt: new Date(Date.now() - RECEIPT_HOLD_MS) } } : {}),
+    },
+    data: { receiptVersion: held },
   });
-  return count === 1;
+  return count === 1 ? held : null;
+}
+
+/** Release a hold taken by takeReceiptHold. A no-op if it was taken over meanwhile. */
+async function releaseReceiptHold(
+  db: Pick<typeof prisma, "purchaseOrder">,
+  poId: string,
+  held: number,
+): Promise<void> {
+  await db.purchaseOrder.updateMany({
+    where: { id: poId, receiptVersion: held },
+    data: { receiptVersion: held + 1 },
+  });
+}
+
+/** Why a hold could not be taken: someone is mid-receipt, or the page is stale. */
+function holdError(po: { receiptVersion: number }): string {
+  return po.receiptVersion % 2 === 1 ? BUSY_ERROR : STALE_ERROR;
 }
 
 /**
@@ -274,7 +319,7 @@ export async function receivePurchaseOrder(
     return { ok: false, error: "This purchase order has no line items to receive", ...empty };
   }
   if (options.expectedVersion != null && options.expectedVersion !== po.receiptVersion) {
-    return { ok: false, error: STALE_ERROR, ...empty };
+    return { ok: false, error: holdError(po), ...empty };
   }
 
   // Work out every line's movement before touching anything, so a request that is wrong
@@ -338,211 +383,243 @@ export async function receivePurchaseOrder(
   const receiptLocationId = await resolveDefaultLocationId(shop, options.locationId ?? null);
   const receivedAt = options.actualDeliveryDate ?? new Date();
 
-  if (!(await claimReceiptVersion(prisma, shop, po.id, po.receiptVersion, RECEIVABLE_PO_STATUSES))) {
-    const now = await prisma.purchaseOrder.findFirst({ where: { id: po.id }, select: { status: true } });
+  const held = await takeReceiptHold(prisma, shop, po, RECEIVABLE_PO_STATUSES);
+  if (held === null) {
+    const now = await prisma.purchaseOrder.findFirst({
+      where: { id: po.id },
+      select: { status: true, receiptVersion: true },
+    });
     const error =
       now && !RECEIVABLE_PO_STATUSES.includes(now.status as POStatus)
         ? closedStatusError(now.status)
-        : STALE_ERROR;
+        : holdError(now ?? po);
     return { ok: false, error, ...empty };
   }
 
-  const shopifyWarnings: string[] = [];
-  const receiptLines: { purchaseOrderItemId: string; quantity: number; quantityDamaged: number }[] = [];
-  const damagedClaimLines: NewClaimLine[] = [];
-  let moved = 0;
+  // Everything from here runs under the hold, and every way out — success, a failed
+  // line, a thrown error — gives it back.
+  try {
 
-  for (const { item, delta, damaged } of toMove) {
-    let lineError: string | undefined;
-    let lineShopifyError: string | undefined;
+    const shopifyWarnings: string[] = [];
+    const receiptLines: { purchaseOrderItemId: string; quantity: number; quantityDamaged: number }[] = [];
+    const damagedClaimLines: NewClaimLine[] = [];
+    let moved = 0;
 
-    if (receiptLocationId && damaged > 0) {
-      // Sellable and quarantined units in one local transaction, so a line is either
-      // booked whole or not at all.
-      const change = { available: delta - damaged, damaged };
-      try {
-        const guard = await prisma.$transaction((tx) =>
-          applyLocalStockState(tx, shop, item.productId, receiptLocationId, change),
-        );
-        if (guard) lineError = guard;
-      } catch (err) {
-        lineError = err instanceof Error ? err.message : "Stock update failed";
-      }
-      if (!lineError) {
-        const res = await pushStockStateToShopify(admin, shop, item.productId, receiptLocationId, change, {
-          reason: "correction",
-          ledgerDocumentUri: `gid://inventorify/PurchaseOrder/${po.id}`,
-        });
-        if (!res.ok && res.error) {
-          lineShopifyError = res.error;
-          shopifyWarnings.push(res.error);
+    for (const { item, delta, damaged } of toMove) {
+      let lineError: string | undefined;
+      let lineShopifyError: string | undefined;
+
+      if (receiptLocationId && damaged > 0) {
+        // Sellable and quarantined units in one local transaction, so a line is either
+        // booked whole or not at all.
+        const change = { available: delta - damaged, damaged };
+        try {
+          const guard = await prisma.$transaction((tx) =>
+            applyLocalStockState(tx, shop, item.productId, receiptLocationId, change),
+          );
+          if (guard) lineError = guard;
+        } catch (err) {
+          lineError = err instanceof Error ? err.message : "Stock update failed";
+        }
+        if (!lineError) {
+          const res = await pushStockStateToShopify(admin, shop, item.productId, receiptLocationId, change, {
+            reason: "correction",
+            ledgerDocumentUri: `gid://inventorify/PurchaseOrder/${po.id}`,
+          });
+          if (!res.ok && res.error) {
+            lineShopifyError = res.error;
+            shopifyWarnings.push(res.error);
+          }
+        }
+      } else if (receiptLocationId) {
+        const res = await applyLocationDelta(admin, shop, item.productId, receiptLocationId, delta);
+        if (!res.ok) {
+          lineError = res.error ?? "Stock update failed";
+        } else if (!res.shopifySynced && res.shopifyError) {
+          lineShopifyError = res.shopifyError;
+          shopifyWarnings.push(res.shopifyError);
+        }
+      } else {
+        // No locations synced at all (a token predating read_locations). Fall back to the
+        // aggregate count, which is what syncShopifyInventory also uses for such shops.
+        // There is no per-location quarantine to put damaged units in, so they are simply
+        // kept out of the count; the claim records them as holding no stock.
+        try {
+          await prisma.product.update({
+            where: { id: item.productId },
+            data: { currentStock: { increment: delta - damaged } },
+          });
+        } catch (err) {
+          lineError = err instanceof Error ? err.message : "Stock update failed";
         }
       }
-    } else if (receiptLocationId) {
-      const res = await applyLocationDelta(admin, shop, item.productId, receiptLocationId, delta);
-      if (!res.ok) {
-        lineError = res.error ?? "Stock update failed";
-      } else if (!res.shopifySynced && res.shopifyError) {
-        lineShopifyError = res.shopifyError;
-        shopifyWarnings.push(res.shopifyError);
-      }
-    } else {
-      // No locations synced at all (a token predating read_locations). Fall back to the
-      // aggregate count, which is what syncShopifyInventory also uses for such shops.
-      // There is no per-location quarantine to put damaged units in, so they are simply
-      // kept out of the count; the claim records them as holding no stock.
-      try {
-        await prisma.product.update({
-          where: { id: item.productId },
-          data: { currentStock: { increment: delta - damaged } },
-        });
-      } catch (err) {
-        lineError = err instanceof Error ? err.message : "Stock update failed";
-      }
-    }
 
-    if (lineError) {
-      // The stock never moved, so the line must not claim it was received.
-      failed++;
+      if (lineError) {
+        // The stock never moved, so the line must not claim it was received.
+        failed++;
+        lines.push({
+          itemId: item.id,
+          productId: item.productId,
+          quantityReceived: item.quantityReceived,
+          delta: 0,
+          error: lineError,
+        });
+        continue;
+      }
+
+      // Incremented, not set: the database does the arithmetic, as for every other
+      // stock-bearing counter in the app.
+      await prisma.purchaseOrderItem.update({
+        where: { id: item.id },
+        data: { quantityReceived: { increment: delta } },
+      });
+      item.quantityReceived += delta;
+      receiptLines.push({ purchaseOrderItemId: item.id, quantity: delta, quantityDamaged: damaged });
+      if (damaged > 0) {
+        damagedClaimLines.push({
+          purchaseOrderItemId: item.id,
+          type: "damaged",
+          quantity: damaged,
+          stockSource: receiptLocationId ? "receipt" : "none",
+          locationId: receiptLocationId,
+        });
+      }
+      moved++;
       lines.push({
         itemId: item.id,
         productId: item.productId,
         quantityReceived: item.quantityReceived,
-        delta: 0,
-        error: lineError,
-      });
-      continue;
-    }
-
-    // Incremented, not set: the database does the arithmetic, as for every other
-    // stock-bearing counter in the app.
-    await prisma.purchaseOrderItem.update({
-      where: { id: item.id },
-      data: { quantityReceived: { increment: delta } },
-    });
-    item.quantityReceived += delta;
-    receiptLines.push({ purchaseOrderItemId: item.id, quantity: delta, quantityDamaged: damaged });
-    if (damaged > 0) {
-      damagedClaimLines.push({
-        purchaseOrderItemId: item.id,
-        type: "damaged",
-        quantity: damaged,
-        stockSource: receiptLocationId ? "receipt" : "none",
-        locationId: receiptLocationId,
+        delta,
+        shopifyError: lineShopifyError,
       });
     }
-    moved++;
-    lines.push({
-      itemId: item.id,
-      productId: item.productId,
-      quantityReceived: item.quantityReceived,
-      delta,
-      shopifyError: lineShopifyError,
-    });
-  }
 
-  // Lines that had stock to move and all failed: nothing arrived as far as the record
-  // goes, so the PO stays exactly where it was (bar the version bump, which is harmless).
-  if (moved === 0 && toMove.length > 0) {
+    // Lines that had stock to move and all failed: nothing arrived as far as the record
+    // goes, so the PO stays exactly where it was (bar the version bump, which is harmless).
+    if (moved === 0 && toMove.length > 0) {
+      return {
+        ok: false,
+        error: lines.find((l) => l.error)?.error ?? "No stock could be received",
+        lines,
+        failed,
+        moved,
+        shopifyWarnings,
+        locationScoped: !!receiptLocationId,
+      };
+    }
+
+    if (receiptLines.length > 0) {
+      // The receipt and its bill commit together: a delivery is never on record without
+      // the supplier's account knowing about it, or the other way round.
+      const unitCostById = new Map(po.items.map((i) => [i.id, i.unitCost]));
+      const supplierId = po.supplierId;
+      await prisma.$transaction(async (tx) => {
+        const receipt = await tx.purchaseOrderReceipt.create({
+          data: {
+            shop,
+            purchaseOrderId: po.id,
+            receivedAt,
+            locationId: receiptLocationId,
+            createdByUserId: options.userId ?? null,
+            lines: { create: receiptLines },
+          },
+        });
+        if (supplierId) {
+          await postReceiptBill(tx, {
+            shop,
+            supplierId,
+            purchaseOrderId: po.id,
+            poNumber: po.poNumber,
+            receiptId: receipt.id,
+            receivedAt,
+            lines: receiptLines.map((l) => ({
+              quantity: l.quantity,
+              unitCost: unitCostById.get(l.purchaseOrderItemId) ?? 0,
+            })),
+            userId: options.userId,
+          });
+        }
+      });
+    }
+
+    let closeSkipped: string | undefined;
+    let cancelledLines: { purchaseOrderItemId: string; quantity: number }[] = [];
+    if (options.closeRemaining) {
+      if (failed > 0) {
+        closeSkipped =
+          "The remainder was left on order because some lines could not be received — fix those first, then close it";
+      } else {
+        cancelledLines = await cancelOutstanding(prisma, po.items);
+      }
+    }
+
+    // One claim per delivery covers both what arrived damaged and, when closing short,
+    // what never arrived. The stock is already where it belongs; if this fails the
+    // merchant is told and can open the claim by hand from the PO page.
+    const claimLines: NewClaimLine[] = [
+      ...damagedClaimLines,
+      ...(options.claimMissing
+        ? cancelledLines.map((c) => ({
+            purchaseOrderItemId: c.purchaseOrderItemId,
+            type: "missing" as const,
+            quantity: c.quantity,
+            stockSource: "none" as const,
+            locationId: null,
+          }))
+        : []),
+    ];
+    let claimId: string | undefined;
+    let claimError: string | undefined;
+    if (claimLines.length > 0) {
+      try {
+        const claim = await prisma.$transaction((tx) =>
+          openClaim(tx, shop, po.id, claimLines, { userId: options.userId }),
+        );
+        claimId = claim.id;
+      } catch (err) {
+        claimError = `Stock was received, but the supplier claim could not be opened: ${
+          err instanceof Error ? err.message : "unknown error"
+        }`;
+      }
+    }
+
+    const fresh = await prisma.purchaseOrderItem.findMany({
+      where: { purchaseOrderId: po.id },
+      select: { quantityOrdered: true, quantityReceived: true, quantityCancelled: true },
+    });
+    const status = derivePoStatus(fresh, po.status as POStatus);
+
+    // actualDeliveryDate is the FIRST delivery; a later top-up does not move it.
+    const firstDelivery = moved > 0 && po.actualDeliveryDate === null;
+    await prisma.purchaseOrder.update({
+      where: { id: po.id },
+      data: { status, ...(firstDelivery ? { actualDeliveryDate: receivedAt } : {}) },
+    });
+
+    // Lead time is measured from when the PO was actually sent to when stock first arrived.
+    // A PO received without ever being marked sent contributes nothing — skipping the
+    // observation beats inventing a send date and poisoning the supplier's variance. Later
+    // deliveries against the same PO are not new observations: counting a backorder as a
+    // second lead time would weight one PO twice.
+    if (firstDelivery && po.supplierId && po.sentAt) {
+      await recordSupplierLeadTime(shop, po.supplierId, po.sentAt, receivedAt);
+    }
+
     return {
-      ok: false,
-      error: lines.find((l) => l.error)?.error ?? "No stock could be received",
+      ok: true,
       lines,
       failed,
       moved,
       shopifyWarnings,
       locationScoped: !!receiptLocationId,
+      status,
+      closeSkipped,
+      claimId,
+      claimError,
     };
+  } finally {
+    await releaseReceiptHold(prisma, po.id, held);
   }
-
-  if (receiptLines.length > 0) {
-    await prisma.purchaseOrderReceipt.create({
-      data: {
-        shop,
-        purchaseOrderId: po.id,
-        receivedAt,
-        locationId: receiptLocationId,
-        createdByUserId: options.userId ?? null,
-        lines: { create: receiptLines },
-      },
-    });
-  }
-
-  let closeSkipped: string | undefined;
-  let cancelledLines: { purchaseOrderItemId: string; quantity: number }[] = [];
-  if (options.closeRemaining) {
-    if (failed > 0) {
-      closeSkipped =
-        "The remainder was left on order because some lines could not be received — fix those first, then close it";
-    } else {
-      cancelledLines = await cancelOutstanding(prisma, po.items);
-    }
-  }
-
-  // One claim per delivery covers both what arrived damaged and, when closing short,
-  // what never arrived. The stock is already where it belongs; if this fails the
-  // merchant is told and can open the claim by hand from the PO page.
-  const claimLines: NewClaimLine[] = [
-    ...damagedClaimLines,
-    ...(options.claimMissing
-      ? cancelledLines.map((c) => ({
-          purchaseOrderItemId: c.purchaseOrderItemId,
-          type: "missing" as const,
-          quantity: c.quantity,
-          stockSource: "none" as const,
-          locationId: null,
-        }))
-      : []),
-  ];
-  let claimId: string | undefined;
-  let claimError: string | undefined;
-  if (claimLines.length > 0) {
-    try {
-      const claim = await prisma.$transaction((tx) =>
-        openClaim(tx, shop, po.id, claimLines, { userId: options.userId }),
-      );
-      claimId = claim.id;
-    } catch (err) {
-      claimError = `Stock was received, but the supplier claim could not be opened: ${
-        err instanceof Error ? err.message : "unknown error"
-      }`;
-    }
-  }
-
-  const fresh = await prisma.purchaseOrderItem.findMany({
-    where: { purchaseOrderId: po.id },
-    select: { quantityOrdered: true, quantityReceived: true, quantityCancelled: true },
-  });
-  const status = derivePoStatus(fresh, po.status as POStatus);
-
-  // actualDeliveryDate is the FIRST delivery; a later top-up does not move it.
-  const firstDelivery = moved > 0 && po.actualDeliveryDate === null;
-  await prisma.purchaseOrder.update({
-    where: { id: po.id },
-    data: { status, ...(firstDelivery ? { actualDeliveryDate: receivedAt } : {}) },
-  });
-
-  // Lead time is measured from when the PO was actually sent to when stock first arrived.
-  // A PO received without ever being marked sent contributes nothing — skipping the
-  // observation beats inventing a send date and poisoning the supplier's variance. Later
-  // deliveries against the same PO are not new observations: counting a backorder as a
-  // second lead time would weight one PO twice.
-  if (firstDelivery && po.supplierId && po.sentAt) {
-    await recordSupplierLeadTime(shop, po.supplierId, po.sentAt, receivedAt);
-  }
-
-  return {
-    ok: true,
-    lines,
-    failed,
-    moved,
-    shopifyWarnings,
-    locationScoped: !!receiptLocationId,
-    status,
-    closeSkipped,
-    claimId,
-    claimError,
-  };
 }
 
 /** Cancel every line's outstanding remainder; returns what was cancelled, per line. */
@@ -596,7 +673,7 @@ export async function closePurchaseOrderRemainder(
     };
   }
   if (options.expectedVersion != null && options.expectedVersion !== po.receiptVersion) {
-    return { ok: false, error: STALE_ERROR };
+    return { ok: false, error: holdError(po) };
   }
   if (po.items.every((i) => outstandingQuantity(i) === 0)) {
     return { ok: false, error: "Nothing is outstanding on this purchase order" };
@@ -607,9 +684,10 @@ export async function closePurchaseOrderRemainder(
   // leaves the PO open rather than closed with nothing claimed.
   try {
     return await prisma.$transaction(async (tx) => {
-      if (!(await claimReceiptVersion(tx, shop, po.id, po.receiptVersion, OPEN_PO_STATUSES))) {
-        return { ok: false, error: STALE_ERROR };
-      }
+      // Taken and released inside one transaction: a close makes no Shopify call, so the
+      // hold only has to exclude a receipt running alongside it.
+      const held = await takeReceiptHold(tx, shop, po, OPEN_PO_STATUSES);
+      if (held === null) return { ok: false, error: holdError(po) };
       const cancelled = await cancelOutstanding(tx, po.items);
       const fresh = await tx.purchaseOrderItem.findMany({
         where: { purchaseOrderId: po.id },
@@ -636,6 +714,7 @@ export async function closePurchaseOrderRemainder(
         );
         claimId = claim.id;
       }
+      await releaseReceiptHold(tx, po.id, held);
       return { ok: true, cancelled: cancelled.reduce((s, c) => s + c.quantity, 0), claimId };
     });
   } catch (err) {

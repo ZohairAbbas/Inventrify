@@ -23,6 +23,7 @@ if (!/_test(\?|$)/.test(process.env.DATABASE_URL ?? "")) {
 
 const { syncShopifyInventory } = await import("./shopify-sync.server");
 const { default: prisma } = await import("../db.server");
+const { touchingUpdatedAt } = await import("./growzar/feed.server");
 
 const SHOP = "sync-test.myshopify.com";
 
@@ -109,6 +110,7 @@ async function productIds() {
 }
 
 beforeEach(async () => {
+  await prisma.growzarTombstone.deleteMany({ where: { shop: SHOP } });
   await prisma.salesRecord.deleteMany({ where: { shop: SHOP } });
   await prisma.stockSnapshot.deleteMany({ where: { shop: SHOP } });
   await prisma.productLocationStock.deleteMany({ where: { shop: SHOP } });
@@ -508,5 +510,102 @@ describe("syncShopifyInventory", () => {
 
     await prisma.purchaseOrderItem.deleteMany({ where: { purchaseOrderId: po.id } });
     await prisma.purchaseOrder.delete({ where: { id: po.id } });
+  });
+});
+
+describe("syncShopifyInventory, as the Growzar feeds see it", () => {
+  const OLD = new Date("2026-10-01T00:00:00.000Z");
+  const ageStockRows = () =>
+    prisma.$transaction(
+      touchingUpdatedAt(prisma, [
+        prisma.productLocationStock.updateMany({ where: { shop: SHOP }, data: { updatedAt: OLD } }),
+        prisma.product.updateMany({ where: { shop: SHOP }, data: { updatedAt: OLD } }),
+      ]),
+    );
+  const stockRowTimes = async () =>
+    (await prisma.productLocationStock.findMany({ where: { shop: SHOP } })).map((r) => r.updatedAt.toISOString());
+
+  it("a resync that changes nothing leaves updatedAt alone on products and stock rows", async () => {
+    const sync = () =>
+      syncShopifyInventory(
+        mockAdmin((q) => (isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) })).admin,
+        SHOP,
+      );
+    await sync();
+    await ageStockRows();
+
+    await sync();
+
+    expect(await stockRowTimes()).toEqual([OLD.toISOString()]);
+    const product = await prisma.product.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(product.updatedAt).toEqual(OLD);
+  });
+
+  it("renaming a location moves updatedAt on its stock rows", async () => {
+    await syncShopifyInventory(
+      mockAdmin((q) => (isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) })).admin,
+      SHOP,
+    );
+    await ageStockRows();
+
+    const renamed = structuredClone(locationsBody);
+    renamed.data.locations.edges[0].node.name = "Karachi Main";
+    await syncShopifyInventory(
+      mockAdmin((q) => (isLocations(q) ? { body: renamed } : { body: variantsBody([variant("1")]) })).admin,
+      SHOP,
+    );
+
+    const [time] = await stockRowTimes();
+    expect(new Date(time).getTime()).toBeGreaterThan(OLD.getTime());
+  });
+
+  it("a location Shopify stops listing moves updatedAt on the rows still at it", async () => {
+    const both = structuredClone(locationsBody);
+    both.data.locations.edges.push({ node: { id: "gid://shopify/Location/2", name: "Lahore WH", isActive: true } });
+    await syncShopifyInventory(
+      mockAdmin((q) => (isLocations(q) ? { body: both } : { body: variantsBody([variant("1")]) })).admin,
+      SHOP,
+    );
+    const lahore = await prisma.location.findFirstOrThrow({ where: { shop: SHOP, shopifyLocationId: "gid://shopify/Location/2" } });
+    // A labelled row survives the stale-level sweep, so it is still there to be touched.
+    await prisma.productLocationStock.create({
+      data: { shop: SHOP, productId: "gid://shopify/ProductVariant/1", locationId: lahore.id, onHand: 3, binLocation: "B-1" },
+    });
+    await ageStockRows();
+
+    await syncShopifyInventory(
+      mockAdmin((q) => (isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) })).admin,
+      SHOP,
+    );
+
+    const row = await prisma.productLocationStock.findFirstOrThrow({ where: { locationId: lahore.id } });
+    expect(row.updatedAt.getTime()).toBeGreaterThan(OLD.getTime());
+    expect((await prisma.location.findUniqueOrThrow({ where: { id: lahore.id } })).isActive).toBe(false);
+  });
+
+  it("reports a stock level the sync drops as a stock-levels tombstone", async () => {
+    const both = structuredClone(locationsBody);
+    both.data.locations.edges.push({ node: { id: "gid://shopify/Location/2", name: "Lahore WH", isActive: true } });
+    const atBoth = variant("1");
+    atBoth.node.inventoryItem.inventoryLevels.edges.push({
+      node: {
+        location: { id: "gid://shopify/Location/2" },
+        quantities: [
+          { name: "on_hand", quantity: 4 },
+          { name: "available", quantity: 4 },
+        ],
+      },
+    });
+    await syncShopifyInventory(
+      mockAdmin((q) => (isLocations(q) ? { body: both } : { body: variantsBody([atBoth]) })).admin,
+      SHOP,
+    );
+    await syncShopifyInventory(
+      mockAdmin((q) => (isLocations(q) ? { body: both } : { body: variantsBody([variant("1")]) })).admin,
+      SHOP,
+    );
+
+    const tombstones = await prisma.growzarTombstone.findMany({ where: { shop: SHOP } });
+    expect(tombstones.map((t) => [t.feed, t.entityId])).toEqual([["stock-levels", "1:2"]]);
   });
 });

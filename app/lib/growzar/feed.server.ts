@@ -18,7 +18,7 @@ import { platformLimiter, type RateLimiter } from "./rate-limit.server";
  */
 
 /** Feeds this release serves, as /growzar/status `capabilities`. */
-export const GROWZAR_CAPABILITIES: string[] = ["variants:read"];
+export const GROWZAR_CAPABILITIES: string[] = ["variants:read", "stock-levels:read"];
 
 export const MAX_LIMIT = 500;
 export const DEFAULT_LIMIT = 200;

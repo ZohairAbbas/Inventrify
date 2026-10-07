@@ -190,7 +190,7 @@ export async function generateAndSaveForecast(
 
   const [records, settings, product] = await Promise.all([
     prisma.salesRecord.findMany({
-      where: { productId, date: { gte: windowStart } },
+      where: { productId, date: { gte: windowStart }, quantity: { gt: 0 } },
       orderBy: { date: "asc" },
     }),
     prisma.shopSettings.findUnique({ where: { shop } }),

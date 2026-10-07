@@ -21,6 +21,7 @@ const touch = (write: Parameters<typeof touchingUpdatedAt>[1][number]) =>
 const { sign, signingPayload } = await import("./signing.server");
 const variants = await import("../../routes/api.v1.growzar.variants");
 const stockLevels = await import("../../routes/api.v1.growzar.stock-levels");
+const dailySales = await import("../../routes/api.v1.growzar.daily-sales");
 
 const SHOP = "feeds-test.myshopify.com";
 const FACTS = { shop: SHOP, shopTimezone: "Asia/Karachi", shopCurrency: "PKR", shopCountry: "PK" };
@@ -224,6 +225,28 @@ describe("GET /growzar/stock-levels", () => {
       },
     ]);
     expect(body).toMatchObject({ shopCountry: "PK", deletedStockLevelIds: [], deletedStockLevelIdsTruncated: false });
+    expect(JSON.stringify(body)).not.toContain("gid://");
+  });
+});
+
+describe("GET /growzar/daily-sales", () => {
+  it("labels each row with its shop-local day and keeps zero days", async () => {
+    await product(31);
+    await prisma.salesRecord.createMany({
+      data: [
+        { shop: SHOP, productId: variantGid(31), date: new Date("2026-10-05T00:00:00.000Z"), quantity: 4 },
+        { shop: SHOP, productId: variantGid(31), date: new Date("2026-10-06T00:00:00.000Z"), quantity: 0 },
+      ],
+    });
+
+    const { status, body } = await get(dailySales.loader, "/api/v1/growzar/daily-sales");
+    expect(status).toBe(200);
+    const rows = body.data.map((r: Record<string, unknown>) => [r.id, r.variantId, r.date, r.units]);
+    expect(rows.sort()).toEqual([
+      [`${vid(31)}:2026-10-05`, vid(31), "2026-10-05", 4],
+      [`${vid(31)}:2026-10-06`, vid(31), "2026-10-06", 0],
+    ]);
+    expect(body).toMatchObject({ shopTimezone: "Asia/Karachi", shopCountry: "PK", shopPurged: false });
     expect(JSON.stringify(body)).not.toContain("gid://");
   });
 });

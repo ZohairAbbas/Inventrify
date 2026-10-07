@@ -33,6 +33,7 @@ if (!/_test(\?|$)/.test(process.env.DATABASE_URL ?? "")) {
 
 const { syncOrderHistory } = await import("./order-sync.server");
 const { default: prisma } = await import("../db.server");
+const { touchingUpdatedAt } = await import("./growzar/feed.server");
 
 const SHOP = "order-sync-test.myshopify.com";
 const VARIANT = "gid://shopify/ProductVariant/501";
@@ -174,11 +175,13 @@ describe("syncOrderHistory without read_all_orders", () => {
     );
 
     expect(result.completed).toBe(true);
-    expect(result.recordsDeleted).toBe(3);
+    // Days the walk no longer sees are kept as 0, not deleted (Growzar reads this table
+    // incrementally, and a deleted row leaves no trace).
+    expect(result.recordsZeroed).toBe(2);
     const after = await stored();
     expect(after.get(5)).toBe(2);
-    expect(after.has(20)).toBe(false);
-    expect(after.has(40)).toBe(false);
+    expect(after.get(20)).toBe(0);
+    expect(after.get(40)).toBe(0);
     expect(after.get(25)).toBe(1);
   });
 
@@ -197,7 +200,7 @@ describe("syncOrderHistory without read_all_orders", () => {
     await seedHistory({ 5: 3, 70: 5 });
     const result = await syncOrderHistory(mockAdmin([], { failOrders: true }), SHOP);
     expect(result.completed).toBe(false);
-    expect(result.recordsDeleted).toBe(0);
+    expect(result.recordsZeroed).toBe(0);
     const after = await stored();
     expect(after.get(5)).toBe(3);
     expect(after.get(70)).toBe(5);
@@ -234,9 +237,41 @@ describe("syncOrderHistory with read_all_orders", () => {
     );
 
     const after = await stored();
-    // Day 70 had no order in Shopify's full answer, so its row was stale.
-    expect(after.has(70)).toBe(false);
+    // Day 70 had no order in Shopify's full answer, so its row was stale: kept at 0.
+    expect(after.get(70)).toBe(0);
     expect(after.get(75)).toBe(2);
     expect(after.get(120)).toBe(7);
+  });
+});
+
+describe("syncOrderHistory, as the Growzar daily-sales feed sees it", () => {
+  it("re-running moves updatedAt only on days whose units changed, and deletes nothing", async () => {
+    await seedHistory({ 5: 2, 10: 3, 20: 4, 70: 6 });
+    const OLD = new Date("2026-09-01T00:00:00.000Z");
+    await prisma.$transaction(
+      touchingUpdatedAt(prisma, [
+        prisma.salesRecord.updateMany({ where: { shop: SHOP }, data: { updatedAt: OLD } }),
+      ]),
+    );
+    const before = await prisma.salesRecord.findMany({ where: { shop: SHOP } });
+
+    // Day 5 unchanged, day 10 now 5 units, day 20's orders all cancelled, day 70 outside
+    // the 60-day window.
+    await syncOrderHistory(mockAdmin([order(5, 2), order(10, 5), order(20, 4, { cancelled: true })]), SHOP);
+
+    const after = await prisma.salesRecord.findMany({ where: { shop: SHOP } });
+    const age = (d: Date) => Math.round((dayKey(0).getTime() - d.getTime()) / DAY_MS);
+    const moved = after.filter((r) => r.updatedAt.getTime() !== OLD.getTime()).map((r) => age(r.date)).sort((a, b) => a - b);
+    expect(moved).toEqual([10, 20]);
+
+    // Nothing deleted, and every row kept its id.
+    expect(after.map((r) => r.id).sort()).toEqual(before.map((r) => r.id).sort());
+    expect((await stored()).get(20)).toBe(0);
+
+    // A second identical run moves nothing at all.
+    const settled = new Map(after.map((r) => [r.id, r.updatedAt.getTime()]));
+    await syncOrderHistory(mockAdmin([order(5, 2), order(10, 5), order(20, 4, { cancelled: true })]), SHOP);
+    const again = await prisma.salesRecord.findMany({ where: { shop: SHOP } });
+    expect(again.every((r) => settled.get(r.id) === r.updatedAt.getTime())).toBe(true);
   });
 });

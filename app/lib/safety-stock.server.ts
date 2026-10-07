@@ -66,7 +66,7 @@ export async function recomputeSafetyStock(
 
   const windowStart = new Date(Date.now() - 90 * 86400000);
   const salesRows = await prisma.salesRecord.findMany({
-    where: { productId, date: { gte: windowStart } },
+    where: { productId, date: { gte: windowStart }, quantity: { gt: 0 } },
     select: { quantity: true, date: true },
   });
 

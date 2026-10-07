@@ -54,7 +54,7 @@ async function runShopifySync() {
     archived: number;
     records: number;
     /** SalesRecord rows removed while rebuilding the reconciled days. */
-    deleted: number;
+    zeroed: number;
     completed: boolean;
     error?: string;
     skipped?: string;
@@ -76,7 +76,7 @@ async function runShopifySync() {
           synced: inventory.synced,
           archived: 0,
           records: 0,
-          deleted: 0,
+          zeroed: 0,
           completed: false,
           skipped: "uninstalled",
         });
@@ -90,7 +90,7 @@ async function runShopifySync() {
           synced: inventory.synced,
           archived: inventory.archived,
           records: orders.recordsSynced,
-          deleted: orders.recordsDeleted,
+          zeroed: orders.recordsZeroed,
           completed: false,
           skipped: "uninstalled",
         });
@@ -112,7 +112,7 @@ async function runShopifySync() {
         synced: inventory.synced,
         archived: inventory.archived,
         records: orders.recordsSynced,
-        deleted: orders.recordsDeleted,
+        zeroed: orders.recordsZeroed,
         // Either half failing makes the run partial; the caller should be able to see
         // that rather than reading the counts as a complete picture.
         completed: inventory.completed && orders.completed,
@@ -129,7 +129,7 @@ async function runShopifySync() {
           synced: 0,
           archived: 0,
           records: 0,
-          deleted: 0,
+          zeroed: 0,
           completed: false,
           skipped: "uninstalled",
         });
@@ -142,7 +142,7 @@ async function runShopifySync() {
         synced: 0,
         archived: 0,
         records: 0,
-        deleted: 0,
+        zeroed: 0,
         completed: false,
         error: message,
       });

@@ -135,7 +135,8 @@ export async function syncOrderHistory(
   shop: string,
 ): Promise<{
   recordsSynced: number;
-  recordsDeleted: number;
+  /** Stored days the walk no longer sees, kept as 0-unit rows. */
+  recordsZeroed: number;
   variantsSeen: number;
   completed: boolean;
   error?: string;
@@ -318,7 +319,7 @@ export async function syncOrderHistory(
   if (!completed) {
     return {
       recordsSynced: 0,
-      recordsDeleted: 0,
+      recordsZeroed: 0,
       variantsSeen: salesMap.size,
       completed,
       error: fatalError,
@@ -326,7 +327,7 @@ export async function syncOrderHistory(
   }
 
   let recordsSynced = 0;
-  let recordsDeleted = 0;
+  let recordsZeroed = 0;
   const variantsSeen = salesMap.size;
 
   // Only variants we track, resolved in one query rather than one per variant.
@@ -335,20 +336,21 @@ export async function syncOrderHistory(
     select: { id: true, firstSoldAt: true },
   });
 
-  // Stored history from the part of the demand window this walk did not rebuild. The
-  // estimate below needs it: estimating from the walk alone treats those days as zero.
-  const olderRows = await prisma.salesRecord.findMany({
+  // Everything stored for the demand window: the reconcile below compares against it,
+  // and the estimate needs the part this walk did not rebuild — estimating from the walk
+  // alone treats those days as zero.
+  const storedRows = await prisma.salesRecord.findMany({
     where: {
       shop,
       productId: { in: tracked.map((t) => t.id) },
-      date: { gte: since, lt: floor },
+      date: { gte: since },
     },
-    select: { productId: true, date: true, quantity: true },
+    select: { id: true, productId: true, date: true, quantity: true },
   });
-  const olderByVariant = new Map<string, Map<number, number>>();
-  for (const row of olderRows) {
-    if (!olderByVariant.has(row.productId)) olderByVariant.set(row.productId, new Map());
-    olderByVariant.get(row.productId)!.set(row.date.getTime(), row.quantity);
+  const storedByVariant = new Map<string, Map<number, { id: string; quantity: number }>>();
+  for (const row of storedRows) {
+    if (!storedByVariant.has(row.productId)) storedByVariant.set(row.productId, new Map());
+    storedByVariant.get(row.productId)!.set(row.date.getTime(), { id: row.id, quantity: row.quantity });
   }
 
   for (const { id: variantId, firstSoldAt: knownFirstSold } of tracked) {
@@ -362,28 +364,41 @@ export async function syncOrderHistory(
       quantity,
     }));
 
-    // Delete-then-insert is only safe inside a transaction. Previously a crash between
-    // the two statements left the product with no demand history at all.
+    // Reconcile the stored days against the walk, row by row, in one transaction.
     //
-    // The delete covers only days the walk saw in full. Days before `floor` are
-    // inserted only where no row exists yet (skipDuplicates), which backfills a fresh
-    // install without overwriting a complete day with the partial count the walk saw.
-    const [deleted] = await prisma.$transaction([
-      prisma.salesRecord.deleteMany({
-        where: { shop, productId: variantId, date: { gte: floor } },
-      }),
-      prisma.salesRecord.createMany({ data: records, skipDuplicates: true }),
-    ]);
-    recordsSynced += records.length;
-    recordsDeleted += deleted.count;
-
-    // What is now stored for the window: the untouched older days, then the rebuilt
-    // ones, plus any older day this walk has just created.
-    const stored = new Map(olderByVariant.get(variantId) ?? []);
-    for (const r of records) {
-      const t = r.date.getTime();
-      if (r.date >= floor || !stored.has(t)) stored.set(t, r.quantity);
+    // Days on or after `floor` were seen in full, so their count is the walk's: changed
+    // counts are updated, and a stored day the walk no longer sees (its orders were
+    // cancelled) is set to 0 rather than deleted. Rows keep their id and an updatedAt
+    // that moves only when the count does, which is what lets Growzar read this table
+    // incrementally — a delete-and-reinsert left no trace of what changed.
+    //
+    // Days before `floor` are created only where no row exists yet, which backfills a
+    // fresh install without overwriting a complete day with the partial count the walk
+    // saw.
+    const existing = storedByVariant.get(variantId) ?? new Map<number, { id: string; quantity: number }>();
+    const walked = new Map(records.map((r) => [r.date.getTime(), r.quantity]));
+    const toCreate = records.filter((r) => !existing.has(r.date.getTime()));
+    const toSet: { id: string; quantity: number }[] = [];
+    for (const [t, row] of existing) {
+      if (t < floor.getTime()) continue;
+      const quantity = walked.get(t) ?? 0;
+      if (quantity !== row.quantity) toSet.push({ id: row.id, quantity });
     }
+    if (toCreate.length > 0 || toSet.length > 0) {
+      await prisma.$transaction([
+        prisma.salesRecord.createMany({ data: toCreate, skipDuplicates: true }),
+        ...toSet.map(({ id, quantity }) =>
+          prisma.salesRecord.update({ where: { id }, data: { quantity } }),
+        ),
+      ]);
+    }
+    recordsSynced += records.length;
+    recordsZeroed += toSet.filter((u) => u.quantity === 0).length;
+
+    // What is now stored for the window.
+    const stored = new Map([...existing].map(([t, row]) => [t, row.quantity]));
+    for (const r of toCreate) stored.set(r.date.getTime(), r.quantity);
+    for (const [t] of existing) if (t >= floor.getTime()) stored.set(t, walked.get(t) ?? 0);
     const history = [...stored.entries()].map(([t, quantity]) => ({
       date: new Date(t),
       quantity,
@@ -513,7 +528,7 @@ export async function syncOrderHistory(
     });
   }
 
-  return { recordsSynced, recordsDeleted, variantsSeen, completed };
+  return { recordsSynced, recordsZeroed, variantsSeen, completed };
 }
 
 /**

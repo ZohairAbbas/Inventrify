@@ -285,12 +285,19 @@ model SalesRecord {
   shop      String
   productId String
   product   Product  @relation(fields: [productId], references: [id])
-  date      DateTime // midnight UTC
+  // The shop-local calendar day (shopDateKey in the shop's timezone), written as that
+  // date at 00:00 UTC. Not the UTC day: read it as a label, never as an instant.
+  date      DateTime
   quantity  Int
   createdAt DateTime @default(now())
+  // Moves only when `quantity` changes. The order sync reconciles rows in place, and a
+  // day whose orders were all cancelled is kept at 0 rather than deleted, so the Growzar
+  // daily-sales feed can read this table incrementally.
+  updatedAt DateTime @default(now()) @updatedAt
 
   @@unique([productId, date])
   @@index([shop, date])
+  @@index([shop, updatedAt, id])
 }
 
 // Daily stock snapshots for analytics / trend charts

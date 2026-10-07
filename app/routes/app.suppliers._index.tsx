@@ -5,6 +5,7 @@ import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { useEffect } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import { tombstoneData } from "../lib/growzar/feed.server";
 import { Button, Card, DataTable, PageHead, Pagination, type DataTableColumn } from "../design";
 import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
 import { useListParams } from "../lib/use-list-params";
@@ -87,6 +88,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       data: { supplierId: null },
     }),
     prisma.supplier.delete({ where: { id: supplier.id } }),
+    // Reported to Growzar's suppliers feed.
+    prisma.growzarTombstone.createMany({ data: tombstoneData(session.shop, "suppliers", [supplier.id]) }),
   ]);
 
   return { ok: true as const, error: "" };

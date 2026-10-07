@@ -90,6 +90,17 @@ cron.schedule('15 * * * *', () => {
   timezone: TIMEZONE,
 });
 
+// Daily stock snapshot - hourly at :05.
+// Writes one row per live variant per shop-local day; only the first run after each
+// shop's local midnight writes anything, so this records opening stock and catches up
+// after a missed hour. Reads our own table only — no Shopify calls.
+cron.schedule('5 * * * *', () => {
+  runJob('stockSnapshots', '/api/cron/snapshots', { quiet: true });
+}, {
+  scheduled: true,
+  timezone: TIMEZONE,
+});
+
 // Planning refresh - daily at 05:45 PKT, before the alert run at 06:30 so alerts are
 // raised against fresh forecasts. Scores elapsed forecasts, recomputes ABC/XYZ, then
 // regenerates forecasts and safety stock.

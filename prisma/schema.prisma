@@ -72,8 +72,32 @@ model ShopSettings {
   rtoDataThrough     DateTime?
   // Orders that contributed to the current derived RTO figures.
   rtoOrdersAttributed Int      @default(0)
+  // The shop's own facts as Shopify reports them, refreshed on every background sync.
+  // Kept apart from `timezone` / `currency` above, which carry "UTC" / "USD" defaults and
+  // are written only when the merchant opens the app: the Growzar feeds must never send a
+  // default as if it were the shop's, so null here means "not known yet".
+  shopCurrency       String?  // ISO-4217, Shopify shop.currencyCode
+  shopTimezone       String?  // IANA, Shopify shop.ianaTimezone
+  shopCountry        String?  // ISO-3166 alpha-2, Shopify shop.billingAddress.countryCodeV2
+  shopFactsSyncedAt  DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
+}
+
+// Hard deletes reported to Growzar (API-CONTRACT §6.2): a deleted row must be reported,
+// never left as silent absence. One row per deleted entity, written in the same
+// transaction as the delete. `feed` names the Growzar feed the id belongs to.
+//
+// A shop purge deletes these too: a purged shop has no install, and every feed answers it
+// with 410 shop_not_connected, which tells Growzar to drop the store as a whole.
+model GrowzarTombstone {
+  id        String   @id @default(cuid())
+  shop      String
+  feed      String
+  entityId  String
+  deletedAt DateTime @default(now())
+
+  @@index([shop, feed, deletedAt])
 }
 
 model Supplier {

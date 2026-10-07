@@ -1,4 +1,5 @@
 import prisma from "../db.server";
+import { PURGE_MARKER_FEED, PURGE_MARKER_ID } from "./growzar/feed.server";
 
 /**
  * Erase everything Inventorify holds for a shop.
@@ -74,6 +75,18 @@ export async function purgeShopData(
   await prisma.supplierLedgerEntry.deleteMany({ where: { shop } });
   await prisma.supplier.deleteMany({ where: { shop } });
   await prisma.shopSettings.deleteMany({ where: { shop } });
+
+  // Growzar tombstones go with the rows they described. A keep-session purge leaves one
+  // marker in their place: the shop stays installed, so its feeds keep answering, and
+  // they report `shopPurged` to say that everything Growzar holds for it is now gone.
+  // Without it a wipe would look like nothing happening. Uninstall and redaction need no
+  // marker — the session goes too, and the feeds answer 410 shop_not_connected.
+  await prisma.growzarTombstone.deleteMany({ where: { shop } });
+  if (keepSession) {
+    await prisma.growzarTombstone.create({
+      data: { shop, feed: PURGE_MARKER_FEED, entityId: PURGE_MARKER_ID },
+    });
+  }
 
   // Session goes last, and only when the shop is genuinely gone.
   //

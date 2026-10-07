@@ -22,6 +22,8 @@ const { sign, signingPayload } = await import("./signing.server");
 const variants = await import("../../routes/api.v1.growzar.variants");
 const stockLevels = await import("../../routes/api.v1.growzar.stock-levels");
 const dailySales = await import("../../routes/api.v1.growzar.daily-sales");
+const purchaseOrders = await import("../../routes/api.v1.growzar.purchase-orders");
+const { deleteDraftPurchaseOrder } = await import("../purchase-order.server");
 
 const SHOP = "feeds-test.myshopify.com";
 const FACTS = { shop: SHOP, shopTimezone: "Asia/Karachi", shopCurrency: "PKR", shopCountry: "PK" };
@@ -247,6 +249,111 @@ describe("GET /growzar/daily-sales", () => {
       [`${vid(31)}:2026-10-06`, vid(31), "2026-10-06", 0],
     ]);
     expect(body).toMatchObject({ shopTimezone: "Asia/Karachi", shopCountry: "PK", shopPurged: false });
+    expect(JSON.stringify(body)).not.toContain("gid://");
+  });
+});
+
+describe("GET /growzar/purchase-orders", () => {
+  const OLD = new Date("2026-09-01T00:00:00.000Z");
+  const agePo = (id: string) =>
+    prisma.$transaction(touchingUpdatedAt(prisma, [prisma.purchaseOrder.update({ where: { id }, data: { updatedAt: OLD } })]));
+  const poUpdatedAt = async (id: string) => (await prisma.purchaseOrder.findUniqueOrThrow({ where: { id } })).updatedAt;
+
+  async function purchaseOrder() {
+    await product(41);
+    const supplier = await prisma.supplier.create({ data: { shop: SHOP, name: "Faisal Textiles" } });
+    return prisma.purchaseOrder.create({
+      data: {
+        shop: SHOP,
+        poNumber: `PO-G5-${Date.now()}`,
+        status: "sent",
+        supplierId: supplier.id,
+        totalCost: 1000,
+        expectedDeliveryDate: new Date("2026-10-20T00:00:00.000Z"),
+        items: { create: [{ productId: variantGid(41), quantityOrdered: 10, quantityReceived: 3, quantityCancelled: 2, unitCost: 100 }] },
+      },
+      include: { items: true, supplier: true },
+    });
+  }
+
+  it("editing a PO item moves the PO's updatedAt; a no-op edit does not", async () => {
+    const po = await purchaseOrder();
+    await agePo(po.id);
+
+    await prisma.purchaseOrderItem.update({ where: { id: po.items[0].id }, data: { quantityReceived: 3 } });
+    expect(await poUpdatedAt(po.id)).toEqual(OLD);
+
+    await prisma.purchaseOrderItem.update({ where: { id: po.items[0].id }, data: { quantityReceived: 5 } });
+    expect((await poUpdatedAt(po.id)).getTime()).toBeGreaterThan(OLD.getTime());
+  });
+
+  it("adding or removing a line, or renaming the supplier, moves the PO's updatedAt", async () => {
+    const po = await purchaseOrder();
+
+    await agePo(po.id);
+    await prisma.purchaseOrderItem.deleteMany({ where: { purchaseOrderId: po.id } });
+    expect((await poUpdatedAt(po.id)).getTime()).toBeGreaterThan(OLD.getTime());
+
+    await agePo(po.id);
+    await prisma.purchaseOrderItem.create({ data: { purchaseOrderId: po.id, productId: variantGid(41), quantityOrdered: 1 } });
+    expect((await poUpdatedAt(po.id)).getTime()).toBeGreaterThan(OLD.getTime());
+
+    await agePo(po.id);
+    await prisma.supplier.update({ where: { id: po.supplierId! }, data: { notes: "unrelated" } });
+    expect(await poUpdatedAt(po.id)).toEqual(OLD);
+    await prisma.supplier.update({ where: { id: po.supplierId! }, data: { name: "Faisal Textiles Ltd" } });
+    expect((await poUpdatedAt(po.id)).getTime()).toBeGreaterThan(OLD.getTime());
+  });
+
+  it("the touch does not leak: a later no-op write in the same transaction keeps its updatedAt", async () => {
+    const po = await purchaseOrder();
+    const other = await prisma.purchaseOrder.create({ data: { shop: SHOP, poNumber: `PO-G5-other-${Date.now()}` } });
+    await agePo(other.id);
+    await prisma.$transaction([
+      prisma.purchaseOrderItem.update({ where: { id: po.items[0].id }, data: { quantityReceived: 6 } }),
+      prisma.purchaseOrder.update({ where: { id: other.id }, data: { status: "draft" } }),
+    ]);
+    expect(await poUpdatedAt(other.id)).toEqual(OLD);
+  });
+
+  it("deleting a draft lists it in deletedPurchaseOrderIds; a sent PO cannot be deleted", async () => {
+    const since = new Date(Date.now() - 1000);
+    const sent = await purchaseOrder();
+    const draft = await prisma.purchaseOrder.create({ data: { shop: SHOP, poNumber: `PO-G5-draft-${Date.now()}` } });
+
+    expect(await deleteDraftPurchaseOrder(SHOP, sent.id)).toBe(false);
+    expect(await deleteDraftPurchaseOrder(SHOP, draft.id)).toBe(true);
+
+    const { body } = await get(purchaseOrders.loader, `/api/v1/growzar/purchase-orders?updatedSince=${since.toISOString()}`);
+    expect(body.deletedPurchaseOrderIds).toEqual([draft.id]);
+    expect(body.data.map((po: { id: string }) => po.id)).toEqual([sent.id]);
+  });
+
+  it("returns lines nested with onOrder and money, and dates as the contract says", async () => {
+    const po = await purchaseOrder();
+    const { status, body } = await get(purchaseOrders.loader, "/api/v1/growzar/purchase-orders");
+    expect(status).toBe(200);
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0]).toMatchObject({
+      id: po.id,
+      status: "sent",
+      supplierId: po.supplierId,
+      supplierName: "Faisal Textiles",
+      expectedDeliveryDate: "2026-10-20",
+      actualDeliveryDate: null,
+      totalCost: { amount: "1000.00", currency: "PKR" },
+      items: [
+        {
+          variantId: vid(41),
+          quantityOrdered: 10,
+          quantityReceived: 3,
+          quantityCancelled: 2,
+          onOrder: 5,
+          unitCost: { amount: "100.00", currency: "PKR" },
+        },
+      ],
+    });
+    expect(body).toMatchObject({ deletedPurchaseOrderIds: [], deletedPurchaseOrderIdsTruncated: false });
     expect(JSON.stringify(body)).not.toContain("gid://");
   });
 });

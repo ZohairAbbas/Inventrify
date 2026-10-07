@@ -1,6 +1,7 @@
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import type { Prisma } from "@prisma/client";
 import prisma from "../db.server";
+import { tombstoneData } from "./growzar/feed.server";
 import {
   applyLocalStockState,
   applyLocationDelta,
@@ -145,6 +146,22 @@ export interface ReceiveResult {
 
 const STALE_ERROR =
   "This purchase order changed since you opened it — reload the page and try again.";
+
+/**
+ * Delete a draft PO. Anything past draft is a record of what was ordered and stays.
+ *
+ * The deletion is reported to Growzar's purchase-orders feed as a tombstone, in the same
+ * transaction. Returns whether a draft was deleted.
+ */
+export async function deleteDraftPurchaseOrder(shop: string, poId: string): Promise<boolean> {
+  return prisma.$transaction(async (tx) => {
+    const { count } = await tx.purchaseOrder.deleteMany({ where: { id: poId, shop, status: "draft" } });
+    if (count > 0) {
+      await tx.growzarTombstone.createMany({ data: tombstoneData(shop, "purchase-orders", [poId]) });
+    }
+    return count > 0;
+  });
+}
 
 /**
  * Mark a draft PO as sent.

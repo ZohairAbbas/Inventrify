@@ -9,7 +9,7 @@ import prisma from "../db.server";
 import { Button, Card, DataTable, FilterChips, PageHead, Pagination, POStatusPill, type DataTableColumn } from "../design";
 import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
 import { useListParams } from "../lib/use-list-params";
-import { markPurchaseOrderSent, receivePurchaseOrder } from "../lib/purchase-order.server";
+import { deleteDraftPurchaseOrder, markPurchaseOrderSent, receivePurchaseOrder } from "../lib/purchase-order.server";
 import { outstandingQuantity } from "../lib/purchase-order-status";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
@@ -97,10 +97,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (intent === "delete") {
-    const { count } = await prisma.purchaseOrder.deleteMany({
-      where: { id: poId, shop, status: "draft" },
-    });
-    if (count === 0) {
+    if (!(await deleteDraftPurchaseOrder(shop, poId))) {
       return { ok: false as const, error: "Only draft purchase orders can be deleted", message: "" };
     }
     return { ok: true as const, error: "", message: "Draft purchase order deleted" };

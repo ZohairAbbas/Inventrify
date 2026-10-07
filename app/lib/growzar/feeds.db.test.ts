@@ -20,6 +20,7 @@ const touch = (write: Parameters<typeof touchingUpdatedAt>[1][number]) =>
   prisma.$transaction(touchingUpdatedAt(prisma, [write]));
 const { sign, signingPayload } = await import("./signing.server");
 const variants = await import("../../routes/api.v1.growzar.variants");
+const stockLevels = await import("../../routes/api.v1.growzar.stock-levels");
 
 const SHOP = "feeds-test.myshopify.com";
 const FACTS = { shop: SHOP, shopTimezone: "Asia/Karachi", shopCurrency: "PKR", shopCountry: "PK" };
@@ -193,5 +194,36 @@ describe("GET /growzar/variants", () => {
     const { status, body } = await get(variants.loader, "/api/v1/growzar/variants");
     expect(status).toBe(410);
     expect(body.errorType).toBe("shop_not_connected");
+  });
+});
+
+describe("GET /growzar/stock-levels", () => {
+  it("returns numeric ids, the location's name and state, and available = onHand - reserved", async () => {
+    await product(21);
+    const location = await prisma.location.create({
+      data: { shop: SHOP, shopifyLocationId: "gid://shopify/Location/880077", name: "Karachi WH", isActive: false },
+    });
+    await prisma.productLocationStock.create({
+      data: { shop: SHOP, productId: variantGid(21), locationId: location.id, onHand: 10, reserved: 3, damaged: 2 },
+    });
+
+    const { status, body } = await get(stockLevels.loader, "/api/v1/growzar/stock-levels");
+    expect(status).toBe(200);
+    expect(body.data).toEqual([
+      {
+        id: `${vid(21)}:880077`,
+        variantId: vid(21),
+        locationId: "880077",
+        locationName: "Karachi WH",
+        locationActive: false,
+        onHand: 10,
+        reserved: 3,
+        damaged: 2,
+        available: 7,
+        updatedAt: expect.stringMatching(/Z$/),
+      },
+    ]);
+    expect(body).toMatchObject({ shopCountry: "PK", deletedStockLevelIds: [], deletedStockLevelIdsTruncated: false });
+    expect(JSON.stringify(body)).not.toContain("gid://");
   });
 });

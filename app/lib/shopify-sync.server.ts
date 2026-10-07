@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import prisma from "../db.server";
+import { numericId, tombstoneData, touchingUpdatedAt } from "./growzar/feed.server";
 import { RECEIVABLE_PO_STATUSES } from "./purchase-order-status";
 import { calculateReorderPoint } from "./forecast.server";
 import {
@@ -15,6 +16,11 @@ import {
   mapPool,
   type Paged,
 } from "./shopify-graphql.server";
+
+/** The id the Growzar stock-levels feed gives a ProductLocationStock row: variant:location. */
+export function stockLevelId(variantGid: string, shopifyLocationGid: string): string {
+  return `${numericId(variantGid)}:${numericId(shopifyLocationGid)}`;
+}
 
 /**
  * Trim a barcode to a storable value.
@@ -94,6 +100,15 @@ export async function syncLocations(
   let cursor: string | null = null;
   let hasNextPage = true;
 
+  const known = new Map(
+    (
+      await prisma.location.findMany({
+        where: { shop },
+        select: { id: true, shopifyLocationId: true, name: true, isActive: true },
+      })
+    ).map((l) => [l.shopifyLocationId, l]),
+  );
+
   while (hasNextPage) {
     const data: LocationsResponse = await graphqlWithRetry<LocationsResponse>(
       admin,
@@ -102,6 +117,16 @@ export async function syncLocations(
     );
 
     for (const { node } of data.locations.edges) {
+      const existing = known.get(node.id);
+      if (existing && (existing.name !== node.name || existing.isActive !== node.isActive)) {
+        await updateLocation(existing.id, { name: node.name, isActive: node.isActive });
+        map.set(node.id, existing.id);
+        continue;
+      }
+      if (existing) {
+        map.set(node.id, existing.id);
+        continue;
+      }
       const location = await prisma.location.upsert({
         where: { shop_shopifyLocationId: { shop, shopifyLocationId: node.id } },
         create: { shop, shopifyLocationId: node.id, name: node.name, isActive: node.isActive },
@@ -124,13 +149,28 @@ export async function syncLocations(
   // empty page from a partial outage would do it — would have its entire location list
   // deactivated on the strength of one bad response.
   if (map.size > 0) {
-    await prisma.location.updateMany({
-      where: { shop, isActive: true, shopifyLocationId: { notIn: [...map.keys()] } },
-      data: { isActive: false },
-    });
+    for (const location of known.values()) {
+      if (location.isActive && !map.has(location.shopifyLocationId)) {
+        await updateLocation(location.id, { isActive: false });
+      }
+    }
   }
 
   return map;
+}
+
+/**
+ * Rename or (de)activate a location, and move `updatedAt` on its stock rows in the same
+ * transaction: the Growzar stock-levels feed returns each row's location name and active
+ * flag, so a change to either is a change to every row at that location.
+ */
+async function updateLocation(id: string, data: { name?: string; isActive: boolean }): Promise<void> {
+  await prisma.$transaction(
+    touchingUpdatedAt(prisma, [
+      prisma.location.update({ where: { id }, data }),
+      prisma.productLocationStock.updateMany({ where: { locationId: id }, data: { updatedAt: new Date() } }),
+    ]),
+  );
 }
 
 /**
@@ -670,9 +710,23 @@ export async function syncShopifyInventory(
               where: { ...stale, binLocation: { not: null } },
               data: { onHand: 0, reserved: 0, damaged: 0 },
             });
-            await prisma.productLocationStock.deleteMany({
+            // Deleted rows are reported to Growzar as tombstones, in the same transaction.
+            const gone = await prisma.productLocationStock.findMany({
               where: { ...stale, binLocation: null },
+              select: { id: true, location: { select: { shopifyLocationId: true } } },
             });
+            if (gone.length > 0) {
+              await prisma.$transaction([
+                prisma.productLocationStock.deleteMany({ where: { id: { in: gone.map((g) => g.id) } } }),
+                prisma.growzarTombstone.createMany({
+                  data: tombstoneData(
+                    shop,
+                    "stock-levels",
+                    gone.map((g) => stockLevelId(variant.id, g.location.shopifyLocationId)),
+                  ),
+                }),
+              ]);
+            }
           }
 
           return true;

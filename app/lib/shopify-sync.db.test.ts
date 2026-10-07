@@ -609,3 +609,13 @@ describe("syncShopifyInventory, as the Growzar feeds see it", () => {
     expect(tombstones.map((t) => [t.feed, t.entityId])).toEqual([["stock-levels", "1:2"]]);
   });
 });
+
+describe("syncShopifyInventory and the daily stock snapshot", () => {
+  it("no longer writes per-variant snapshots; the scheduled job owns them", async () => {
+    await syncShopifyInventory(
+      mockAdmin((q) => (isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) })).admin,
+      SHOP,
+    );
+    expect(await prisma.stockSnapshot.count({ where: { shop: SHOP } })).toBe(0);
+  });
+});

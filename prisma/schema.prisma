@@ -300,18 +300,28 @@ model SalesRecord {
   @@index([shop, updatedAt, id])
 }
 
-// Daily stock snapshots for analytics / trend charts
+// Daily stock snapshots for analytics / trend charts, and for Growzar's "days out of
+// stock". Written once per live variant per shop-local day by the scheduled snapshot job
+// (lib/stock-snapshot.server), whether or not a product sync ran that day.
+//
+// `date` is the shop-local day at 00:00 UTC for rows the job writes. Rows written before
+// it (by the product sync, first sync of the UTC day) hold the UTC day instead;
+// `observedAt` says when the stock was actually read, and for those rows is their
+// createdAt.
 model StockSnapshot {
-  id        String   @id @default(cuid())
-  shop      String
-  productId String
-  product   Product  @relation(fields: [productId], references: [id])
-  date      DateTime // midnight UTC
-  stock     Int
-  createdAt DateTime @default(now())
+  id         String   @id @default(cuid())
+  shop       String
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+  date       DateTime
+  stock      Int
+  observedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @default(now()) @updatedAt
 
   @@unique([productId, date])
   @@index([shop, date])
+  @@index([shop, updatedAt, id])
 }
 
 // Daily shop-wide snapshot, for the dashboard's KPI sparklines.

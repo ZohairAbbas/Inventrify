@@ -788,7 +788,9 @@ export async function syncShopifyInventory(
     }
   }
 
-  // Daily stock snapshot — live products only.
+  // The per-variant daily stock snapshot is written by its own scheduled job
+  // (lib/stock-snapshot.server), per shop-local day, whether or not this sync runs. What
+  // remains here is the shop-wide one, still per UTC day.
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
   const allProducts = await prisma.product.findMany({
@@ -800,15 +802,6 @@ export async function syncShopifyInventory(
       avgMargin: true,
       fulfilledInTransit: true,
     },
-  });
-  await prisma.stockSnapshot.createMany({
-    data: allProducts.map((p) => ({
-      shop,
-      productId: p.id,
-      date: today,
-      stock: p.currentStock,
-    })),
-    skipDuplicates: true,
   });
 
   // Shop-wide snapshot for the dashboard sparklines.

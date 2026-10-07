@@ -25,6 +25,8 @@ const dailySales = await import("../../routes/api.v1.growzar.daily-sales");
 const purchaseOrders = await import("../../routes/api.v1.growzar.purchase-orders");
 const { deleteDraftPurchaseOrder } = await import("../purchase-order.server");
 const suppliers = await import("../../routes/api.v1.growzar.suppliers");
+const stockSnapshots = await import("../../routes/api.v1.growzar.stock-snapshots");
+const { writeDailySnapshots } = await import("../stock-snapshot.server");
 
 const SHOP = "feeds-test.myshopify.com";
 const FACTS = { shop: SHOP, shopTimezone: "Asia/Karachi", shopCurrency: "PKR", shopCountry: "PK" };
@@ -397,5 +399,58 @@ describe("GET /growzar/suppliers", () => {
       expect(text).not.toContain(secret);
     }
     expect(body).toMatchObject({ deletedSupplierIds: [], deletedSupplierIdsTruncated: false });
+  });
+});
+
+describe("daily stock snapshot job", () => {
+  beforeEach(async () => {
+    await prisma.shopSettings.update({ where: { shop: SHOP }, data: { timezone: "Asia/Karachi" } });
+  });
+
+  it("writes one row per live variant per shop-local day, and a second run that day writes 0", async () => {
+    await product(51, { currentStock: 7 });
+    await product(52, { currentStock: 0 });
+    await product(53, { currentStock: 4, isArchived: true });
+
+    // 20:30 UTC on 5 Oct is 01:30 on 6 Oct in Karachi.
+    const first = await writeDailySnapshots(SHOP, new Date("2026-10-05T20:30:00.000Z"));
+    expect(first).toEqual({ date: "2026-10-06", written: 2, variants: 2 });
+
+    const again = await writeDailySnapshots(SHOP, new Date("2026-10-06T10:00:00.000Z"));
+    expect(again).toEqual({ date: "2026-10-06", written: 0, variants: 2 });
+
+    const rows = await prisma.stockSnapshot.findMany({ where: { shop: SHOP }, orderBy: { productId: "asc" } });
+    expect(rows.map((r) => [r.productId, r.date.toISOString().slice(0, 10), r.stock])).toEqual([
+      [variantGid(51), "2026-10-06", 7],
+      [variantGid(52), "2026-10-06", 0],
+    ]);
+    expect(rows[0].observedAt.toISOString()).toBe("2026-10-05T20:30:00.000Z");
+
+    const nextDay = await writeDailySnapshots(SHOP, new Date("2026-10-06T19:05:00.000Z"));
+    expect(nextDay).toMatchObject({ date: "2026-10-07", written: 2 });
+  });
+
+  it("the feed labels every row by the shop-local day it was observed, old UTC-day rows included", async () => {
+    await product(54);
+    // An old product-sync row: UTC day 5 Oct, read at 00:15 UTC = 05:15 in Karachi.
+    await prisma.stockSnapshot.create({
+      data: {
+        shop: SHOP,
+        productId: variantGid(54),
+        date: new Date("2026-10-05T00:00:00.000Z"),
+        stock: 3,
+        observedAt: new Date("2026-10-05T00:15:00.000Z"),
+      },
+    });
+    await writeDailySnapshots(SHOP, new Date("2026-10-05T19:30:00.000Z"));
+
+    const { status, body } = await get(stockSnapshots.loader, "/api/v1/growzar/stock-snapshots");
+    expect(status).toBe(200);
+    const rows = body.data.map((r: Record<string, unknown>) => [r.variantId, r.date, r.stock, r.observedAt]);
+    expect(rows.sort()).toEqual([
+      [vid(54), "2026-10-05", 3, "2026-10-05T00:15:00.000Z"],
+      [vid(54), "2026-10-06", 0, "2026-10-05T19:30:00.000Z"],
+    ]);
+    expect(JSON.stringify(body)).not.toContain("gid://");
   });
 });

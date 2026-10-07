@@ -24,6 +24,7 @@ const stockLevels = await import("../../routes/api.v1.growzar.stock-levels");
 const dailySales = await import("../../routes/api.v1.growzar.daily-sales");
 const purchaseOrders = await import("../../routes/api.v1.growzar.purchase-orders");
 const { deleteDraftPurchaseOrder } = await import("../purchase-order.server");
+const suppliers = await import("../../routes/api.v1.growzar.suppliers");
 
 const SHOP = "feeds-test.myshopify.com";
 const FACTS = { shop: SHOP, shopTimezone: "Asia/Karachi", shopCurrency: "PKR", shopCountry: "PK" };
@@ -355,5 +356,46 @@ describe("GET /growzar/purchase-orders", () => {
     });
     expect(body).toMatchObject({ deletedPurchaseOrderIds: [], deletedPurchaseOrderIdsTruncated: false });
     expect(JSON.stringify(body)).not.toContain("gid://");
+  });
+});
+
+describe("GET /growzar/suppliers", () => {
+  it("returns lead time as set and as measured, and no contact details", async () => {
+    const supplier = await prisma.supplier.create({
+      data: {
+        shop: SHOP,
+        name: "Faisal Textiles",
+        contactName: "Contact Person",
+        email: "supplier@example.test",
+        phone: "+920000000000",
+        address: "Somewhere",
+        leadTimeDays: 9,
+        avgActualLeadTime: 11.5,
+        leadTimeVariance: 2.25,
+        totalPosReceived: 4,
+        minOrderValue: 0,
+      },
+    });
+
+    const { status, body } = await get(suppliers.loader, "/api/v1/growzar/suppliers");
+    expect(status).toBe(200);
+    expect(body.data).toEqual([
+      {
+        id: supplier.id,
+        name: "Faisal Textiles",
+        leadTimeDays: 9,
+        avgActualLeadTime: 11.5,
+        leadTimeSigma: 2.25,
+        totalPosReceived: 4,
+        minOrderValue: { amount: "0.00", currency: "PKR" },
+        isActive: true,
+        updatedAt: expect.stringMatching(/Z$/),
+      },
+    ]);
+    const text = JSON.stringify(body);
+    for (const secret of ["Contact Person", "supplier@example.test", "+920000000000", "Somewhere"]) {
+      expect(text).not.toContain(secret);
+    }
+    expect(body).toMatchObject({ deletedSupplierIds: [], deletedSupplierIdsTruncated: false });
   });
 });

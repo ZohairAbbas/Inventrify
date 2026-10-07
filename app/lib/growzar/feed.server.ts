@@ -1,4 +1,5 @@
 import { json } from "@remix-run/node";
+import type { Prisma, PrismaClient } from "@prisma/client";
 import prisma from "../../db.server";
 import { authenticatePlatformRequest, growzarError } from "./platform-auth.server";
 import { platformLimiter, type RateLimiter } from "./rate-limit.server";
@@ -17,7 +18,7 @@ import { platformLimiter, type RateLimiter } from "./rate-limit.server";
  */
 
 /** Feeds this release serves, as /growzar/status `capabilities`. */
-export const GROWZAR_CAPABILITIES: string[] = [];
+export const GROWZAR_CAPABILITIES: string[] = ["variants:read"];
 
 export const MAX_LIMIT = 500;
 export const DEFAULT_LIMIT = 200;
@@ -290,4 +291,20 @@ export const dayLabel = (value: Date): string => value.toISOString().slice(0, 10
 /** Record hard deletes for a feed. Pass the transaction client when inside one. */
 export function tombstoneData(shop: string, feed: string, entityIds: string[]) {
   return entityIds.map((entityId) => ({ shop, feed, entityId }));
+}
+
+/**
+ * Lift the no-op guard on updatedAt for one transaction.
+ *
+ * A database trigger (migration 20261007130000) keeps `updatedAt` unchanged when an
+ * UPDATE changes no other column, so the hourly syncs' rewrites do not make every row
+ * look new to Growzar. A write whose whole point is to move updatedAt — telling Growzar
+ * a row changed when the change lives in another table — would be swallowed by that
+ * guard, so it runs behind this: pass the result to `prisma.$transaction([...])`.
+ */
+export function touchingUpdatedAt(
+  db: Pick<PrismaClient, "$executeRaw">,
+  writes: Prisma.PrismaPromise<unknown>[],
+): Prisma.PrismaPromise<unknown>[] {
+  return [db.$executeRaw`SELECT set_config('growzar.touch', 'on', true)`, ...writes];
 }

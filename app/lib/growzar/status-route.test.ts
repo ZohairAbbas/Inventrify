@@ -5,6 +5,7 @@ const count = vi.fn();
 vi.mock("../../db.server", () => ({ default: { session: { count: (...args: unknown[]) => count(...args) } } }));
 
 const { loader } = await import("../../routes/api.v1.growzar.status");
+const { GROWZAR_CAPABILITIES } = await import("./feed.server");
 
 const SHOP = "acme.myshopify.com";
 const PATH = `/api/v1/growzar/status?shop=${SHOP}`;
@@ -43,7 +44,7 @@ describe("GET /api/v1/growzar/status", () => {
       installed: true,
       appVersion: "abc1234",
       shop: SHOP,
-      capabilities: [],
+      capabilities: GROWZAR_CAPABILITIES,
       planRelevantFeatures: [],
     });
     expect(count).toHaveBeenCalledWith({ where: { shop: SHOP, isOnline: false } });

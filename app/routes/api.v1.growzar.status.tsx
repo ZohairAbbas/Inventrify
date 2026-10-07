@@ -1,6 +1,7 @@
 import { json, type LoaderFunctionArgs } from "@remix-run/node";
 import prisma from "../db.server";
 import { appVersion } from "../lib/growzar/config.server";
+import { GROWZAR_CAPABILITIES } from "../lib/growzar/feed.server";
 import { authenticatePlatformRequest, growzarError } from "../lib/growzar/platform-auth.server";
 
 /**
@@ -11,8 +12,8 @@ import { authenticatePlatformRequest, growzarError } from "../lib/growzar/platfo
  * it is the same test the background jobs use (active-shops.server). Its `expires` is
  * deliberately not consulted, for the reason given in listSyncableShops.
  *
- * `capabilities` is empty in Phase 1 by design: it makes Growzar show a locked section
- * with a preview. The read API that fills it is R2.
+ * `capabilities` lists the read feeds this release serves (Phase 5, lib/growzar/feed.server).
+ * Empty means Growzar shows a locked section with a preview.
  *
  * No CORS headers: this is server-to-server only.
  */
@@ -28,7 +29,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         installed: offlineSessions > 0,
         appVersion: appVersion(),
         shop,
-        capabilities: [] as string[],
+        capabilities: GROWZAR_CAPABILITIES,
         planRelevantFeatures: [] as string[],
       },
       { headers: { "Cache-Control": "no-store" } },

@@ -404,32 +404,73 @@ interface ShopifyVariant {
 }
 
 /**
- * Record the store's own name, so the dashboard can greet a merchant by it.
+ * Refresh the shop's own facts from the Admin API: its display name (so the dashboard can
+ * greet the merchant by the name they actually call their store), and the currency,
+ * timezone and country the Growzar feeds report (API-CONTRACT §4, §5).
  *
- * `session.shop` is only the *.myshopify.com domain, which is not what anyone calls their
- * own store. This is cosmetic, so it must never be able to fail a sync: a shop whose token
- * predates the read_products scope grant, or any other error on this one query, leaves the
- * stored name as it was and the greeting falls back to the domain.
+ * This must never be able to fail a sync: any error on this one query leaves the stored
+ * values as they were. A value Shopify does not return, or returns malformed, is stored as
+ * null rather than guessed — the feeds treat null as "unknown" and never send a default.
  *
  * Skipped entirely when the shop has no settings row yet — the row is created on first
- * visit to the settings page, and creating one here purely to hold a display name would
- * give every shop a settings record whose other columns are silently defaulted.
+ * visit to the app, and creating one here would give every shop a settings record whose
+ * other columns are silently defaulted.
  */
-async function refreshShopName(admin: AdminApiContext, shop: string): Promise<void> {
+const SHOP_FACTS_QUERY = `query shopFacts {
+  shop { name currencyCode ianaTimezone billingAddress { countryCodeV2 } }
+}`;
+
+type ShopFactsResponse = {
+  shop: {
+    name: string | null;
+    currencyCode: string | null;
+    ianaTimezone: string | null;
+    billingAddress: { countryCodeV2: string | null } | null;
+  } | null;
+};
+
+export function parseShopFacts(data: ShopFactsResponse): {
+  name: string | null;
+  shopCurrency: string | null;
+  shopTimezone: string | null;
+  shopCountry: string | null;
+} {
+  const currency = (data.shop?.currencyCode ?? "").trim().toUpperCase();
+  const country = (data.shop?.billingAddress?.countryCodeV2 ?? "").trim().toUpperCase();
+  const timezone = (data.shop?.ianaTimezone ?? "").trim();
+  return {
+    name: (data.shop?.name ?? "").trim() || null,
+    shopCurrency: /^[A-Z]{3}$/.test(currency) ? currency : null,
+    shopTimezone: timezone && isValidTimezone(timezone) ? timezone : null,
+    shopCountry: /^[A-Z]{2}$/.test(country) ? country : null,
+  };
+}
+
+function isValidTimezone(zone: string): boolean {
   try {
-    const data = await graphqlWithRetry<{ shop: { name: string | null } }>(
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function refreshShopFacts(admin: AdminApiContext, shop: string): Promise<void> {
+  try {
+    const data = await graphqlWithRetry<ShopFactsResponse>(
       admin,
-      `query shopName { shop { name } }`,
+      SHOP_FACTS_QUERY,
       {},
-      // One retry, not the default five: nothing downstream depends on this, and a shop
-      // with a genuinely failing Admin API has more urgent problems than its greeting.
+      // One retry, not the default five: the stored values stay usable for another hour.
       2,
     );
-    const name = (data.shop?.name ?? "").trim();
-    if (!name) return;
-    await prisma.shopSettings.updateMany({ where: { shop }, data: { shopName: name } });
+    const { name, ...facts } = parseShopFacts(data);
+    await prisma.shopSettings.updateMany({
+      where: { shop },
+      data: { ...(name ? { shopName: name } : {}), ...facts, shopFactsSyncedAt: new Date() },
+    });
   } catch (err) {
-    console.warn(`[inventorify] ${shop}: could not read store name (${describeError(err)})`);
+    console.warn(`[inventorify] ${shop}: could not read shop facts (${describeError(err)})`);
   }
 }
 
@@ -444,7 +485,7 @@ export async function syncShopifyInventory(
   const settings = await prisma.shopSettings.findUnique({ where: { shop } });
   const defaultLeadTime = settings?.defaultLeadTime ?? 7;
 
-  await refreshShopName(admin, shop);
+  await refreshShopFacts(admin, shop);
 
   // Sync locations first so per-location stock has stable FKs (shopifyLocationId → Location.id).
   // A shop whose token predates the read_locations scope still syncs, without per-location

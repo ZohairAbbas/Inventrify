@@ -27,6 +27,7 @@ const { deleteDraftPurchaseOrder } = await import("../purchase-order.server");
 const suppliers = await import("../../routes/api.v1.growzar.suppliers");
 const stockSnapshots = await import("../../routes/api.v1.growzar.stock-snapshots");
 const { writeDailySnapshots } = await import("../stock-snapshot.server");
+const returnRestocks = await import("../../routes/api.v1.growzar.return-restocks");
 
 const SHOP = "feeds-test.myshopify.com";
 const FACTS = { shop: SHOP, shopTimezone: "Asia/Karachi", shopCurrency: "PKR", shopCountry: "PK" };
@@ -452,5 +453,43 @@ describe("daily stock snapshot job", () => {
       [vid(54), "2026-10-06", 0, "2026-10-05T19:30:00.000Z"],
     ]);
     expect(JSON.stringify(body)).not.toContain("gid://");
+  });
+});
+
+describe("GET /growzar/return-restocks", () => {
+  it("returns only what Inventorify owns, with Shopify ids for the variant and location", async () => {
+    await product(61);
+    const location = await prisma.location.create({
+      data: { shop: SHOP, shopifyLocationId: "gid://shopify/Location/880061", name: "Karachi WH" },
+    });
+    const resolvedAt = new Date("2026-10-04T08:00:00.000Z");
+    await prisma.returnItem.createMany({
+      data: [
+        {
+          shop: SHOP, shipmentId: "shp_1", lineItemId: "li_1", shopifyVariantId: vid(61), productId: variantGid(61),
+          quantity: 2, status: "restocked", locationId: location.id, resolvedAt,
+          city: "Made-up City", courier: "made-up-courier", reasonCategory: "refused",
+        },
+        { shop: SHOP, shipmentId: "shp_2", lineItemId: "li_2", quantity: 1 },
+      ],
+    });
+
+    const { status, body } = await get(returnRestocks.loader, "/api/v1/growzar/return-restocks");
+    expect(status).toBe(200);
+    const byLine = Object.fromEntries(body.data.map((r: { lineItemId: string }) => [r.lineItemId, r]));
+    expect(byLine.li_1).toEqual({
+      id: expect.any(String),
+      shipmentId: "shp_1",
+      lineItemId: "li_1",
+      variantId: vid(61),
+      quantity: 2,
+      status: "restocked",
+      resolvedAt: "2026-10-04T08:00:00.000Z",
+      locationId: "880061",
+      updatedAt: expect.stringMatching(/Z$/),
+    });
+    expect(byLine.li_2).toMatchObject({ variantId: null, status: "pending", resolvedAt: null, locationId: null });
+    const text = JSON.stringify(body);
+    for (const theirs of ["Made-up City", "made-up-courier", "refused", "gid://"]) expect(text).not.toContain(theirs);
   });
 });

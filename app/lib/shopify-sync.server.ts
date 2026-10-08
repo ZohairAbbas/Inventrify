@@ -448,16 +448,27 @@ interface ShopifyVariant {
  * greet the merchant by the name they actually call their store), and the currency,
  * timezone and country the Growzar feeds report (API-CONTRACT §4, §5).
  *
- * This must never be able to fail a sync: any error on this one query leaves the stored
- * values as they were. A value Shopify does not return, or returns malformed, is stored as
- * null rather than guessed — the feeds treat null as "unknown" and never send a default.
+ * The country is the one the shop's primary location is in — where its stock ships from —
+ * not its billing address. The billing address is the account holder's and says nothing
+ * about where buyers are: three Karachi stores selling in PKR have a GB one, and Growzar
+ * uses the country to read buyers' locally written phone numbers.
+ *
+ * This must never be able to fail a sync: any error leaves the stored values as they were.
+ * A value Shopify does not return, or returns malformed, is stored as null rather than
+ * guessed — the feeds treat null as "unknown" and never send a default. A token without
+ * read_locations cannot see the location, so its country is null.
  *
  * Skipped entirely when the shop has no settings row yet — the row is created on first
  * visit to the app, and creating one here would give every shop a settings record whose
  * other columns are silently defaulted.
  */
 const SHOP_FACTS_QUERY = `query shopFacts {
-  shop { name currencyCode ianaTimezone billingAddress { countryCodeV2 } }
+  shop { name currencyCode ianaTimezone }
+}`;
+
+// `location` with no id is the shop's primary location.
+const PRIMARY_LOCATION_COUNTRY_QUERY = `query primaryLocationCountry {
+  location { address { countryCode } }
 }`;
 
 type ShopFactsResponse = {
@@ -465,25 +476,30 @@ type ShopFactsResponse = {
     name: string | null;
     currencyCode: string | null;
     ianaTimezone: string | null;
-    billingAddress: { countryCodeV2: string | null } | null;
   } | null;
+};
+
+type PrimaryLocationCountryResponse = {
+  location: { address: { countryCode: string | null } | null } | null;
 };
 
 export function parseShopFacts(data: ShopFactsResponse): {
   name: string | null;
   shopCurrency: string | null;
   shopTimezone: string | null;
-  shopCountry: string | null;
 } {
   const currency = (data.shop?.currencyCode ?? "").trim().toUpperCase();
-  const country = (data.shop?.billingAddress?.countryCodeV2 ?? "").trim().toUpperCase();
   const timezone = (data.shop?.ianaTimezone ?? "").trim();
   return {
     name: (data.shop?.name ?? "").trim() || null,
     shopCurrency: /^[A-Z]{3}$/.test(currency) ? currency : null,
     shopTimezone: timezone && isValidTimezone(timezone) ? timezone : null,
-    shopCountry: /^[A-Z]{2}$/.test(country) ? country : null,
   };
+}
+
+export function parseShopCountry(data: PrimaryLocationCountryResponse): string | null {
+  const country = (data.location?.address?.countryCode ?? "").trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(country) ? country : null;
 }
 
 function isValidTimezone(zone: string): boolean {
@@ -511,7 +527,23 @@ async function refreshShopFacts(admin: AdminApiContext, shop: string): Promise<v
     });
   } catch (err) {
     console.warn(`[inventorify] ${shop}: could not read shop facts (${describeError(err)})`);
+    return;
   }
+
+  // A separate query, so a token without read_locations still refreshes the rest.
+  let shopCountry: string | null;
+  try {
+    shopCountry = parseShopCountry(
+      await graphqlWithRetry<PrimaryLocationCountryResponse>(admin, PRIMARY_LOCATION_COUNTRY_QUERY, {}, 2),
+    );
+  } catch (err) {
+    if (!isMissingScope(err)) {
+      console.warn(`[inventorify] ${shop}: could not read primary location country (${describeError(err)})`);
+      return;
+    }
+    shopCountry = null;
+  }
+  await prisma.shopSettings.updateMany({ where: { shop }, data: { shopCountry } });
 }
 
 export async function syncShopifyInventory(

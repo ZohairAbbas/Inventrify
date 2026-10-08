@@ -619,3 +619,36 @@ describe("syncShopifyInventory and the daily stock snapshot", () => {
     expect(await prisma.stockSnapshot.count({ where: { shop: SHOP } })).toBe(0);
   });
 });
+
+describe("syncShopifyInventory and the shop's facts", () => {
+  const facts = () =>
+    prisma.shopSettings.findUniqueOrThrow({
+      where: { shop: SHOP },
+      select: { shopCurrency: true, shopTimezone: true, shopCountry: true },
+    });
+  const shopBody = { data: { shop: { name: "Test", currencyCode: "PKR", ianaTimezone: "Asia/Karachi" } } };
+  const run = (country: Reply) =>
+    syncShopifyInventory(
+      mockAdmin((q) => {
+        if (q.includes("shopFacts")) return { body: shopBody };
+        if (q.includes("primaryLocationCountry")) return country;
+        return isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) };
+      }).admin,
+      SHOP,
+    );
+
+  it("takes the country from the primary location", async () => {
+    await run({ body: { data: { location: { address: { countryCode: "PK" } } } } });
+    expect(await facts()).toEqual({ shopCurrency: "PKR", shopTimezone: "Asia/Karachi", shopCountry: "PK" });
+  });
+
+  it("stores null when the token cannot read locations, and keeps the value on any other error", async () => {
+    await run({ body: { data: { location: { address: { countryCode: "PK" } } } } });
+
+    await run({ body: { errors: [{ message: "Server error" }] } });
+    expect((await facts()).shopCountry).toBe("PK");
+
+    await run({ body: { errors: [{ message: "Access denied for location field" }] } });
+    expect((await facts()).shopCountry).toBeNull();
+  });
+});

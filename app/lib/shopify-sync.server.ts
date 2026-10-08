@@ -523,7 +523,18 @@ async function refreshShopFacts(admin: AdminApiContext, shop: string): Promise<v
     const { name, ...facts } = parseShopFacts(data);
     await prisma.shopSettings.updateMany({
       where: { shop },
-      data: { ...(name ? { shopName: name } : {}), ...facts, shopFactsSyncedAt: new Date() },
+      data: {
+        ...(name ? { shopName: name } : {}),
+        ...facts,
+        // The older `currency` / `timezone` columns drive what the merchant sees and the
+        // day boundaries of the sales history. Nothing lets a merchant set them by hand:
+        // they were copied from Shopify once, at install, and went stale (or kept their
+        // USD / UTC defaults) when that copy failed. Keep them in step whenever Shopify
+        // gives a real value; an unknown value leaves them as they are.
+        ...(facts.shopCurrency ? { currency: facts.shopCurrency } : {}),
+        ...(facts.shopTimezone ? { timezone: facts.shopTimezone } : {}),
+        shopFactsSyncedAt: new Date(),
+      },
     });
   } catch (err) {
     console.warn(`[inventorify] ${shop}: could not read shop facts (${describeError(err)})`);

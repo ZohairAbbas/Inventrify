@@ -637,6 +637,27 @@ describe("syncShopifyInventory and the shop's facts", () => {
       SHOP,
     );
 
+  it("brings a stale USD / UTC settings row in step with Shopify", async () => {
+    await prisma.shopSettings.update({ where: { shop: SHOP }, data: { currency: "USD", timezone: "UTC" } });
+    await run({ body: { data: { location: { address: { countryCode: "PK" } } } } });
+    const row = await prisma.shopSettings.findUniqueOrThrow({ where: { shop: SHOP } });
+    expect([row.currency, row.timezone]).toEqual(["PKR", "Asia/Karachi"]);
+  });
+
+  it("leaves the settings row alone when Shopify gives no usable value", async () => {
+    await prisma.shopSettings.update({ where: { shop: SHOP }, data: { currency: "PKR", timezone: "Asia/Karachi" } });
+    await syncShopifyInventory(
+      mockAdmin((q) => {
+        if (q.includes("shopFacts")) return { body: { data: { shop: { name: "Test", currencyCode: null, ianaTimezone: "Mars/Olympus" } } } };
+        if (q.includes("primaryLocationCountry")) return { body: { data: { location: null } } };
+        return isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1")]) };
+      }).admin,
+      SHOP,
+    );
+    const row = await prisma.shopSettings.findUniqueOrThrow({ where: { shop: SHOP } });
+    expect([row.currency, row.timezone]).toEqual(["PKR", "Asia/Karachi"]);
+  });
+
   it("takes the country from the primary location", async () => {
     await run({ body: { data: { location: { address: { countryCode: "PK" } } } } });
     expect(await facts()).toEqual({ shopCurrency: "PKR", shopTimezone: "Asia/Karachi", shopCountry: "PK" });

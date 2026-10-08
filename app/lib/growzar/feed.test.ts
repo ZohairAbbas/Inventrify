@@ -12,7 +12,7 @@ vi.mock("../../db.server", () => ({
 }));
 
 const { money, numericId, openFeed, parseFeedParams, dayLabel } = await import("./feed.server");
-const { parseShopFacts } = await import("../shopify-sync.server");
+const { parseShopCountry, parseShopFacts } = await import("../shopify-sync.server");
 
 const SHOP = "acme.myshopify.com";
 const saved = { ...process.env };
@@ -169,15 +169,30 @@ describe("rate limiter", () => {
 });
 
 describe("parseShopFacts", () => {
-  it("takes currency, timezone and country from Shopify", () => {
-    expect(
-      parseShopFacts({ shop: { name: "Acme", currencyCode: "PKR", ianaTimezone: "Asia/Karachi", billingAddress: { countryCodeV2: "PK" } } }),
-    ).toEqual({ name: "Acme", shopCurrency: "PKR", shopTimezone: "Asia/Karachi", shopCountry: "PK" });
+  it("takes currency and timezone from Shopify", () => {
+    expect(parseShopFacts({ shop: { name: "Acme", currencyCode: "PKR", ianaTimezone: "Asia/Karachi" } })).toEqual({
+      name: "Acme",
+      shopCurrency: "PKR",
+      shopTimezone: "Asia/Karachi",
+    });
   });
 
   it("stores null rather than a guess for anything missing or malformed", () => {
-    expect(
-      parseShopFacts({ shop: { name: " ", currencyCode: null, ianaTimezone: "Mars/Olympus", billingAddress: null } }),
-    ).toEqual({ name: null, shopCurrency: null, shopTimezone: null, shopCountry: null });
+    expect(parseShopFacts({ shop: { name: " ", currencyCode: null, ianaTimezone: "Mars/Olympus" } })).toEqual({
+      name: null,
+      shopCurrency: null,
+      shopTimezone: null,
+    });
+  });
+});
+
+describe("parseShopCountry", () => {
+  it("takes the primary location's country", () => {
+    expect(parseShopCountry({ location: { address: { countryCode: "PK" } } })).toBe("PK");
+  });
+
+  it("is null when the location or its country is missing", () => {
+    expect(parseShopCountry({ location: null })).toBeNull();
+    expect(parseShopCountry({ location: { address: { countryCode: "" } } })).toBeNull();
   });
 });

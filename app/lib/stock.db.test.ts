@@ -236,6 +236,83 @@ describe("applyInventoryLevelUpdate", () => {
     expect(after.currentStock).toBe(8);
   });
 
+  function levelAdmin(quantities: Record<string, number> | "fail") {
+    return {
+      graphql: async (_query: string, opts?: { variables?: Record<string, unknown> }) =>
+        quantities === "fail"
+          ? { status: 400, ok: false, json: async () => ({}) }
+          : {
+              status: 200,
+              ok: true,
+              json: async () => {
+                expect(opts?.variables).toEqual({
+                  id: "gid://shopify/InventoryItem/stock-1",
+                  locationId: "gid://shopify/Location/1",
+                });
+                return {
+                  data: {
+                    inventoryItem: {
+                      inventoryLevel: {
+                        quantities: Object.entries(quantities).map(([name, quantity]) => ({ name, quantity })),
+                      },
+                    },
+                  },
+                };
+              },
+            },
+    } as unknown as AdminApiContext;
+  }
+
+  it("reads live quantities so a cancellation frees a committed unit instead of adding stock", async () => {
+    const location = await seed(6);
+    // 6 on hand, 10 committed: oversold by 4.
+    await prisma.productLocationStock.update({
+      where: { productId_locationId: { productId: PRODUCT_ID, locationId: location!.id } },
+      data: { onHand: 6, reserved: 10 },
+    });
+
+    // One unbooked order is cancelled: Shopify's available goes -4 -> -3, on_hand stays 6.
+    const result = await applyInventoryLevelUpdate(
+      SHOP, "gid://shopify/InventoryItem/stock-1", "gid://shopify/Location/1", -3,
+      levelAdmin({ available: -3, on_hand: 6, damaged: 0 }),
+    );
+
+    expect(result).toMatchObject({ applied: "location", live: true, onHand: 6 });
+    const level = await prisma.productLocationStock.findUniqueOrThrow({
+      where: { productId_locationId: { productId: PRODUCT_ID, locationId: location!.id } },
+    });
+    // Reconstruction from available would have said 7 on hand and still 10 committed.
+    expect(level).toMatchObject({ onHand: 6, reserved: 9, damaged: 0 });
+    const after = await prisma.product.findUniqueOrThrow({ where: { id: PRODUCT_ID } });
+    expect(after.currentStock).toBe(6);
+  });
+
+  it("splits damaged units out of live on-hand, as the catalogue sync does", async () => {
+    await seed(10);
+
+    await applyInventoryLevelUpdate(
+      SHOP, "gid://shopify/InventoryItem/stock-1", "gid://shopify/Location/1", 5,
+      levelAdmin({ available: 5, on_hand: 10, damaged: 2 }),
+    );
+
+    const level = await prisma.productLocationStock.findFirstOrThrow({ where: { shop: SHOP } });
+    expect(level).toMatchObject({ onHand: 8, reserved: 3, damaged: 2 });
+  });
+
+  it("falls back to reconstructing from available when the live read fails", async () => {
+    const location = await seed(10);
+    await prisma.productLocationStock.update({
+      where: { productId_locationId: { productId: PRODUCT_ID, locationId: location!.id } },
+      data: { onHand: 10, reserved: 3 },
+    });
+
+    const result = await applyInventoryLevelUpdate(
+      SHOP, "gid://shopify/InventoryItem/stock-1", "gid://shopify/Location/1", 5, levelAdmin("fail"),
+    );
+
+    expect(result).toMatchObject({ applied: "location", live: false, onHand: 8 });
+  });
+
   it("treats available as on-hand for a level it has never seen", async () => {
     await seed(0);
     await prisma.productLocationStock.deleteMany({ where: { shop: SHOP } });

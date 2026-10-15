@@ -1,4 +1,5 @@
 import type { ActionFunctionArgs } from "@remix-run/node";
+import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 import { isCodOrder, parseCodGateways } from "../lib/cod.server";
@@ -82,7 +83,7 @@ async function releaseDelivery(webhookId: string | null, topic: string): Promise
 }
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { topic, shop, payload } = await authenticate.webhook(request);
+  const { topic, shop, payload, admin } = await authenticate.webhook(request);
 
   const webhookId = request.headers.get("x-shopify-webhook-id");
   if (!(await claimDelivery(webhookId, shop, topic))) {
@@ -94,6 +95,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       topic,
       shop,
       payload,
+      admin,
       webhookId,
       triggeredAt: request.headers.get("x-shopify-triggered-at"),
     });
@@ -112,12 +114,15 @@ async function handleTopic({
   topic,
   shop,
   payload,
+  admin,
   webhookId,
   triggeredAt,
 }: {
   topic: string;
   shop: string;
   payload: unknown;
+  /** Undefined when the shop has no offline session (e.g. after uninstall). */
+  admin: AdminApiContext | undefined;
   webhookId: string | null;
   triggeredAt: string | null;
 }) {
@@ -276,6 +281,7 @@ async function handleTopic({
         `gid://shopify/InventoryItem/${data.inventory_item_id}`,
         `gid://shopify/Location/${data.location_id}`,
         data.available,
+        admin,
       );
       break;
     }

@@ -1,7 +1,12 @@
 import type { AdminApiContext } from "@shopify/shopify-app-remix/server";
 import type { Prisma } from "@prisma/client";
 import prisma from "../db.server";
-import { applyShopifyInventoryDelta, applyShopifyStockStateChange } from "./shopify-sync.server";
+import { graphqlWithRetry } from "./shopify-graphql.server";
+import {
+  applyShopifyInventoryDelta,
+  applyShopifyStockStateChange,
+  splitLevelQuantities,
+} from "./shopify-sync.server";
 
 /**
  * A Prisma unique-constraint violation (P2002) naming a specific column.
@@ -298,17 +303,54 @@ export async function pushStockStateToShopify(
   return applyShopifyStockStateChange(admin, product.inventoryItemId, location.shopifyLocationId, change, opts);
 }
 
+const INVENTORY_LEVEL_QUERY = `
+  query getInventoryLevel($id: ID!, $locationId: ID!) {
+    inventoryItem(id: $id) {
+      inventoryLevel(locationId: $locationId) {
+        quantities(names: ["available", "on_hand", "damaged"]) { name quantity }
+      }
+    }
+  }
+`;
+
+/**
+ * Shopify's live quantities for one level, or null when they cannot be had. Never throws:
+ * the caller falls back to reconstructing from `available`, which is no worse than before.
+ * One retry only — Shopify expects a webhook answered within seconds.
+ */
+async function fetchLevelQuantities(
+  admin: AdminApiContext,
+  inventoryItemGid: string,
+  locationGid: string,
+): Promise<{ onHand: number; reserved: number; damaged: number } | null> {
+  try {
+    const data = await graphqlWithRetry<{
+      inventoryItem: { inventoryLevel: { quantities: { name: string; quantity: number }[] } | null } | null;
+    }>(admin, INVENTORY_LEVEL_QUERY, { id: inventoryItemGid, locationId: locationGid }, 2);
+    const quantities = data.inventoryItem?.inventoryLevel?.quantities;
+    return quantities && quantities.length > 0 ? splitLevelQuantities(quantities) : null;
+  } catch (err) {
+    console.warn(
+      `[inventorify] live inventory level read failed for ${inventoryItemGid} at ${locationGid}; ` +
+        `reconstructing from available: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
 /**
  * Apply an INVENTORY_LEVELS_UPDATE webhook to per-location stock.
  *
  * Two things make this subtler than it looks.
  *
- * The webhook reports `available`, but `onHand` means on-hand everywhere else — the
- * catalogue sync writes Shopify's real `on_hand` and derives `reserved = on_hand -
- * available`. Writing `available` into that column understated stock by whatever was
- * committed to unfulfilled orders and left `reserved` double-counted, so every inventory
- * position was wrong until the next full sync. Since available = onHand - reserved,
- * on-hand is reconstructed from the last known reserved figure.
+ * The webhook reports only `available`, which moves for two different reasons: on-hand
+ * changed (a receipt, a count, a fulfilment) or the committed quantity changed (an order
+ * placed or cancelled). Available alone cannot tell them apart. So when an admin context
+ * is at hand, the level's real on_hand / available / damaged are read from Shopify and
+ * written exactly as the catalogue sync would. Reconstructing on-hand as available plus
+ * the last known reserved figure is only the fallback: it treats every order and every
+ * cancellation as an on-hand change, so on-hand and unbooked drift by a unit per order
+ * until the next hourly sync.
  *
  * And an unrecognised location must not fall back to overwriting Product.currentStock:
  * on a multi-location shop that collapses the whole product to whichever location
@@ -320,8 +362,15 @@ export async function applyInventoryLevelUpdate(
   inventoryItemGid: string,
   locationGid: string,
   available: number,
+  admin?: AdminApiContext,
 ): Promise<
-  { applied: "location" | "aggregate" | "none"; productId?: string; onHand?: number }
+  {
+    applied: "location" | "aggregate" | "none";
+    /** Whether on-hand came from Shopify's live quantities rather than reconstruction. */
+    live?: boolean;
+    productId?: string;
+    onHand?: number;
+  }
 > {
   const product = await prisma.product.findFirst({
     where: { shop, inventoryItemId: inventoryItemGid },
@@ -353,25 +402,36 @@ export async function applyInventoryLevelUpdate(
     return { applied: "aggregate", productId: product.id, onHand: updated.currentStock };
   }
 
-  const onHand = await prisma.$transaction(async (tx) => {
-    const existing = await tx.productLocationStock.findUnique({
-      where: { productId_locationId: { productId: product.id, locationId: location.id } },
-      select: { reserved: true },
-    });
-    // A row we have never seen before has nothing committed against it yet.
-    const reserved = existing?.reserved ?? 0;
+  // Read before the transaction: no network call while it holds a connection.
+  const live = admin ? await fetchLevelQuantities(admin, inventoryItemGid, locationGid) : null;
 
-    await tx.productLocationStock.upsert({
-      where: { productId_locationId: { productId: product.id, locationId: location.id } },
-      create: {
-        shop,
-        productId: product.id,
-        locationId: location.id,
-        onHand: available,
-        reserved: 0,
-      },
-      update: { onHand: available + reserved },
-    });
+  const onHand = await prisma.$transaction(async (tx) => {
+    if (live) {
+      await tx.productLocationStock.upsert({
+        where: { productId_locationId: { productId: product.id, locationId: location.id } },
+        create: { shop, productId: product.id, locationId: location.id, ...live },
+        update: live,
+      });
+    } else {
+      const existing = await tx.productLocationStock.findUnique({
+        where: { productId_locationId: { productId: product.id, locationId: location.id } },
+        select: { reserved: true },
+      });
+      // A row we have never seen before has nothing committed against it yet.
+      const reserved = existing?.reserved ?? 0;
+
+      await tx.productLocationStock.upsert({
+        where: { productId_locationId: { productId: product.id, locationId: location.id } },
+        create: {
+          shop,
+          productId: product.id,
+          locationId: location.id,
+          onHand: available,
+          reserved: 0,
+        },
+        update: { onHand: available + reserved },
+      });
+    }
 
     const agg = await tx.productLocationStock.aggregate({
       where: { productId: product.id },
@@ -384,7 +444,7 @@ export async function applyInventoryLevelUpdate(
     return agg._sum.onHand ?? 0;
   });
 
-  return { applied: "location", productId: product.id, onHand };
+  return { applied: "location", live: live != null, productId: product.id, onHand };
 }
 
 /**

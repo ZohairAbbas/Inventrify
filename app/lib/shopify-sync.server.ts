@@ -440,6 +440,26 @@ interface ShopifyInventoryLevel {
   quantities: { name: string; quantity: number }[];
 }
 
+/**
+ * One inventory level's Shopify quantities, in this app's terms. Shared by the catalogue
+ * sync and the inventory webhook so the two cannot disagree about what a level holds.
+ *
+ * Shopify's on_hand includes units in the `damaged` state. Here onHand means sellable
+ * physical stock, so quarantined units are split out — otherwise they would be derived as
+ * "reserved" and still counted in currentStock and value. Reserved is what on-hand holds
+ * beyond available: units committed to open orders (and any other unavailable state).
+ */
+export function splitLevelQuantities(
+  quantities: readonly { name: string; quantity: number }[],
+): { onHand: number; reserved: number; damaged: number } {
+  const qtyByName = new Map(quantities.map((q) => [q.name, q.quantity]));
+  const shopifyOnHand = qtyByName.get("on_hand") ?? qtyByName.get("available") ?? 0;
+  const available = qtyByName.get("available") ?? shopifyOnHand;
+  const damaged = Math.max(0, qtyByName.get("damaged") ?? 0);
+  const onHand = Math.max(0, shopifyOnHand - damaged);
+  return { onHand, reserved: Math.max(0, onHand - available), damaged };
+}
+
 interface ProductVariantsResponse {
   productVariants: Paged<ShopifyVariant>;
 }
@@ -666,20 +686,7 @@ export async function syncShopifyInventory(
           for (const level of levelNodes) {
             const localLocationId = locationMap.get(level.location.id);
             if (!localLocationId) continue;
-            const qtyByName = new Map(level.quantities.map((q) => [q.name, q.quantity]));
-            const shopifyOnHand = qtyByName.get("on_hand") ?? qtyByName.get("available") ?? 0;
-            const available = qtyByName.get("available") ?? shopifyOnHand;
-            // Shopify's on_hand includes units in the `damaged` state. Here onHand means
-            // sellable physical stock, so quarantined units are split out — otherwise they
-            // would be derived as "reserved" and still counted in currentStock and value.
-            const damaged = Math.max(0, qtyByName.get("damaged") ?? 0);
-            const onHand = Math.max(0, shopifyOnHand - damaged);
-            perLocation.push({
-              locationId: localLocationId,
-              onHand,
-              reserved: Math.max(0, onHand - available),
-              damaged,
-            });
+            perLocation.push({ locationId: localLocationId, ...splitLevelQuantities(level.quantities) });
           }
 
           const currentStock =

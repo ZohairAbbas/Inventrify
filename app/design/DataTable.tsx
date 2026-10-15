@@ -18,9 +18,14 @@ interface Props {
   columns: DataTableColumn[];
   rows: DataTableRow[];
   compact?: boolean;
+  /**
+   * Width below which the table scrolls sideways instead of squeezing its columns. For
+   * wide numeric tables, where a squeezed column truncates a figure into "Rs 1,0…".
+   */
+  minWidth?: string;
 }
 
-export function DataTable({ columns, rows, compact = false }: Props) {
+export function DataTable({ columns, rows, compact = false, minWidth }: Props) {
   const gridTemplateColumns = columns.map((c) => c.width || "1fr").join(" ");
   const rowPad = compact ? "var(--inv-row-pad-compact)" : "var(--inv-row-pad)";
 
@@ -30,39 +35,41 @@ export function DataTable({ columns, rows, compact = false }: Props) {
         background: "#fff",
         border: "1px solid var(--inv-border)",
         borderRadius: "var(--inv-radius-card)",
-        overflow: "hidden",
+        overflow: minWidth ? "auto hidden" : "hidden",
       }}
     >
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns,
-          gap: "12px",
-          padding: "10px 16px",
-          borderBottom: "1px solid var(--inv-divider)",
-          fontSize: "10.5px",
-          fontWeight: 600,
-          letterSpacing: ".4px",
-          color: "var(--inv-muted)",
-          textTransform: "uppercase",
-        }}
-      >
-        {columns.map((c, i) => (
-          <div key={i} style={{ textAlign: c.align || "left" }}>
-            {c.header}
-          </div>
+      <div style={minWidth ? { minWidth } : undefined}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns,
+            gap: "12px",
+            padding: "10px 16px",
+            borderBottom: "1px solid var(--inv-divider)",
+            fontSize: "10.5px",
+            fontWeight: 600,
+            letterSpacing: ".4px",
+            color: "var(--inv-muted)",
+            textTransform: "uppercase",
+          }}
+        >
+          {columns.map((c, i) => (
+            <div key={i} style={{ textAlign: c.align || "left" }}>
+              {c.header}
+            </div>
+          ))}
+        </div>
+        {rows.map((row, ri) => (
+          <TableRow
+            key={row.key ?? ri}
+            row={row}
+            columns={columns}
+            gridTemplateColumns={gridTemplateColumns}
+            rowPad={rowPad}
+            isFirst={ri === 0}
+          />
         ))}
       </div>
-      {rows.map((row, ri) => (
-        <TableRow
-          key={row.key ?? ri}
-          row={row}
-          columns={columns}
-          gridTemplateColumns={gridTemplateColumns}
-          rowPad={rowPad}
-          isFirst={ri === 0}
-        />
-      ))}
     </div>
   );
 }

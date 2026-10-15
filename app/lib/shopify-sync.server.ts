@@ -326,6 +326,18 @@ export async function applyShopifyStockStateChange(
 }
 
 /**
+ * Shopify returns a variant price as a decimal string. Absent, unparseable or negative
+ * values become null ("not known") rather than 0, so they are left out of stock-at-retail
+ * and margin instead of being counted as free. A genuine 0 (a giveaway) is kept as 0;
+ * the valuation code treats only a positive price as priced.
+ */
+export function parseVariantPrice(raw: string | null | undefined): number | null {
+  if (raw == null) return null;
+  const n = Number.parseFloat(raw);
+  return Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
  * Flat pagination over every variant in the shop.
  *
  * This deliberately does NOT nest variants under products. The old query asked for
@@ -345,6 +357,8 @@ const PRODUCT_VARIANTS_QUERY = `
           # Scannable code as the merchant entered it in Shopify. Drives scan lookups in
           # receiving, counting and adjustments; blank for most catalogues.
           barcode
+          # Selling price (Money scalar, decimal string). Drives stock-at-retail and margin.
+          price
           inventoryQuantity
           image { url }
           product { id title featuredImage { url } }
@@ -391,6 +405,8 @@ const PRODUCT_VARIANTS_NO_LOCATION_QUERY = `
           # Scannable code as the merchant entered it in Shopify. Drives scan lookups in
           # receiving, counting and adjustments; blank for most catalogues.
           barcode
+          # Selling price (Money scalar, decimal string). Drives stock-at-retail and margin.
+          price
           inventoryQuantity
           image { url }
           product { id title featuredImage { url } }
@@ -433,6 +449,7 @@ interface ShopifyVariant {
   title: string;
   sku: string | null;
   barcode: string | null;
+  price: string | null;
   inventoryQuantity: number | null;
   image: { url: string } | null;
   product: { id: string; title: string; featuredImage: { url: string } | null };
@@ -626,6 +643,7 @@ export async function syncShopifyInventory(
           const parsedCost = rawCost != null ? Number.parseFloat(rawCost) : NaN;
           const unitCost =
             Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : null;
+          const price = parseVariantPrice(variant.price);
 
           // Build per-location stock from inventory levels; fall back to the
           // aggregate inventoryQuantity when no levels are returned.
@@ -688,6 +706,7 @@ export async function syncShopifyInventory(
               barcode: normaliseBarcode(variant.barcode),
               imageUrl,
               ...(unitCost != null ? { unitCost } : {}),
+              price,
               currentStock,
               reorderPoint,
               leadTimeDays,
@@ -705,6 +724,9 @@ export async function syncShopifyInventory(
               // so a cost supplied elsewhere is not wiped by a shop that left the field
               // blank.
               ...(unitCost != null ? { unitCost } : {}),
+              // Unlike cost, price has no other source: Shopify's value always wins,
+              // including a price that was cleared.
+              price,
               currentStock,
               inventoryItemId,
               productGid: variant.product.id,
@@ -844,6 +866,7 @@ export async function syncShopifyInventory(
       unitCost: true,
       avgMargin: true,
       fulfilledInTransit: true,
+      price: true,
     },
   });
 

@@ -60,13 +60,14 @@ const locationsBody = {
   },
 };
 
-function variant(id: string, opts: { sku?: string; qty?: number; cost?: string | null; image?: string | null; barcode?: string | null } = {}) {
+function variant(id: string, opts: { sku?: string; qty?: number; cost?: string | null; price?: string | null; image?: string | null; barcode?: string | null } = {}) {
   return {
     node: {
       id: `gid://shopify/ProductVariant/${id}`,
       title: opts.sku ?? id,
       sku: opts.sku ?? `SKU-${id}`,
       barcode: opts.barcode === undefined ? `BC-${id}` : opts.barcode,
+      price: opts.price === undefined ? "499.00" : opts.price,
       inventoryQuantity: opts.qty ?? 5,
       image: opts.image === undefined ? null : { url: opts.image },
       product: {
@@ -139,6 +140,8 @@ describe("syncShopifyInventory", () => {
     expect(p?.barcode).toBe("BC-1");
     // Cost comes from Shopify's own "Cost per item", no integration needed.
     expect(p?.unitCost).toBe(250);
+    // Selling price, for stock-at-retail and margin.
+    expect(p?.price).toBe(499);
     // Falls back to the product's featured image when the variant has none.
     expect(p?.imageUrl).toBe("https://cdn.shopify.com/featured.jpg");
 
@@ -328,6 +331,22 @@ describe("syncShopifyInventory", () => {
     await syncShopifyInventory(admin, SHOP);
     const p = await prisma.product.findFirst({ where: { shop: SHOP } });
     expect(p?.unitCost).toBe(0);
+  });
+
+  it("stores a missing price as unknown, and follows a cleared price", async () => {
+    const first = mockAdmin((q) =>
+      isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1", { price: "1200.50" })]) },
+    );
+    await syncShopifyInventory(first.admin, SHOP);
+    expect((await prisma.product.findFirst({ where: { shop: SHOP } }))?.price).toBe(1200.5);
+
+    // Unlike cost, nothing else supplies a price, so Shopify's answer replaces ours even
+    // when it is "none" — a stale price would keep valuing stock at a number that is gone.
+    const second = mockAdmin((q) =>
+      isLocations(q) ? { body: locationsBody } : { body: variantsBody([variant("1", { price: null })]) },
+    );
+    await syncShopifyInventory(second.admin, SHOP);
+    expect((await prisma.product.findFirst({ where: { shop: SHOP } }))?.price).toBeNull();
   });
 
   it("syncs more than 20 variants of one product", async () => {

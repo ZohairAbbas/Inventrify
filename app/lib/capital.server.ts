@@ -15,10 +15,13 @@ export type CapitalInputs = {
   unitCost: number;
   avgMargin: number;
   fulfilledInTransit: number;
+  /** Shopify selling price; null until synced. */
+  price: number | null;
 };
 
 /**
- * Estimated retail price of one unit.
+ * Retail price of one unit: the synced Shopify price when there is one, otherwise an
+ * estimate from cost and margin.
  *
  * COD float is money owed back by the courier, so in-route stock is valued at what it
  * sells for, not what it cost. Margin is only trusted between 0 and 0.95: at 1.0 the
@@ -26,7 +29,10 @@ export type CapitalInputs = {
  * (a percentage entered as 95 rather than 0.95) which would inflate the float twentyfold.
  * Outside that band, fall back to cost — understating the float is the safer error.
  */
-export function estimateUnitPrice(p: Pick<CapitalInputs, "unitCost" | "avgMargin">): number {
+export function estimateUnitPrice(
+  p: Pick<CapitalInputs, "unitCost" | "avgMargin"> & { price?: number | null },
+): number {
+  if (p.price != null && p.price > 0) return p.price;
   return p.unitCost > 0 && p.avgMargin > 0 && p.avgMargin < 0.95
     ? p.unitCost / (1 - p.avgMargin)
     : p.unitCost;
@@ -39,7 +45,9 @@ export function estimateUnitPrice(p: Pick<CapitalInputs, "unitCost" | "avgMargin
  * it by cost subtracts real money from the total — on one live shop that read as Rs
  * 194,475 less than the stock physically on the shelves — so it is floored at zero.
  */
-export function computeStockAtCost(products: readonly CapitalInputs[]): number {
+export function computeStockAtCost(
+  products: readonly Pick<CapitalInputs, "currentStock" | "unitCost">[],
+): number {
   return products.reduce((sum, p) => sum + Math.max(0, p.currentStock) * p.unitCost, 0);
 }
 
@@ -51,4 +59,14 @@ export function computeCodFloat(products: readonly CapitalInputs[]): number {
 /** Units that have left the building and not yet resolved. */
 export function computeInRouteUnits(products: readonly Pick<CapitalInputs, "fulfilledInTransit">[]): number {
   return products.reduce((sum, p) => sum + (p.fulfilledInTransit || 0), 0);
+}
+
+/** On-hand stock valued at selling price. Unpriced SKUs are left out, not counted at 0. */
+export function computeStockAtRetail(
+  products: readonly Pick<CapitalInputs, "currentStock" | "price">[],
+): number {
+  return products.reduce(
+    (sum, p) => sum + (p.price != null && p.price > 0 ? Math.max(0, p.currentStock) * p.price : 0),
+    0,
+  );
 }

@@ -11,6 +11,7 @@ import { applyStockDelta, setBinLocation } from "../lib/stock.server";
 import { getDamagedUnitsByProduct } from "../lib/damage.server";
 import { parsePageRequest, parseSearch, resolvePage } from "../lib/pagination";
 import { useListParams } from "../lib/use-list-params";
+import { formatCurrencyWhole } from "../lib/format";
 import {
   getStockStatus,
   calculateDaysRemaining,
@@ -151,6 +152,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           ? p.locationStock.find((ls) => ls.locationId === locationFilter)
           : null;
       const effectiveStock = locationFilter !== "all" ? locLevel?.onHand ?? 0 : p.currentStock;
+      const price = p.price ?? 0;
       return {
         ...p,
         effectiveStock,
@@ -175,6 +177,12 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           locationFilter !== "all" ? effectiveStock : positions.get(p.id)?.position ?? effectiveStock,
           p.reorderPoint,
         ),
+        // Held for unfulfilled orders, at the location in view or across all of them.
+        booked:
+          locationFilter !== "all" ? locLevel?.reserved ?? 0 : positions.get(p.id)?.reserved ?? 0,
+        // From the synced Shopify price. avgMargin is never populated, so the old column
+        // read "—" for every SKU.
+        marginPct: price > 0 && p.unitCost > 0 ? (price - p.unitCost) / price : null,
         onOrder: positions.get(p.id)?.onOrder ?? 0,
         rtoInbound: positions.get(p.id)?.rtoInbound ?? 0,
         inTransit: positions.get(p.id)?.inTransit ?? 0,
@@ -200,7 +208,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }),
     prisma.shopSettings.findUnique({
       where: { shop: session.shop },
-      select: { courierifyApiKey: true },
+      select: { courierifyApiKey: true, currency: true },
     }),
     // Damaged pipeline count: units removed by damage adjustments, plus returned units
     // written off from the returns queue (§7.8 of the integration contract).
@@ -232,6 +240,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     locationFilter,
     courierifyConnected,
     hasPipelineData,
+    currency: settings?.currency ?? "USD",
   };
 };
 
@@ -438,8 +447,10 @@ type CsvDiffRow = {
 };
 
 export default function Inventory() {
-  const { products, page, statusFilter, suppliers, locations, locationFilter, courierifyConnected, hasPipelineData } =
+  const { products, page, statusFilter, suppliers, locations, locationFilter, courierifyConnected, hasPipelineData, currency } =
     useLoaderData<typeof loader>();
+  const money = (n: number) => formatCurrencyWhole(n, currency);
+  const marginLabel = (pct: number | null) => (pct == null ? "—" : `${Math.round(pct * 100)}%`);
   const { theme = "emerald" } = useRouteLoaderData<typeof appLoader>("routes/app") ?? {};
   const fetcher = useFetcher<typeof action>();
   const importFetcher = useFetcher<typeof action>();
@@ -485,10 +496,13 @@ export default function Inventory() {
       Product: p.title,
       Variant: p.variantTitle ?? "",
       Stock: p.currentStock,
+      Booked: p.booked,
       "Reorder Point": p.reorderPoint,
       "Lead Time (days)": p.leadTimeDays,
       "COD Return Rate": p.codReturnRate,
-      "Avg Margin": p.avgMargin,
+      Price: p.price ?? "",
+      "Unit Cost": p.unitCost,
+      Margin: p.marginPct == null ? "" : Number(p.marginPct.toFixed(4)),
       Supplier: p.supplier?.name ?? "",
     }));
     const csv = Papa.unparse(rows);
@@ -616,10 +630,12 @@ export default function Inventory() {
     { header: "SKU", width: "1fr" },
     { header: "Class", width: ".7fr" },
     { header: "Stock", width: ".7fr", align: "right" },
+    { header: "Booked", width: ".7fr", align: "right" },
     { header: "Reorder", width: ".8fr", align: "right" },
     { header: "Days left", width: ".9fr", align: "right" },
     { header: "COD ret.", width: ".9fr", align: "right" },
-    { header: "Margin", width: "1fr", align: "right" },
+    { header: "Price", width: "1fr", align: "right" },
+    { header: "Margin", width: ".8fr", align: "right" },
     { header: "Supplier", width: "1.1fr" },
     { header: "Pipeline", width: "2fr" },
     { header: "Status", width: "1fr", align: "right" },
@@ -709,6 +725,13 @@ export default function Inventory() {
       >
         {p.effectiveStock}
       </span>,
+      <span
+        key="booked"
+        title="Held for unfulfilled orders"
+        style={{ fontFamily: "var(--inv-font-mono)", color: p.booked > 0 ? "var(--inv-ink)" : "var(--inv-faint)" }}
+      >
+        {p.booked > 0 ? p.booked : "—"}
+      </span>,
       <span key="reorder" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-muted)" }}>
         {p.reorderPoint}
       </span>,
@@ -736,8 +759,23 @@ export default function Inventory() {
           ? "no data"
           : `${(p.codReturnRate * 100).toFixed(0)}%`}
       </span>,
-      <span key="margin" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-text-2)" }}>
-        {p.avgMargin > 0 ? `${(p.avgMargin * 100).toFixed(0)}%` : "—"}
+      <span key="price" style={{ fontFamily: "var(--inv-font-mono)", color: p.price ? "var(--inv-ink)" : "var(--inv-faint)" }}>
+        {p.price ? money(p.price) : "—"}
+      </span>,
+      <span
+        key="margin"
+        title={p.marginPct == null ? "Needs both a price and a unit cost" : undefined}
+        style={{
+          fontFamily: "var(--inv-font-mono)",
+          color:
+            p.marginPct == null
+              ? "var(--inv-faint)"
+              : p.marginPct < 0
+                ? "var(--inv-status-stockout-fg)"
+                : "var(--inv-text-2)",
+        }}
+      >
+        {marginLabel(p.marginPct)}
       </span>,
       <span key="supplier" style={{ fontSize: "12.5px", color: "var(--inv-text-2)" }}>
         {p.supplier?.name ?? "—"}
@@ -888,7 +926,7 @@ export default function Inventory() {
                 <input type="checkbox" checked={allSelected} onChange={toggleAll} /> Select all
               </label>
             </div>
-            <DataTable columns={columns} rows={rows} />
+            <DataTable columns={columns} rows={rows} minWidth="1240px" />
             <Pagination
               page={page}
               onPageChange={setPage}
@@ -941,11 +979,13 @@ export default function Inventory() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "18px" }}>
               {[
                 ["Stock", String(drawerProduct.currentStock)],
+                ["Booked", String(drawerProduct.booked)],
+                ["Price", drawerProduct.price ? money(drawerProduct.price) : "—"],
                 ["Reorder at", String(drawerProduct.reorderPoint)],
                 ["Days left", drawerProduct.daysRemaining === null ? "No demand" : `${drawerProduct.daysRemaining}d`],
                 ["Avg daily", `${(drawerProduct.avgDailySales || 0).toFixed(1)}/d`],
                 ["COD return", drawerProduct.codReturnRate > 0 ? `${(drawerProduct.codReturnRate * 100).toFixed(0)}%` : "—"],
-                ["Margin", drawerProduct.avgMargin > 0 ? `${(drawerProduct.avgMargin * 100).toFixed(0)}%` : "—"],
+                ["Margin", marginLabel(drawerProduct.marginPct)],
               ].map(([label, value]) => (
                 <div key={label} style={{ background: "var(--inv-subtle)", borderRadius: "11px", padding: "12px 14px" }}>
                   <div style={{ fontSize: "11px", color: "var(--inv-muted)", marginBottom: "5px" }}>{label}</div>

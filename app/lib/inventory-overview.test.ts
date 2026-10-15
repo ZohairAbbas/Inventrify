@@ -10,7 +10,7 @@ import {
 const input = (over: Partial<OverviewInput> = {}): OverviewInput => ({
   id: "p1",
   onHand: 100,
-  booked: 0,
+  unbooked: 0,
   damaged: 0,
   incoming: 0,
   incomingCost: 0,
@@ -42,7 +42,7 @@ describe("overviewStatus", () => {
 
 describe("toOverviewRow", () => {
   it("derives available, value, margin and runway", () => {
-    const r = toOverviewRow(input({ booked: 10 }));
+    const r = toOverviewRow(input({ unbooked: 10 }));
     expect(r.available).toBe(90);
     expect(r.atCost).toBe(1000);
     expect(r.atRetail).toBe(2500);
@@ -81,18 +81,18 @@ describe("summarise", () => {
 
   it("does not let one SKU's oversell cancel another's available units", () => {
     const t = summarise([
-      toOverviewRow(input({ id: "a", onHand: 2, booked: 5 })),
-      toOverviewRow(input({ id: "b", onHand: 10, booked: 0 })),
+      toOverviewRow(input({ id: "a", onHand: 2, unbooked: 5 })),
+      toOverviewRow(input({ id: "b", onHand: 10, unbooked: 0 })),
     ]);
     expect(t.available).toBe(10);
-    expect(t.booked).toBe(5);
+    expect(t.unbooked).toBe(5);
     expect(t.counts.out).toBe(1);
   });
 
-  it("values booked units at selling price for the order value", () => {
-    const t = summarise([toOverviewRow(input({ booked: 3, price: 25 }))]);
-    expect(t.bookedRetail).toBe(75);
-    expect(t.bookedCost).toBe(30);
+  it("values unbooked units at selling price for the order value", () => {
+    const t = summarise([toOverviewRow(input({ unbooked: 3, price: 25 }))]);
+    expect(t.unbookedRetail).toBe(75);
+    expect(t.unbookedCost).toBe(30);
   });
 });
 

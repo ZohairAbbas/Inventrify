@@ -25,8 +25,12 @@ export interface OverviewInput {
   id: string;
   /** Sellable physical units (Product.currentStock — damaged already excluded). */
   onHand: number;
-  /** Committed to unfulfilled orders (sum of ProductLocationStock.reserved). */
-  booked: number;
+  /**
+   * Committed to open Shopify orders not yet booked with a courier (sum of
+   * ProductLocationStock.reserved). Booking fulfils the Shopify order, which takes the
+   * units out of on-hand and out of this figure, so committed and unbooked are the same.
+   */
+  unbooked: number;
   /** Shopify `damaged` state: physically present, not sellable. */
   damaged: number;
   /** Outstanding units on open purchase orders. */
@@ -79,7 +83,7 @@ export function overviewStatus(available: number, input: Pick<OverviewInput, "pl
 
 export function toOverviewRow(input: OverviewInput): OverviewRow {
   const onHand = Math.max(0, input.onHand);
-  const available = onHand - input.booked;
+  const available = onHand - input.unbooked;
   const daysLeft =
     input.avgDailySales > 0 ? (available <= 0 ? 0 : Math.floor(available / input.avgDailySales)) : null;
   return {
@@ -99,11 +103,11 @@ export type OverviewCounts = Record<OverviewFilter, number>;
 export interface OverviewTotals {
   skus: number;
   onHand: number;
-  booked: number;
+  unbooked: number;
   available: number;
-  /** Booked units at selling price — the order value they are held for. */
-  bookedRetail: number;
-  bookedCost: number;
+  /** Unbooked units at selling price — the order value they are held for. */
+  unbookedRetail: number;
+  unbookedCost: number;
   availableCost: number;
   damaged: number;
   damagedCost: number;
@@ -123,10 +127,10 @@ export function summarise(rows: readonly OverviewRow[]): OverviewTotals {
   const t: OverviewTotals = {
     skus: rows.length,
     onHand: 0,
-    booked: 0,
+    unbooked: 0,
     available: 0,
-    bookedRetail: 0,
-    bookedCost: 0,
+    unbookedRetail: 0,
+    unbookedCost: 0,
     availableCost: 0,
     damaged: 0,
     damagedCost: 0,
@@ -142,10 +146,10 @@ export function summarise(rows: readonly OverviewRow[]): OverviewTotals {
   for (const r of rows) {
     const onHand = Math.max(0, r.onHand);
     t.onHand += onHand;
-    t.booked += r.booked;
+    t.unbooked += r.unbooked;
     // An oversold SKU has negative availability; it does not cancel another SKU's units.
     t.available += Math.max(0, r.available);
-    t.bookedCost += r.booked * r.unitCost;
+    t.unbookedCost += r.unbooked * r.unitCost;
     t.availableCost += Math.max(0, r.available) * r.unitCost;
     t.damaged += r.damaged;
     t.damagedCost += r.damaged * r.unitCost;
@@ -158,7 +162,7 @@ export function summarise(rows: readonly OverviewRow[]): OverviewTotals {
       t.pricedAtCost += r.atCost;
       t.pricedSkus++;
     }
-    if (isPriced(r.price)) t.bookedRetail += r.booked * r.price;
+    if (isPriced(r.price)) t.unbookedRetail += r.unbooked * r.price;
     if (r.status !== "healthy") t.counts[r.status]++;
   }
   return t;

@@ -172,6 +172,11 @@ model Product {
   cancellationRate Float    @default(0)
   // Landed unit cost — drives inventory value, revenue-at-risk ranking and PO totals.
   unitCost        Float     @default(0)
+  // Selling price from the Shopify variant, in the shop's currency. Null until the first
+  // sync after this column was added, and for variants Shopify reports no price for —
+  // never 0, so "unknown" stays distinguishable from "free". Drives stock-at-retail,
+  // margin and the COD float; replaces the cost / (1 - avgMargin) estimate where set.
+  price           Float?
   // Purchasing constraints applied when suggesting order quantities.
   moq             Int       @default(1)
   casePackSize    Int       @default(1)

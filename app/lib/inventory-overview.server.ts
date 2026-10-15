@@ -3,6 +3,7 @@ import { getStockStatus } from "./forecast.server";
 import { getInventoryPositions } from "./planning.server";
 import { OPEN_PO_STATUSES, outstandingQuantity } from "./purchase-order-status";
 import { estimateUnitPrice } from "./capital.server";
+import { classifyFulfilmentStage, isRecognisedStatus, resolveOutcomeByOrder } from "./rto-attribution.server";
 import type { DateRange } from "./date-range";
 import { summarise, toOverviewRow, type OverviewRow, type OverviewTotals } from "./inventory-overview";
 
@@ -16,7 +17,12 @@ export type OverviewProductRow = OverviewRow & {
 export interface StockOverview {
   rows: OverviewProductRow[];
   totals: OverviewTotals;
-  /** Dispatched and not yet delivered or returned. Already out of on-hand. */
+  /**
+   * Booked with a courier and not yet picked up. Booking fulfils the Shopify order, so
+   * these units are already out of on-hand, like withCourier.
+   */
+  booked: { units: number; cost: number; retail: number; orders: number };
+  /** Picked up by the courier and not yet delivered or returned. Already out of on-hand. */
   withCourier: { units: number; cost: number; retail: number };
   /** Returned parcels logged in the returns queue, not yet restocked or written off. */
   returnsToCheck: { units: number; cost: number };
@@ -27,19 +33,53 @@ export interface StockOverview {
  * Every live SKU's stock, split by where the units are, with the per-SKU status the
  * dashboard filters on. Current state only — nothing here depends on a date range.
  */
+/**
+ * A booking with no carrier scan after this long is not waiting for a pickup; tracking has
+ * most likely stopped flowing. It stays in "with courier", where it was before bookings
+ * were split out, rather than inflating Booked indefinitely.
+ */
+export const BOOKED_WINDOW_DAYS = 7;
+
+/**
+ * Units per product on orders booked with a courier but not yet collected: the shipment's
+ * latest status is a pre-pickup one (Courierify's booked/pending, or Shopify's fulfilled
+ * with no carrier scan). Shopify's own tracking carries this for every shop, so it works
+ * without a Courierify connection.
+ */
+async function getBookedUnits(shop: string): Promise<{ byProduct: Map<string, number>; orders: number }> {
+  const outcomes = await prisma.orderOutcome.findMany({
+    where: { shop, updatedAt: { gte: new Date(Date.now() - BOOKED_WINDOW_DAYS * 86400000) } },
+    select: { orderName: true, status: true, source: true },
+    // resolveOutcomeByOrder keeps the last row per order; the order must be stable.
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+  });
+  const bookedOrders = [...resolveOutcomeByOrder(outcomes)]
+    .filter(([, status]) => isRecognisedStatus(status) && classifyFulfilmentStage(status) === "dispatched")
+    .map(([orderName]) => orderName);
+  const byProduct = new Map<string, number>();
+  if (bookedOrders.length === 0) return { byProduct, orders: 0 };
+
+  const lines = await prisma.orderLineItem.findMany({
+    where: { shop, orderName: { in: bookedOrders } },
+    select: { productId: true, quantity: true },
+  });
+  for (const l of lines) byProduct.set(l.productId, (byProduct.get(l.productId) ?? 0) + l.quantity);
+  return { byProduct, orders: bookedOrders.length };
+}
+
 export async function getStockOverview(
   shop: string,
   deadStock: { days: number; minUnits: number },
 ): Promise<StockOverview> {
   const since = new Date(Date.now() - deadStock.days * 86400000);
 
-  const [products, positions, damagedRows, openItems, pendingReturns, soldRecently] = await Promise.all([
+  const [products, positions, damagedRows, openItems, pendingReturns, soldRecently, bookedUnits] = await Promise.all([
     prisma.product.findMany({
       where: { shop, isArchived: false },
       select: {
         id: true, title: true, variantTitle: true, sku: true, imageUrl: true,
         currentStock: true, reorderPoint: true, avgDailySales: true,
-        unitCost: true, price: true, avgMargin: true, fulfilledInTransit: true,
+        unitCost: true, price: true, avgMargin: true, fulfilledInTransit: true, fulfilmentSource: true,
       },
     }),
     getInventoryPositions(shop),
@@ -70,6 +110,7 @@ export async function getStockOverview(
       _sum: { quantity: true },
       having: { quantity: { _sum: { gt: 0 } } },
     }),
+    getBookedUnits(shop),
   ]);
 
   const damagedById = new Map(damagedRows.map((r) => [r.productId, r._sum.damaged ?? 0]));
@@ -90,6 +131,7 @@ export async function getStockOverview(
     incomingById.set(item.productId, acc);
   }
 
+  const booked = { units: 0, cost: 0, retail: 0, orders: bookedUnits.orders };
   const withCourier = { units: 0, cost: 0, retail: 0 };
   const returnsToCheck = { units: 0, cost: 0 };
 
@@ -101,7 +143,19 @@ export async function getStockOverview(
     const incomingUnits = incoming?.units ?? 0;
     const incomingCost = incoming && incoming.cost > 0 ? incoming.cost : incomingUnits * p.unitCost;
 
-    const inTransit = Math.max(0, p.fulfilledInTransit);
+    const bookedHere = bookedUnits.byProduct.get(p.id) ?? 0;
+    booked.units += bookedHere;
+    booked.cost += bookedHere * p.unitCost;
+    booked.retail += bookedHere * estimateUnitPrice(p);
+
+    // Shopify-derived in-transit counts every shipment not yet delivered or returned,
+    // bookings included, so they come out here to be counted once. Courierify's own
+    // in-transit figure is forward transit only and already excludes them. Clamped
+    // because in-transit is recomputed hourly and a fresh booking can land first.
+    const inTransit = Math.max(
+      0,
+      p.fulfilledInTransit - (p.fulfilmentSource === "courierify" ? 0 : bookedHere),
+    );
     withCourier.units += inTransit;
     withCourier.cost += inTransit * p.unitCost;
     withCourier.retail += inTransit * estimateUnitPrice(p);
@@ -114,7 +168,7 @@ export async function getStockOverview(
       ...toOverviewRow({
         id: p.id,
         onHand: p.currentStock,
-        booked: pos?.reserved ?? 0,
+        unbooked: pos?.reserved ?? 0,
         damaged: damagedById.get(p.id) ?? 0,
         incoming: incomingUnits,
         incomingCost,
@@ -134,6 +188,7 @@ export async function getStockOverview(
   return {
     rows,
     totals: summarise(rows),
+    booked,
     withCourier,
     returnsToCheck,
     openPurchaseOrders: openPoIds.size,

@@ -177,8 +177,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           locationFilter !== "all" ? effectiveStock : positions.get(p.id)?.position ?? effectiveStock,
           p.reorderPoint,
         ),
-        // Held for unfulfilled orders, at the location in view or across all of them.
-        booked:
+        // On open orders not yet booked with a courier, at the location in view or across
+        // all of them.
+        unbooked:
           locationFilter !== "all" ? locLevel?.reserved ?? 0 : positions.get(p.id)?.reserved ?? 0,
         // From the synced Shopify price. avgMargin is never populated, so the old column
         // read "—" for every SKU.
@@ -496,7 +497,7 @@ export default function Inventory() {
       Product: p.title,
       Variant: p.variantTitle ?? "",
       Stock: p.currentStock,
-      Booked: p.booked,
+      Unbooked: p.unbooked,
       "Reorder Point": p.reorderPoint,
       "Lead Time (days)": p.leadTimeDays,
       "COD Return Rate": p.codReturnRate,
@@ -630,7 +631,7 @@ export default function Inventory() {
     { header: "SKU", width: "1fr" },
     { header: "Class", width: ".7fr" },
     { header: "Stock", width: ".7fr", align: "right" },
-    { header: "Booked", width: ".7fr", align: "right" },
+    { header: "Unbooked", width: ".8fr", align: "right" },
     { header: "Reorder", width: ".8fr", align: "right" },
     { header: "Days left", width: ".9fr", align: "right" },
     { header: "COD ret.", width: ".9fr", align: "right" },
@@ -726,11 +727,11 @@ export default function Inventory() {
         {p.effectiveStock}
       </span>,
       <span
-        key="booked"
-        title="Held for unfulfilled orders"
-        style={{ fontFamily: "var(--inv-font-mono)", color: p.booked > 0 ? "var(--inv-ink)" : "var(--inv-faint)" }}
+        key="unbooked"
+        title="On open orders, not yet booked with a courier"
+        style={{ fontFamily: "var(--inv-font-mono)", color: p.unbooked > 0 ? "var(--inv-ink)" : "var(--inv-faint)" }}
       >
-        {p.booked > 0 ? p.booked : "—"}
+        {p.unbooked > 0 ? p.unbooked : "—"}
       </span>,
       <span key="reorder" style={{ fontFamily: "var(--inv-font-mono)", color: "var(--inv-muted)" }}>
         {p.reorderPoint}
@@ -979,7 +980,7 @@ export default function Inventory() {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "18px" }}>
               {[
                 ["Stock", String(drawerProduct.currentStock)],
-                ["Booked", String(drawerProduct.booked)],
+                ["Unbooked", String(drawerProduct.unbooked)],
                 ["Price", drawerProduct.price ? money(drawerProduct.price) : "—"],
                 ["Reorder at", String(drawerProduct.reorderPoint)],
                 ["Days left", drawerProduct.daysRemaining === null ? "No demand" : `${drawerProduct.daysRemaining}d`],

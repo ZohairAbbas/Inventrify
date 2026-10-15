@@ -106,6 +106,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     }).format(new Date()),
     currency: settings?.currency ?? "USD",
     totals,
+    booked: overview.booked,
     withCourier: overview.withCourier,
     returnsToCheck: overview.returnsToCheck,
     openPurchaseOrders: overview.openPurchaseOrders,
@@ -115,7 +116,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       sku: r.sku,
       imageUrl: r.imageUrl,
       onHand: Math.max(0, r.onHand),
-      booked: r.booked,
+      unbooked: r.unbooked,
       available: r.available,
       incoming: r.incoming,
       unitCost: r.unitCost,
@@ -275,9 +276,10 @@ export default function Dashboard() {
   const costCoverage =
     t.costedSkus === t.skus ? `all ${t.skus} SKUs have a cost` : `${t.costedSkus} of ${t.skus} SKUs have a cost`;
 
-  // ---- Where the stock is. Each unit sits in exactly one bucket: available and booked
-  // split on-hand; damaged is excluded from on-hand by the sync; units with the courier
-  // and returns awaiting a decision have already left on-hand; incoming has not arrived.
+  // ---- Where the stock is. Each unit sits in exactly one bucket: available and awaiting
+  // booking split on-hand; damaged is excluded from on-hand by the sync; booking fulfils the
+  // Shopify order, so booked units, units with the courier and returns awaiting a decision
+  // have already left on-hand; incoming has not arrived.
   const buckets: StockBucket[] = [
     {
       key: "available",
@@ -288,11 +290,11 @@ export default function Dashboard() {
       color: "var(--inv-status-healthy-dot)",
     },
     {
-      key: "booked",
-      label: "Booked",
-      units: t.booked,
-      cost: t.bookedCost,
-      note: "Held for unfulfilled orders",
+      key: "unbooked",
+      label: "Awaiting booking",
+      units: t.unbooked,
+      cost: t.unbookedCost,
+      note: "On open orders, not yet booked with a courier",
       color: "#7fb8a0",
     },
     {
@@ -302,6 +304,17 @@ export default function Dashboard() {
       cost: t.damagedCost,
       note: "Quarantined, not sellable",
       color: "var(--inv-status-stockout-dot)",
+    },
+    {
+      key: "booked",
+      label: "Booked",
+      units: data.booked.units,
+      cost: data.booked.cost,
+      note:
+        data.booked.orders > 0
+          ? `${fmt(data.booked.orders)} order${data.booked.orders === 1 ? "" : "s"} awaiting courier pickup`
+          : "Nothing awaiting pickup",
+      color: "#e0b25c",
     },
     {
       key: "courier",
@@ -336,7 +349,7 @@ export default function Dashboard() {
   const columns: DataTableColumn[] = [
     { header: "Product", width: "2.3fr" },
     { header: "On hand", width: ".7fr", align: "right" },
-    { header: "Booked", width: ".7fr", align: "right" },
+    { header: "Unbooked", width: ".8fr", align: "right" },
     { header: "Available", width: ".8fr", align: "right" },
     { header: "Incoming", width: ".8fr", align: "right" },
     { header: "Unit cost", width: ".9fr", align: "right" },
@@ -360,7 +373,7 @@ export default function Dashboard() {
         </div>
       </div>,
       <span key="onhand" style={mono}>{fmt(r.onHand)}</span>,
-      <span key="booked" style={r.booked ? mono : faint}>{r.booked ? fmt(r.booked) : "—"}</span>,
+      <span key="unbooked" style={r.unbooked ? mono : faint}>{r.unbooked ? fmt(r.unbooked) : "—"}</span>,
       <span
         key="avail"
         style={{ ...mono, fontWeight: 600, color: r.available <= 0 ? "var(--inv-status-stockout-fg)" : "var(--inv-ink)" }}
@@ -554,15 +567,16 @@ export default function Dashboard() {
                 label="Available to sell"
                 value={fmt(t.available)}
                 valueColor="var(--inv-status-healthy-fg)"
-                sub={`${fmt(t.onHand)} on hand − ${fmt(t.booked)} booked · ${t.skus} SKUs`}
+                sub={`${fmt(t.onHand)} on hand − ${fmt(t.unbooked)} awaiting booking · ${t.skus} SKUs`}
               />
               <KpiTile
                 label="Booked"
-                value={fmt(t.booked)}
+                value={fmt(data.booked.units)}
                 sub={
-                  t.booked > 0 && t.bookedRetail > 0
-                    ? `${money(t.bookedRetail)} at selling price, on unfulfilled orders`
-                    : "units on unfulfilled orders"
+                  data.booked.units > 0
+                    ? `units on ${fmt(data.booked.orders)} order${data.booked.orders === 1 ? "" : "s"} awaiting pickup` +
+                      (data.booked.retail > 0 ? ` · ${money(data.booked.retail)} COD` : "")
+                    : "nothing awaiting courier pickup"
                 }
               />
               <KpiTile

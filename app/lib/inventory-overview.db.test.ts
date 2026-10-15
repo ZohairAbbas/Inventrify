@@ -38,6 +38,8 @@ async function product(id: string, data: { currentStock: number; unitCost: numbe
 }
 
 beforeEach(async () => {
+  await prisma.orderOutcome.deleteMany({ where: { shop: SHOP } });
+  await prisma.orderLineItem.deleteMany({ where: { shop: SHOP } });
   await prisma.purchaseOrderReceiptLine.deleteMany({ where: { receipt: { shop: SHOP } } });
   await prisma.purchaseOrderReceipt.deleteMany({ where: { shop: SHOP } });
   await prisma.purchaseOrderItem.deleteMany({ where: { purchaseOrder: { shop: SHOP } } });
@@ -74,7 +76,7 @@ describe("getStockOverview", () => {
     const o = await getStockOverview(SHOP, DEAD);
 
     expect(o.totals.onHand).toBe(40);
-    expect(o.totals.booked).toBe(4);
+    expect(o.totals.unbooked).toBe(4);
     expect(o.totals.available).toBe(36);
     expect(o.totals.damaged).toBe(2);
     // Outstanding on the sent PO only, valued at the PO line's cost; drafts are not incoming.
@@ -82,6 +84,7 @@ describe("getStockOverview", () => {
     expect(o.totals.incomingCost).toBe(360);
     expect(o.openPurchaseOrders).toBe(1);
     expect(o.withCourier).toEqual({ units: 3, cost: 300, retail: 750 });
+    expect(o.booked).toEqual({ units: 0, cost: 0, retail: 0, orders: 0 });
     expect(o.returnsToCheck).toEqual({ units: 2, cost: 200 });
 
     // Retail over priced SKUs only: B has no price and no stock.
@@ -91,6 +94,37 @@ describe("getStockOverview", () => {
     const b = o.rows.find((r) => r.id === B);
     expect(b?.status).toBe("out");
     expect(b?.incoming).toBe(6);
+  });
+
+  it("splits parcels booked but not picked up out of with-courier", async () => {
+    const order = async (name: string, status: string, source: string, qty: number, daysAgo = 0) => {
+      const at = new Date(Date.now() - daysAgo * 86400000);
+      await prisma.orderLineItem.create({
+        data: { id: `li-${name}`, shop: SHOP, orderName: name, productId: A, quantity: qty, orderedAt: at },
+      });
+      await prisma.orderOutcome.create({
+        data: { id: `oo-${name}`, shop: SHOP, shipmentId: `s-${name}`, orderName: name, status, source, updatedAt: at },
+      });
+    };
+    // Booked via Shopify's fulfilled-with-no-scan and via Courierify's own status.
+    await order("#1", "FULFILLED", "shopify", 1);
+    await order("#2", "booked", "courierify", 1);
+    // Picked up, and a booking stale enough that tracking has stopped: both stay with the courier.
+    await order("#3", "IN_TRANSIT", "shopify", 1);
+    await order("#4", "FULFILLED", "shopify", 5, 10);
+
+    const o = await getStockOverview(SHOP, DEAD);
+
+    expect(o.booked).toEqual({ units: 2, cost: 200, retail: 500, orders: 2 });
+    // A's in-transit of 3 (Shopify-derived) included the two bookings.
+    expect(o.withCourier).toEqual({ units: 1, cost: 100, retail: 250 });
+    // Booking fulfils the order: on-hand and the unbooked split are untouched.
+    expect(o.totals.onHand).toBe(40);
+    expect(o.totals.unbooked).toBe(4);
+
+    // Courierify's in-transit figure is forward transit only, so nothing comes off it.
+    await prisma.product.update({ where: { id: A }, data: { fulfilmentSource: "courierify" } });
+    expect((await getStockOverview(SHOP, DEAD)).withCourier.units).toBe(3);
   });
 
   it("flags slow stock with Analytics' dead-stock rule", async () => {

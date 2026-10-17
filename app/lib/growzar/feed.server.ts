@@ -1,8 +1,10 @@
 import { json } from "@remix-run/node";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import prisma from "../../db.server";
+import { shopDateString } from "../tz.server";
 import { authenticatePlatformRequest, growzarError } from "./platform-auth.server";
-import { platformLimiter, type RateLimiter } from "./rate-limit.server";
+import type { PlatformPartner } from "./config.server";
+import { financifyLimiter, platformLimiter, type RateLimiter } from "./rate-limit.server";
 
 /**
  * Shared plumbing for the Growzar read feeds (API-CONTRACT §6, Phase 5).
@@ -15,6 +17,10 @@ import { platformLimiter, type RateLimiter } from "./rate-limit.server";
  * Paging is keyset on (updatedAt, id) ascending, with `updatedSince` inclusive (§6.2).
  * The cursor carries the last row's (updatedAt, primary key); the primary key is always
  * the table's own id column, even where the id a feed shows is a natural key.
+ *
+ * The same feeds serve Financify Books under /api/v1/financify/<feed>, with Financify's
+ * own key and secret. The partner comes from the path, which the signature covers, so a
+ * route under one prefix only ever admits that partner's key.
  */
 
 /** Feeds this release serves, as /growzar/status `capabilities`. */
@@ -100,11 +106,18 @@ export function parseFeedParams(url: URL): { ok: true; value: FeedParams } | { o
   return { ok: true, value: { updatedSince, limit, cursor } };
 }
 
+/** The partner a feed URL belongs to: its second path segment after /api/v1/. */
+export function feedPartner(pathname: string): PlatformPartner {
+  return pathname.startsWith("/api/v1/financify/") ? "financify" : "growzar";
+}
+
 export async function openFeed(
   request: Request,
-  { limiter = platformLimiter, env, now }: { limiter?: RateLimiter; env?: NodeJS.ProcessEnv; now?: number } = {},
+  { limiter, env, now }: { limiter?: RateLimiter; env?: NodeJS.ProcessEnv; now?: number } = {},
 ): Promise<{ ok: true; value: FeedRequest } | { ok: false; response: Response }> {
-  const auth = await authenticatePlatformRequest(request, { env, now });
+  const partner = feedPartner(new URL(request.url).pathname);
+  limiter ??= partner === "financify" ? financifyLimiter : platformLimiter;
+  const auth = await authenticatePlatformRequest(request, { partner, env, now });
   if (!auth.ok) return auth;
   const { shop } = auth.value;
 
@@ -161,14 +174,14 @@ export async function openFeed(
  * Prisma `where` fragment for one page: rows at or after `updatedSince`, strictly after
  * the cursor in (updatedAt, id) order.
  */
-export function keysetWhere(params: FeedParams) {
+export function keysetWhere(params: FeedParams, column: "updatedAt" | "createdAt" = "updatedAt") {
   const and: object[] = [];
-  if (params.updatedSince) and.push({ updatedAt: { gte: params.updatedSince } });
+  if (params.updatedSince) and.push({ [column]: { gte: params.updatedSince } });
   if (params.cursor) {
     and.push({
       OR: [
-        { updatedAt: { gt: params.cursor.updatedAt } },
-        { updatedAt: params.cursor.updatedAt, id: { gt: params.cursor.id } },
+        { [column]: { gt: params.cursor.updatedAt } },
+        { [column]: params.cursor.updatedAt, id: { gt: params.cursor.id } },
       ],
     });
   }
@@ -176,6 +189,23 @@ export function keysetWhere(params: FeedParams) {
 }
 
 export const keysetOrder = [{ updatedAt: "asc" as const }, { id: "asc" as const }];
+
+/**
+ * Append-only feeds (receipts, supplier ledger) page on createdAt: their rows are never
+ * updated, so createdAt is when each one last changed. `updatedSince` keeps its name.
+ *
+ * createdAt is stamped when the INSERT runs, not when its transaction commits, so a row
+ * from a slow transaction could appear behind a cursor that has already passed its time.
+ * Rows younger than SETTLE_MS are held back until every transaction that could still
+ * insert behind them has finished; a reader polling every few minutes never notices.
+ */
+export const SETTLE_MS = 60_000;
+
+export const createdKeysetOrder = [{ createdAt: "asc" as const }, { id: "asc" as const }];
+
+export function settledWhere(now: number = Date.now()) {
+  return { createdAt: { lt: new Date(now - SETTLE_MS) } };
+}
 
 /** Fetch one more than the page size, so `hasMore` needs no second query. */
 export const pageTake = (params: FeedParams) => params.limit + 1;
@@ -196,6 +226,17 @@ export async function feedResponse<Row extends { id: string; updatedAt: Date }>(
   toData: (row: Row) => unknown,
   tombstones?: TombstoneOption,
 ): Promise<Response> {
+  return pagedResponse({ facts, params }, fetched, (row) => row.updatedAt, toData, tombstones);
+}
+
+/** feedResponse for a feed paged on another timestamp column (see createdKeysetOrder). */
+export async function pagedResponse<Row extends { id: string }>(
+  { facts, params }: FeedRequest,
+  fetched: Row[],
+  cursorAt: (row: Row) => Date,
+  toData: (row: Row) => unknown,
+  tombstones?: TombstoneOption,
+): Promise<Response> {
   const hasMore = fetched.length > params.limit;
   const rows = hasMore ? fetched.slice(0, params.limit) : fetched;
   const last = rows[rows.length - 1];
@@ -210,7 +251,7 @@ export async function feedResponse<Row extends { id: string; updatedAt: Date }>(
       limit: params.limit,
       count: rows.length,
       hasMore,
-      nextCursor: hasMore && last ? encodeCursor({ updatedAt: last.updatedAt, id: last.id }) : null,
+      nextCursor: hasMore && last ? encodeCursor({ updatedAt: cursorAt(last), id: last.id }) : null,
     },
   };
 
@@ -295,6 +336,19 @@ export const iso = (value: Date | null | undefined): string | null => (value ? v
  * its `YYYY-MM-DD` label (§5).
  */
 export const dayLabel = (value: Date): string => value.toISOString().slice(0, 10);
+
+/**
+ * The shop-local day of a receipt date or ledger date, as `YYYY-MM-DD`.
+ *
+ * Those columns hold either a day the merchant picked (stored as that date at 00:00 UTC,
+ * the way parseFormDate reads a date input) or the instant the app recorded it. A value
+ * at exactly UTC midnight is taken as a picked day and labelled as stored; anything else
+ * is an instant and is placed in the shop's day. Without a time zone the UTC day is used.
+ */
+export function dayOf(value: Date, timeZone: string | null): string {
+  const isPickedDay = value.getTime() % 86_400_000 === 0;
+  return isPickedDay || !timeZone ? dayLabel(value) : shopDateString(value, timeZone);
+}
 
 /** Record hard deletes for a feed. Pass the transaction client when inside one. */
 export function tombstoneData(shop: string, feed: string, entityIds: string[]) {

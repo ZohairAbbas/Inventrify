@@ -1,5 +1,5 @@
 import { json } from "@remix-run/node";
-import { getGrowzarConfig, normaliseShopDomain, type GrowzarConfig } from "./config.server";
+import { getPartnerCredentials, normaliseShopDomain, type PlatformPartner } from "./config.server";
 import { safeEqual, verifySignature } from "./signing.server";
 
 /**
@@ -12,8 +12,12 @@ import { safeEqual, verifySignature } from "./signing.server";
  *
  * The tenant is X-Growzar-Shop (and/or `?shop=`, which Growzar also sends and which the
  * signature covers). When both are present they must agree.
+ *
+ * Financify Books uses the same scheme with its own key, secret and X-Financify-*
+ * headers (`partner: "financify"`). Each route names the one partner it admits, so a
+ * key only ever opens its own partner's endpoints.
  */
-export type PlatformRequest = { shop: string; config: GrowzarConfig };
+export type PlatformRequest = { shop: string; partner: PlatformPartner };
 
 /** §9 error shape. */
 export function growzarError(status: number, errorType: string, error: string): Response {
@@ -25,16 +29,21 @@ export function growzarError(status: number, errorType: string, error: string): 
 
 export async function authenticatePlatformRequest(
   request: Request,
-  { env = process.env, now }: { env?: NodeJS.ProcessEnv; now?: number } = {},
+  {
+    partner = "growzar",
+    env = process.env,
+    now,
+  }: { partner?: PlatformPartner; env?: NodeJS.ProcessEnv; now?: number } = {},
 ): Promise<{ ok: true; value: PlatformRequest } | { ok: false; response: Response }> {
-  const config = getGrowzarConfig(env);
+  const config = getPartnerCredentials(partner, env);
   if (!config) {
-    console.error("[growzar] GROWZAR_URL / GROWZAR_PLATFORM_KEY / GROWZAR_SIGNING_SECRET not set — refusing platform request");
+    console.error(`[${partner}] platform credentials not set — refusing platform request`);
     return {
       ok: false,
-      response: growzarError(503, "internal_error", "The Growzar integration is not configured."),
+      response: growzarError(503, "internal_error", "This integration is not configured."),
     };
   }
+  const header = (name: string) => request.headers.get(`x-${config.headerPrefix.toLowerCase()}-${name}`);
 
   const authorization = request.headers.get("authorization") ?? "";
   const bearer = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
@@ -46,19 +55,19 @@ export async function authenticatePlatformRequest(
   const body = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
   const signature = verifySignature({
     secret: config.signingSecret,
-    signature: request.headers.get("x-growzar-signature"),
-    timestamp: request.headers.get("x-growzar-timestamp"),
+    signature: header("signature"),
+    timestamp: header("timestamp"),
     method: request.method,
     pathWithQuery: `${url.pathname}${url.search}`,
     body,
     now,
   });
   if (!signature.ok) {
-    console.warn(`[growzar] platform request refused: ${signature.reason}`);
+    console.warn(`[${partner}] platform request refused: ${signature.reason}`);
     return { ok: false, response: growzarError(401, "unauthorized", "Invalid request signature.") };
   }
 
-  const headerShopRaw = request.headers.get("x-growzar-shop");
+  const headerShopRaw = header("shop");
   const queryShopRaw = url.searchParams.get("shop");
   const headerShop = headerShopRaw === null ? null : normaliseShopDomain(headerShopRaw);
   const queryShop = queryShopRaw === null ? null : normaliseShopDomain(queryShopRaw);
@@ -67,12 +76,12 @@ export async function authenticatePlatformRequest(
     return { ok: false, response: growzarError(400, "bad_request", "The shop must be a *.myshopify.com domain.") };
   }
   if (headerShop && queryShop && headerShop !== queryShop) {
-    return { ok: false, response: growzarError(400, "bad_request", "X-Growzar-Shop and ?shop= disagree.") };
+    return { ok: false, response: growzarError(400, "bad_request", `X-${config.headerPrefix}-Shop and ?shop= disagree.`) };
   }
   const shop = headerShop ?? queryShop;
   if (!shop) {
-    return { ok: false, response: growzarError(400, "bad_request", "X-Growzar-Shop is required.") };
+    return { ok: false, response: growzarError(400, "bad_request", `X-${config.headerPrefix}-Shop is required.`) };
   }
 
-  return { ok: true, value: { shop, config } };
+  return { ok: true, value: { shop, partner } };
 }

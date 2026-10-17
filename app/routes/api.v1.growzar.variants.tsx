@@ -39,6 +39,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       select: {
         id: true,
         productGid: true,
+        inventoryItemId: true,
         title: true,
         variantTitle: true,
         sku: true,
@@ -72,6 +73,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
           id: variantId,
           variantId,
           productId: numericId(p.productGid),
+          inventoryItemId: numericId(p.inventoryItemId),
           title: p.title,
           variantTitle: p.variantTitle,
           sku: p.sku,

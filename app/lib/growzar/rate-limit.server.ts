@@ -35,3 +35,6 @@ export function createRateLimiter(limit: number, windowMs: number): RateLimiter 
 }
 
 export const platformLimiter = createRateLimiter(PLATFORM_LIMIT, PLATFORM_WINDOW_MS);
+
+/** Financify's key gets a bucket of its own, so neither partner can starve the other. */
+export const financifyLimiter = createRateLimiter(PLATFORM_LIMIT, PLATFORM_WINDOW_MS);

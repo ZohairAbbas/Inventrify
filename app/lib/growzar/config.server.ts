@@ -41,3 +41,44 @@ export function normaliseShopDomain(value: string | null | undefined): string | 
   const shop = (value ?? "").trim().toLowerCase();
   return /^[a-z0-9][a-z0-9-]*\.myshopify\.com$/.test(shop) ? shop : null;
 }
+
+/**
+ * Credentials a read-feed partner presents to us: the bearer key and the HMAC secret
+ * its requests are signed with. `headerPrefix` names its headers — `X-<Prefix>-Shop`,
+ * `-Timestamp` and `-Signature` — so one partner's signed request can never be replayed
+ * as another's.
+ */
+export type PlatformPartner = "growzar" | "financify";
+
+export type PartnerCredentials = {
+  partner: PlatformPartner;
+  platformKey: string;
+  signingSecret: string;
+  headerPrefix: string;
+};
+
+/**
+ * Financify Books' credentials for its read feeds (/api/v1/financify/*):
+ *
+ *   FINANCIFY_PLATFORM_KEY    the bearer key Financify presents to us
+ *   FINANCIFY_SIGNING_SECRET  HMAC secret its requests are signed with
+ *
+ * Separate from Growzar's on purpose: the Growzar key reads every Growzar feed for every
+ * shop, and Financify is limited to the feeds served under its own prefix. The same pm2
+ * caveat as above applies after changing them. Either missing turns the feeds off.
+ */
+export function getPartnerCredentials(
+  partner: PlatformPartner,
+  env: NodeJS.ProcessEnv = process.env,
+): PartnerCredentials | null {
+  if (partner === "growzar") {
+    const config = getGrowzarConfig(env);
+    return config
+      ? { partner, platformKey: config.platformKey, signingSecret: config.signingSecret, headerPrefix: "Growzar" }
+      : null;
+  }
+  const platformKey = env.FINANCIFY_PLATFORM_KEY?.trim();
+  const signingSecret = env.FINANCIFY_SIGNING_SECRET?.trim();
+  if (!platformKey || !signingSecret) return null;
+  return { partner, platformKey, signingSecret, headerPrefix: "Financify" };
+}

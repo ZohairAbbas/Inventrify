@@ -1,6 +1,7 @@
 /**
- * The Financify Books feeds against a real database: partner isolation, the receipts and
- * supplier-ledger feeds, createdAt paging and the settle window.
+ * The Books feeds against a real database: partner isolation, the receipts and
+ * supplier-ledger feeds, createdAt paging, the settle window, and Growzar and Financify
+ * getting the same body for the same shop and page.
  *
  * Needs a scratch database; see the header of alert-dispatch.db.test.ts.
  *   npm run test:db
@@ -15,9 +16,11 @@ if (!/_test(\?|$)/.test(process.env.DATABASE_URL ?? "")) {
 const { default: prisma } = await import("../../db.server");
 const { purgeShopData } = await import("../shop-purge.server");
 const { sign, signingPayload } = await import("./signing.server");
-const { SETTLE_MS } = await import("./feed.server");
+const { GROWZAR_CAPABILITIES, SETTLE_MS } = await import("./feed.server");
 const receipts = await import("../../routes/api.v1.financify.receipts");
 const ledger = await import("../../routes/api.v1.financify.supplier-ledger");
+const growzarReceipts = await import("../../routes/api.v1.growzar.receipts");
+const growzarLedger = await import("../../routes/api.v1.growzar.supplier-ledger");
 const financifyVariants = await import("../../routes/api.v1.financify.variants");
 const growzarVariants = await import("../../routes/api.v1.growzar.variants");
 
@@ -117,6 +120,8 @@ describe("partner isolation", () => {
   it("a Financify route refuses the Growzar key, and a Growzar route the Financify key", async () => {
     expect((await get(receipts.loader, "/api/v1/financify/receipts", GROWZAR)).status).toBe(401);
     expect((await get(growzarVariants.loader, "/api/v1/growzar/variants", FINANCIFY)).status).toBe(401);
+    expect((await get(growzarReceipts.loader, "/api/v1/growzar/receipts", FINANCIFY)).status).toBe(401);
+    expect((await get(growzarLedger.loader, "/api/v1/growzar/supplier-ledger", FINANCIFY)).status).toBe(401);
   });
 
   it("each partner reads the shared variants feed under its own prefix", async () => {
@@ -239,5 +244,58 @@ describe("GET /financify/supplier-ledger", () => {
     const since = settled(50).toISOString();
     const { body } = await get(ledger.loader, `/api/v1/financify/supplier-ledger?updatedSince=${since}`);
     expect(body.data.map((e: { kind: string }) => e.kind)).toEqual(["adjustment"]);
+  });
+});
+
+describe("Growzar and Financify get the same body", () => {
+  type Partner = typeof GROWZAR;
+
+  /** Every page of a feed under one prefix, following that partner's own cursors. */
+  async function pages(loader: Loader, prefix: string, feed: string, as: Partner) {
+    const bodies: unknown[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 10; page++) {
+      const path = `/api/v1/${prefix}/${feed}?limit=1${cursor ? `&cursor=${cursor}` : ""}`;
+      const { status, body } = await get(loader, path, as);
+      expect(status).toBe(200);
+      bodies.push(body);
+      if (!body.pagination.hasMore) break;
+      cursor = body.pagination.nextCursor;
+    }
+    return bodies;
+  }
+
+  beforeEach(async () => {
+    const { supplier, bill } = await receivedPo();
+    await prisma.supplierLedgerEntry.create({
+      data: {
+        shop: SHOP,
+        supplierId: supplier.id,
+        type: "payment",
+        amount: "-1000.50",
+        currency: "PKR",
+        occurredAt: new Date("2026-10-12T00:00:00.000Z"),
+        reference: "HBL-123",
+        createdAt: bill.createdAt,
+      },
+    });
+  });
+
+  it("serves receipts identically, page by page", async () => {
+    const growzar = await pages(growzarReceipts.loader, "growzar", "receipts", GROWZAR);
+    const financify = await pages(receipts.loader, "financify", "receipts", FINANCIFY);
+    expect(growzar).toHaveLength(1);
+    expect(growzar).toEqual(financify);
+  });
+
+  it("serves the supplier ledger identically, page by page", async () => {
+    const growzar = await pages(growzarLedger.loader, "growzar", "supplier-ledger", GROWZAR);
+    const financify = await pages(ledger.loader, "financify", "supplier-ledger", FINANCIFY);
+    expect(growzar).toHaveLength(2);
+    expect(growzar).toEqual(financify);
+  });
+
+  it("lists both feeds in Growzar's capabilities", () => {
+    expect(GROWZAR_CAPABILITIES).toEqual(expect.arrayContaining(["receipts:read", "supplier-ledger:read"]));
   });
 });

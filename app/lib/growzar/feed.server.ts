@@ -32,6 +32,8 @@ export const GROWZAR_CAPABILITIES: string[] = [
   "suppliers:read",
   "stock-snapshots:read",
   "return-restocks:read",
+  "receipts:read",
+  "supplier-ledger:read",
 ];
 
 export const MAX_LIMIT = 500;

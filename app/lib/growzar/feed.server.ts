@@ -301,7 +301,7 @@ export function numericId(value: string | null | undefined): string | null {
 
 const minorUnitsCache = new Map<string, number>();
 
-function minorUnits(currency: string): number {
+export function minorUnits(currency: string): number {
   let digits = minorUnitsCache.get(currency);
   if (digits === undefined) {
     try {

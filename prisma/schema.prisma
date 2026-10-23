@@ -933,3 +933,66 @@ model SupplierLedgerEntry {
   @@index([shop, supplierId, occurredAt])
   @@index([purchaseOrderId])
 }
+
+// Growzar's Books offering its average cost to Shopify's "Cost per item" (D-77, G-INV-C1).
+// Always two steps: a preview that changes nothing, then a confirm that carries its id.
+//
+// A preview is what one Growzar user saw: each item's current Shopify cost, the proposed
+// one and whether it would change. It can be confirmed once, by the same user, within
+// COST_PREVIEW_TTL_MS (lib/growzar/costs.server). `items` is the stored per-item result,
+// including the inventory item id and the current cost the confirm re-checks against.
+model GrowzarCostPreview {
+  id          String    @id @default(uuid())
+  shop        String
+  // X-Growzar-User: Growzar's opaque user id, never an email.
+  actor       String
+  currency    String
+  items       Json
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  // Set when a confirm claims the preview, so it can never be written twice.
+  confirmedAt DateTime?
+
+  @@index([shop, createdAt])
+}
+
+// One row per Idempotency-Key (API-CONTRACT §8). Inserted before anything is written, so a
+// concurrent duplicate collides on the unique key; `response` is filled when the confirm
+// finishes and is what a replay returns. Kept forever, like the write log beside it.
+model GrowzarCostConfirm {
+  id             String    @id @default(cuid())
+  shop           String
+  idempotencyKey String
+  previewId      String
+  actor          String
+  // The stored reply: HTTP status and body. Null while the confirm is still running.
+  responseStatus Int?
+  response       Json?
+  createdAt      DateTime  @default(now())
+  completedAt    DateTime?
+
+  @@unique([shop, idempotencyKey])
+  @@index([previewId])
+}
+
+// Audit log: one row per item a confirm tried to write, with who, old and new. Shopify's
+// cost applies to future orders only, so nothing here rewrites the past.
+model GrowzarCostWrite {
+  id              String   @id @default(cuid())
+  shop            String
+  previewId       String
+  idempotencyKey  String
+  actor           String
+  variantId       String   // Shopify variant GID, as Product.id
+  inventoryItemId String
+  // In `currency`. Null old amount: Shopify had no cost set.
+  oldAmount       Decimal? @db.Decimal(18, 4)
+  newAmount       Decimal  @db.Decimal(18, 4)
+  currency        String
+  result          String   // set | failed
+  reason          String?
+  createdAt       DateTime @default(now())
+
+  @@index([shop, createdAt])
+  @@index([shop, variantId])
+}

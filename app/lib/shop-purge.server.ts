@@ -74,6 +74,10 @@ export async function purgeShopData(
   // The ledger references suppliers, so it goes first.
   await prisma.supplierLedgerEntry.deleteMany({ where: { shop } });
   await prisma.supplier.deleteMany({ where: { shop } });
+  // Growzar cost previews, confirms and their write log (G-INV-C1).
+  await prisma.growzarCostWrite.deleteMany({ where: { shop } });
+  await prisma.growzarCostConfirm.deleteMany({ where: { shop } });
+  await prisma.growzarCostPreview.deleteMany({ where: { shop } });
   await prisma.shopSettings.deleteMany({ where: { shop } });
 
   // Growzar tombstones go with the rows they described. A keep-session purge leaves one

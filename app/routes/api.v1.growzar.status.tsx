@@ -1,6 +1,7 @@
 import { json, type LoaderFunctionArgs } from "@remix-run/node";
 import prisma from "../db.server";
 import { appVersion } from "../lib/growzar/config.server";
+import { COST_WRITE_CAPABILITY, costWriteGranted } from "../lib/growzar/costs.server";
 import { GROWZAR_CAPABILITIES } from "../lib/growzar/feed.server";
 import { authenticatePlatformRequest, growzarError } from "../lib/growzar/platform-auth.server";
 
@@ -13,7 +14,8 @@ import { authenticatePlatformRequest, growzarError } from "../lib/growzar/platfo
  * deliberately not consulted, for the reason given in listSyncableShops.
  *
  * `capabilities` lists the read feeds this release serves (Phase 5, lib/growzar/feed.server).
- * Empty means Growzar shows a locked section with a preview.
+ * Empty means Growzar shows a locked section with a preview. `costs:write` is added per
+ * shop, only where Shopify confirms the shop granted the write scopes (costs.server).
  *
  * No CORS headers: this is server-to-server only.
  */
@@ -24,12 +26,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   try {
     const offlineSessions = await prisma.session.count({ where: { shop, isOnline: false } });
+    const installed = offlineSessions > 0;
+    const canWriteCosts = installed && (await costWriteGranted(shop));
     return json(
       {
-        installed: offlineSessions > 0,
+        installed,
         appVersion: appVersion(),
         shop,
-        capabilities: GROWZAR_CAPABILITIES,
+        capabilities: canWriteCosts ? [...GROWZAR_CAPABILITIES, COST_WRITE_CAPABILITY] : GROWZAR_CAPABILITIES,
         planRelevantFeatures: [] as string[],
       },
       { headers: { "Cache-Control": "no-store" } },
